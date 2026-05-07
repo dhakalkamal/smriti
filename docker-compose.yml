@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: smriti-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: smriti
+      POSTGRES_USER: smriti
+      POSTGRES_PASSWORD: smriti
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - smriti-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smriti -d smriti"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  smriti-postgres-data:

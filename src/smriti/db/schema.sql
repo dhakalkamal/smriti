@@ -1,0 +1,4 @@
+-- Canonical schema definition lives in append-only migrations.
+-- Apply schema changes with:
+--   uv run python -m smriti.db.migrate up
+-- Migration files are in src/smriti/db/migrations/.
