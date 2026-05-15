@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
   "asyncpg>=0.30.0",
   "click>=8.1.7",
+  "httpx>=0.27.0",
   "pgvector>=0.3.6",
   "pydantic>=2.8.2",
   "pydantic-settings>=2.4.0",
@@ -57,7 +58,7 @@ python_version = "3.11"
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["smriti.db.*"]
+module = ["smriti.db.*", "smriti.memory.*"]
 strict = true
 
 [[tool.mypy.overrides]]
