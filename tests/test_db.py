@@ -16,8 +16,15 @@ def _to_asyncpg_dsn(container_url: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_migrations_create_schema_and_seed_embedding_model() -> None:
+async def test_migrations_create_schema_and_seed_embedding_model(tmp_path: Path) -> None:
     migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+    stage_one_migrations_dir = tmp_path / "stage_one_migrations"
+    stage_one_migrations_dir.mkdir()
+    stage_one_migration = migrations_dir / "001_init.sql"
+    (stage_one_migrations_dir / stage_one_migration.name).write_text(
+        stage_one_migration.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     with PostgresContainer(
         "pgvector/pgvector:pg16",
@@ -28,11 +35,34 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
         database_url = _to_asyncpg_dsn(postgres.get_connection_url())
         settings = Settings(database_url=database_url)
 
-        first_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
-        second_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+        first_run = await apply_migrations(
+            settings=settings,
+            migrations_dir=stage_one_migrations_dir,
+        )
 
-        assert [migration.filename for migration in first_run] == ["001_init.sql", "002_scopes.sql"]
-        assert second_run == []
+        connection = await asyncpg.connect(dsn=database_url)
+        try:
+            existing_user_id = await connection.fetchval(
+                "INSERT INTO users DEFAULT VALUES RETURNING id;"
+            )
+            existing_conversation_id = await connection.fetchval(
+                """
+                INSERT INTO conversations (user_id, title)
+                VALUES ($1, $2)
+                RETURNING id;
+                """,
+                existing_user_id,
+                "Pre-scope conversation",
+            )
+        finally:
+            await connection.close()
+
+        second_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+        third_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        assert [migration.filename for migration in first_run] == ["001_init.sql"]
+        assert [migration.filename for migration in second_run] == ["002_scopes.sql"]
+        assert third_run == []
 
         connection = await asyncpg.connect(dsn=database_url)
         try:
@@ -72,7 +102,7 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
             assert default_model["provider"] == "ollama"
             assert default_model["dimensions"] == 768
 
-            for table_name in ["users", "conversations", "messages", "episodes"]:
+            for table_name in ["users", "scopes", "conversations", "messages", "episodes"]:
                 data_type = await connection.fetchval(
                     """
                     SELECT data_type
@@ -85,16 +115,44 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
                 )
                 assert data_type == "uuid"
 
-            scope_id_type = await connection.fetchval(
+            scope_id_column = await connection.fetchrow(
                 """
-                SELECT data_type
+                SELECT data_type, is_nullable
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = 'conversations'
                   AND column_name = 'scope_id';
                 """
             )
-            assert scope_id_type == "uuid"
+            assert scope_id_column is not None
+            assert scope_id_column["data_type"] == "uuid"
+            assert scope_id_column["is_nullable"] == "NO"
+
+            default_scope = await connection.fetchrow(
+                """
+                SELECT scopes.id, scopes.user_id, scopes.name, scopes.system_prompt
+                FROM conversations
+                JOIN scopes ON scopes.id = conversations.scope_id
+                WHERE conversations.id = $1;
+                """,
+                existing_conversation_id,
+            )
+            assert default_scope is not None
+            assert default_scope["user_id"] == existing_user_id
+            assert default_scope["name"] == "Default"
+            assert default_scope["system_prompt"] == ""
+
+            same_user_constraint_exists = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'conversations_scope_user_fkey'
+                      AND conrelid = 'conversations'::regclass
+                );
+                """
+            )
+            assert same_user_constraint_exists is True
 
             user_id = await connection.fetchval("INSERT INTO users DEFAULT VALUES RETURNING id;")
             scope_id = await connection.fetchval(
@@ -107,6 +165,85 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
                 "Test Scope",
                 "You are a scoped assistant.",
             )
+
+            with pytest.raises(asyncpg.UniqueViolationError):
+                await connection.execute(
+                    """
+                    INSERT INTO scopes (user_id, name, system_prompt)
+                    VALUES ($1, $2, $3);
+                    """,
+                    user_id,
+                    "Test Scope",
+                    "Duplicate names in one user must be rejected.",
+                )
+
+            other_user_id = await connection.fetchval(
+                "INSERT INTO users DEFAULT VALUES RETURNING id;"
+            )
+            same_name_other_user_scope_id = await connection.fetchval(
+                """
+                INSERT INTO scopes (user_id, name, system_prompt)
+                VALUES ($1, $2, $3)
+                RETURNING id;
+                """,
+                other_user_id,
+                "Test Scope",
+                "The same name is allowed for another user.",
+            )
+            assert same_name_other_user_scope_id is not None
+
+            with pytest.raises(asyncpg.NotNullViolationError):
+                await connection.execute(
+                    """
+                    INSERT INTO scopes (user_id, name, system_prompt)
+                    VALUES (NULL, $1, $2);
+                    """,
+                    "Missing User Scope",
+                    "Scopes must belong to a user.",
+                )
+
+            with pytest.raises(asyncpg.NotNullViolationError):
+                await connection.execute(
+                    """
+                    INSERT INTO scopes (user_id, name, system_prompt)
+                    VALUES ($1, NULL, $2);
+                    """,
+                    user_id,
+                    "Scopes must have a user-facing name.",
+                )
+
+            with pytest.raises(asyncpg.NotNullViolationError):
+                await connection.execute(
+                    """
+                    INSERT INTO conversations (user_id, title)
+                    VALUES ($1, $2);
+                    """,
+                    user_id,
+                    "Missing scope conversation",
+                )
+
+            other_scope_id = await connection.fetchval(
+                """
+                INSERT INTO scopes (user_id, name, system_prompt)
+                VALUES ($1, $2, $3)
+                RETURNING id;
+                """,
+                other_user_id,
+                "Other User Scope",
+                "Keep this separate.",
+            )
+
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                await connection.execute(
+                    """
+                    INSERT INTO conversations (user_id, scope_id, title)
+                    VALUES ($1, $2, $3);
+                    """,
+                    user_id,
+                    other_scope_id,
+                    "Cross-user scope conversation",
+                )
+
             conversation_id = await connection.fetchval(
                 """
                 INSERT INTO conversations (user_id, scope_id, title)
