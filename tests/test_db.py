@@ -51,7 +51,9 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
             ]
 
             for table_name in expected_tables:
-                result = await connection.fetchval("SELECT to_regclass($1);", f"public.{table_name}")
+                result = await connection.fetchval(
+                    "SELECT to_regclass($1);", f"public.{table_name}"
+                )
                 assert result == table_name
 
             vector_loaded = await connection.fetchval(

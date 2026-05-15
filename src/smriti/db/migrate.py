@@ -129,7 +129,9 @@ def migrate_up(database_url: str | None, migrations_dir: Path | None) -> None:
         settings = settings.model_copy(update={"database_url": database_url})
 
     resolved_migrations_dir = migrations_dir or settings.migrations_dir
-    applied_now = asyncio.run(apply_migrations(settings=settings, migrations_dir=resolved_migrations_dir))
+    applied_now = asyncio.run(
+        apply_migrations(settings=settings, migrations_dir=resolved_migrations_dir)
+    )
 
     if not applied_now:
         click.echo("No pending migrations.")

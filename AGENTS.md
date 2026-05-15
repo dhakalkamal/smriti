@@ -16,6 +16,40 @@ Plus **Ollama** running on localhost as a separate service for embeddings and ch
 
 The Python package is named `smriti`. All imports look like `from smriti.memory.service import ...`.
 
+
+## Environment requirements (critical)
+
+This project currently supports:
+
+- Python 3.13.x
+- uv
+- macOS/Linux
+- editable installs via Hatchling + src/ layout
+
+Do not:
+- use Python 3.14+
+- change package manager
+- flatten the src/ layout
+- replace Hatchling editable installs
+- switch away from uv without explicit instruction
+
+Bootstrap:
+
+```bash
+uv sync --python 3.13 --extra dev
+chflags -R nouchg,nohidden .venv
+```
+
+Verification:
+
+```bash
+uv run python -c "import smriti; print(smriti.__file__)"
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/smriti/db src/smriti/config.py
+uv run pytest -q
+```
+
 ## Core concept: scopes
 
 A **scope** is a user-defined memory partition with its own system prompt. Examples: "Family Companion," "Research Notes," "Coding Helper." A user can have many scopes.

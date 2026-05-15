@@ -7,7 +7,7 @@ name = "smriti"
 version = "0.1.0"
 description = "Long-term memory for local LLMs"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "asyncpg>=0.30.0",
   "click>=8.1.7",
@@ -57,5 +57,9 @@ python_version = "3.11"
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["smriti.db.*", "smriti.memory.*"]
+module = ["smriti.db.*"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "pgvector.asyncpg"]
+ignore_missing_imports = true

@@ -72,7 +72,7 @@ The memory service is the core. FastAPI and the MCP server are both thin wrapper
 ## Tech stack
 
 **Backend:**
-- Python 3.11+, async-first
+- Python 3.11+, async-first. The project environment is pinned to CPython 3.13; Python 3.14 is excluded until uv editable installs on macOS no longer hide `.pth` files from Python's startup checks.
 - Postgres 16 + pgvector (HNSW indexes)
 - asyncpg for database access (no ORM)
 - Ollama for embeddings (`nomic-embed-text`, 768d) and chat (`qwen2.5:7b` by default)
@@ -93,7 +93,7 @@ The memory service is the core. FastAPI and the MCP server are both thin wrapper
 docker compose up -d
 
 # Install backend deps and apply migrations
-uv sync --extra dev
+uv sync --python 3.13 --extra dev
 uv run migrate up
 
 # Pull local models
