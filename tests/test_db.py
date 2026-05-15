@@ -31,13 +31,14 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
         first_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
         second_run = await apply_migrations(settings=settings, migrations_dir=migrations_dir)
 
-        assert [migration.filename for migration in first_run] == ["001_init.sql"]
+        assert [migration.filename for migration in first_run] == ["001_init.sql", "002_scopes.sql"]
         assert second_run == []
 
         connection = await asyncpg.connect(dsn=database_url)
         try:
             expected_tables = [
                 "users",
+                "scopes",
                 "conversations",
                 "messages",
                 "episodes",
@@ -68,5 +69,65 @@ async def test_migrations_create_schema_and_seed_embedding_model() -> None:
             assert default_model is not None
             assert default_model["provider"] == "ollama"
             assert default_model["dimensions"] == 768
+
+            for table_name in ["users", "conversations", "messages", "episodes"]:
+                data_type = await connection.fetchval(
+                    """
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = $1
+                      AND column_name = 'id';
+                    """,
+                    table_name,
+                )
+                assert data_type == "uuid"
+
+            scope_id_type = await connection.fetchval(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'conversations'
+                  AND column_name = 'scope_id';
+                """
+            )
+            assert scope_id_type == "uuid"
+
+            user_id = await connection.fetchval("INSERT INTO users DEFAULT VALUES RETURNING id;")
+            scope_id = await connection.fetchval(
+                """
+                INSERT INTO scopes (user_id, name, system_prompt)
+                VALUES ($1, $2, $3)
+                RETURNING id;
+                """,
+                user_id,
+                "Test Scope",
+                "You are a scoped assistant.",
+            )
+            conversation_id = await connection.fetchval(
+                """
+                INSERT INTO conversations (user_id, scope_id, title)
+                VALUES ($1, $2, $3)
+                RETURNING id;
+                """,
+                user_id,
+                scope_id,
+                "Cascade test conversation",
+            )
+
+            before_delete = await connection.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE id = $1;",
+                conversation_id,
+            )
+            assert before_delete == 1
+
+            await connection.execute("DELETE FROM scopes WHERE id = $1;", scope_id)
+
+            after_delete = await connection.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE id = $1;",
+                conversation_id,
+            )
+            assert after_delete == 0
         finally:
             await connection.close()
