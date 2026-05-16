@@ -390,4 +390,15 @@ smriti/
 └── experiments/
 ```
 
+## Frontend conventions
+
+Frontend-specific conventions live in `FRONTEND.md`.
+
+When working on frontend code under `frontend/`, read both:
+
+1. `AGENTS.md` for project-wide architecture, privacy, and tooling rules.
+2. `FRONTEND.md` for React, TypeScript, Vite, Tailwind, testing, and frontend API conventions.
+
+If the two conflict, `AGENTS.md` wins for project-wide/privacy rules, and the more restrictive rule wins.
+
 Build incrementally. Do not pre-create empty packages.
