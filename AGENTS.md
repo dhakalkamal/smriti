@@ -6,9 +6,9 @@ Instructions for AI coding agents (Codex, Claude Code, Cursor, etc.) working in 
 
 smriti gives local LLMs long-term conversational memory, organized into user-defined **scopes**. Privacy is a hard requirement, not a feature. Design and code decisions must preserve the property that, with the bundled UI, no user data leaves the machine.
 
-The product has three components, all running on localhost:
+The core local product has three components, all running on localhost:
 
-1. A **Python backend** combining the memory service, a FastAPI HTTP/SSE layer, and an MCP server using FastMCP. All three sit on top of one memory service.
+1. A **Python backend** combining the memory service and a FastAPI HTTP/SSE layer. An MCP server using FastMCP may be added later, but it is optional and deferred until after the core local UI product works.
 2. A **React + TypeScript frontend** that talks to the FastAPI backend over HTTP/SSE.
 3. A **Postgres + pgvector** database in Docker.
 
@@ -124,7 +124,7 @@ The schema supports scopes. Existing v1 code must enforce scope-filtering in eve
 - Ollama for embeddings using `nomic-embed-text`, 768d
 - Chat model: `qwen2.5:7b` by default
 - FastAPI for HTTP/SSE
-- FastMCP for MCP server
+- FastMCP for optional/deferred MCP server
 - uv for dependency management
 - pytest + pytest-asyncio
 - ruff for lint and format
@@ -172,7 +172,7 @@ If you think another choice is better, explain it in the PR description. Do not 
    src/smriti/memory/
    ```
 
-   The MCP server, FastAPI routes, and tests call into the memory service. They do not talk directly to the database.
+   FastAPI routes, tests, and any later MCP server call into the memory service. They do not talk directly to the database.
 
 2. **Raw SQL, not ORMs.**
 
@@ -215,6 +215,10 @@ If you think another choice is better, explain it in the PR description. Do not 
 8. **Strict browser security.**
 
    No remote scripts, unsafe CSP, or external assets.
+
+9. **MCP is optional and deferred.**
+
+   MCP is not required for the core local UI product. No MCP work should happen during Stage 6. If MCP is added later, it must be localhost-only or stdio-based by default and must not expose memory data over public network interfaces.
 
 ---
 
@@ -309,14 +313,15 @@ Follow this strictly:
 2. Migration 002: scopes table + `scope_id`
 3. Embeddings: `Embedder` protocol, `OllamaEmbedder`, `FakeEmbedder`
 4. Memory service core
-5. MCP server
-6. FastAPI layer
+5. Retrieval and eval groundwork
+6. FastAPI local API layer
 7. SSE streaming
 8. React scaffolding
 9. React chat UI
 10. Scope management UI
 11. Rolling summarization
 12. Eval harness
+13. Optional MCP server, deferred until after the core local UI product works
 
 Do not skip ahead.
 

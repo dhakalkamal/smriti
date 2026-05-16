@@ -22,6 +22,18 @@ class ListScopesRequest:
 
 
 @dataclass(frozen=True)
+class ListConversationsRequest:
+    user_id: UUID
+
+
+@dataclass(frozen=True)
+class ListMessagesRequest:
+    user_id: UUID
+    conversation_id: UUID
+    limit: int = 100
+
+
+@dataclass(frozen=True)
 class CreateConversationRequest:
     user_id: UUID
     scope_id: UUID
@@ -32,6 +44,15 @@ class CreateConversationRequest:
 class AppendMessageRequest:
     user_id: UUID
     scope_id: UUID
+    conversation_id: UUID
+    role: MessageRole
+    content: str
+    token_count: int
+
+
+@dataclass(frozen=True)
+class AppendMessageWithEpisodeRequest:
+    user_id: UUID
     conversation_id: UUID
     role: MessageRole
     content: str
@@ -89,7 +110,14 @@ class EpisodeRecord:
 
 
 @dataclass(frozen=True)
+class MessageEpisodeRecord:
+    message: MessageRecord
+    episode: EpisodeRecord
+
+
+@dataclass(frozen=True)
 class ScoredEpisode:
+    result_rank: int
     id: UUID
     user_id: UUID
     scope_id: UUID
