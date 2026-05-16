@@ -11,12 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from smriti.api.dependencies import ApiAppState, set_api_state
 from smriti.api.errors import register_error_handlers
 from smriti.api.routes import (
+    assistant_router,
     conversations_router,
     health_router,
     messages_router,
     retrieval_router,
     scopes_router,
 )
+from smriti.assistant import AssistantOrchestrator
+from smriti.chat import ChatGenerator, OllamaChatGenerator
 from smriti.config import Settings, get_settings
 from smriti.db.client import close_pool, get_pool
 from smriti.embeddings import Embedder, OllamaEmbedder
@@ -29,6 +32,7 @@ def create_app(
     *,
     settings: Settings | None = None,
     embedder: Embedder | None = None,
+    chat_generator: ChatGenerator | None = None,
 ) -> FastAPI:
     """Create the local FastAPI app without binding a network socket."""
 
@@ -38,6 +42,15 @@ def create_app(
         pool = await get_pool(resolved_settings)
         resolved_embedder = embedder or OllamaEmbedder()
         memory_service = MemoryService(pool=pool, embedder=resolved_embedder)
+        resolved_chat_generator = chat_generator or OllamaChatGenerator(
+            model=resolved_settings.ollama_chat_model,
+            base_url=resolved_settings.ollama_base_url,
+            timeout_seconds=resolved_settings.ollama_chat_timeout_seconds,
+        )
+        assistant_orchestrator = AssistantOrchestrator(
+            memory_service=memory_service,
+            chat_generator=resolved_chat_generator,
+        )
         local_user_id = await _ensure_local_user(pool, resolved_settings.local_user_id)
 
         set_api_state(
@@ -47,6 +60,8 @@ def create_app(
                 pool=pool,
                 embedder=resolved_embedder,
                 memory_service=memory_service,
+                chat_generator=resolved_chat_generator,
+                assistant_orchestrator=assistant_orchestrator,
                 local_user_id=local_user_id,
             ),
         )
@@ -77,6 +92,7 @@ def create_app(
     app.include_router(conversations_router)
     app.include_router(messages_router)
     app.include_router(retrieval_router)
+    app.include_router(assistant_router)
     return app
 
 

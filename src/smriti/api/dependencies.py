@@ -6,6 +6,8 @@ from uuid import UUID
 import asyncpg
 from fastapi import FastAPI, Request
 
+from smriti.assistant import AssistantOrchestrator
+from smriti.chat import ChatGenerator
 from smriti.config import Settings
 from smriti.embeddings import Embedder
 from smriti.memory import MemoryService
@@ -19,6 +21,8 @@ class ApiAppState:
     pool: asyncpg.Pool
     embedder: Embedder
     memory_service: MemoryService
+    chat_generator: ChatGenerator
+    assistant_orchestrator: AssistantOrchestrator
     local_user_id: UUID
 
 
@@ -59,6 +63,18 @@ def get_memory_service(request: Request) -> MemoryService:
     """Return the memory service singleton used by thin API routes."""
 
     return get_api_state(request).memory_service
+
+
+def get_chat_generator(request: Request) -> ChatGenerator:
+    """Return the configured local chat generator for API handlers."""
+
+    return get_api_state(request).chat_generator
+
+
+def get_assistant_orchestrator(request: Request) -> AssistantOrchestrator:
+    """Return the assistant orchestrator used by thin API routes."""
+
+    return get_api_state(request).assistant_orchestrator
 
 
 def get_current_local_user_id(request: Request) -> UUID:

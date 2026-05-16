@@ -672,6 +672,337 @@ Stage 7.4 excludes:
   analytics, remote model provider, schema/migration changes, retrieval/scoring redesign, or
   prompt-builder changes unless tests reveal a Stage 7.3 bug
 
+## Stage 7.6: SSE Streaming Assistant Response Contract
+
+The following Stage 7.6 decisions are locked before streaming implementation. They add SSE token
+streaming as an additive transport for the already-completed Stage 7 non-streaming assistant flow.
+
+Earlier Stage 7 wording that excludes SSE or streaming is stage-bounded to the non-streaming work
+through Stage 7.5. Stage 7.6 supersedes that wording only for the streaming contract below; it does
+not change the JSON route, scope/privacy invariants, persistence model, or localhost-only local
+Ollama requirement.
+
+### D7.6.1 — Streaming scope
+
+Stage 7.6 includes:
+
+- SSE streaming route
+- streaming chat generator protocol
+- local Ollama streaming implementation
+- `AssistantOrchestrator.generate_stream(...)`
+- shared preparation logic between streaming and non-streaming generation
+- SSE event schema
+- streaming error semantics
+- cancellation/disconnect semantics
+- streaming tests
+
+Stage 7.6 excludes:
+
+- WebSockets
+- frontend
+- MCP
+- remote providers
+- schema changes for partial assistant messages
+- durable generation queues
+- background jobs
+- partial assistant persistence
+
+SSE is preferred over WebSockets for this stage because assistant token streaming is
+server-to-client only. It fits the existing FastAPI HTTP architecture, keeps the transport
+lower-complexity, and is easier to debug in the localhost-only product.
+
+### D7.6.2 — Route shape
+
+The existing non-streaming route remains unchanged:
+
+```text
+POST /conversations/{conversation_id}/assistant-response
+```
+
+Stage 7.6 adds a sibling streaming route:
+
+```text
+POST /conversations/{conversation_id}/assistant-response/stream
+```
+
+The streaming response media type is:
+
+```text
+text/event-stream
+```
+
+The request body matches the existing non-streaming request shape:
+
+- `scope_id`
+- `query_message_id`
+- `top_k`
+- `max_prompt_chars`
+- `recent_message_limit`
+
+The streaming route is additive rather than a replacement for the JSON route. Keeping both routes
+preserves simpler debugging, deterministic non-streaming tests, eval/programmatic client behavior,
+and lower migration risk. Transport variation must not remove existing stable behavior.
+
+### D7.6.3 — Streaming generator abstraction
+
+Do not replace the existing `ChatGenerator` protocol.
+
+Keep:
+
+```python
+ChatGenerator.generate(...)
+```
+
+Add a sibling streaming protocol, for example:
+
+```python
+StreamingChatGenerator.generate_stream(...)
+```
+
+The streaming protocol returns an async iterator of typed stream chunks/events.
+
+The abstraction must not expose raw Ollama payload dictionaries across service boundaries. The local
+Ollama implementation must remain localhost-only with no remote fallback.
+
+Separate protocols are required, but separate concrete classes are not required. Concrete
+implementations may implement one or both protocols. The contract must not prematurely force an
+inheritance structure.
+
+### D7.6.4 — Orchestrator streaming shape
+
+Do not create a separate streaming orchestrator.
+
+Add:
+
+```python
+AssistantOrchestrator.generate_stream(...)
+```
+
+The orchestrator must share generation preparation logic between:
+
+- `generate(...)`
+- `generate_stream(...)`
+
+Shared preparation includes:
+
+- persisted triggering message validation
+- scoped retrieval
+- deterministic memory selection
+- deterministic prompt construction
+- preservation of memory ordering/provenance invariants
+
+The streaming path must preserve all Stage 7 scope/privacy invariants.
+
+### D7.6.5 — Streaming flow and persistence timing
+
+The streaming flow is:
+
+1. validate triggering message
+2. retrieve scoped memories
+3. select prompt memories
+4. build deterministic prompt
+5. emit start event
+6. start model streaming
+7. emit token events while accumulating full text server-side
+8. after successful generation completion:
+   - persist assistant message + provenance atomically
+9. emit final done event ONLY after persistence succeeds
+
+The done event is the signal that persistence completed successfully.
+
+The final done event carries:
+
+- persisted assistant message metadata
+- chat model
+- finish reason
+- ordered used memory episode ids
+
+If persistence fails after token emission:
+
+- emit SSE error event
+- persist nothing
+- close the stream
+- do not emit done event
+
+Assistant responses are never partially persisted. Provenance is never partially persisted. No
+schema changes are added for failed or interrupted assistant messages.
+
+### D7.6.6 — Transaction boundary
+
+Preserve the Stage 7 transaction model:
+
+- retrieval
+- prompt construction
+- model generation/streaming
+
+all happen outside database transactions.
+
+Only final assistant-message insertion and provenance insertion are atomic.
+
+The orchestrator and API route must not acquire raw database connections or open transactions
+directly.
+
+Persistence continues through:
+
+```python
+MemoryService.append_assistant_response_with_provenance(...)
+```
+
+### D7.6.7 — SSE event schema
+
+Stage 7.6 locks these SSE event types:
+
+- `start`
+- `token`
+- `done`
+- `error`
+
+Start event:
+
+```text
+event: start
+data: {
+  "used_memory_episode_ids": [...]
+}
+```
+
+`chat_model` may optionally be included in the start event if known before streaming begins.
+
+Token event:
+
+```text
+event: token
+data: {
+  "text": "..."
+}
+```
+
+Done event:
+
+```text
+event: done
+data: {
+  "assistant_message": {...},
+  "chat_model": "...",
+  "finish_reason": "...",
+  "used_memory_episode_ids": [...]
+}
+```
+
+Error event:
+
+```text
+event: error
+data: {
+  "code": "...",
+  "message": "..."
+}
+```
+
+SSE payloads must not include:
+
+- prompt text
+- retrieved memory content
+- raw Ollama payloads
+- internal DB rows
+
+### D7.6.8 — Error semantics
+
+Pre-stream errors use normal HTTP error responses, and existing Stage 7 mappings still apply.
+
+Post-stream-start errors use SSE error events. The HTTP status remains `200`, and the stream closes
+after the error event.
+
+The orchestrator continues to map `ChatError` subclasses into assistant-layer errors first. The API
+layer must not expose raw `ChatError` implementations.
+
+### D7.6.9 — Cancellation and disconnect behavior
+
+If the client disconnects or generation is canceled mid-stream:
+
+- generation should be canceled when possible
+- persist nothing
+- write no provenance
+- close the stream
+
+Cancellation/disconnect is not treated as a successful assistant response. Partial assistant output
+must not be persisted.
+
+The implementation mechanism is intentionally not locked yet. The implementation may use:
+
+- `Request.is_disconnected()`
+- streaming write failure detection
+- cancellation propagation
+- or a combination
+
+Stage 7.6 tests must verify:
+
+```text
+disconnect during streaming -> no persistence
+```
+
+### D7.6.10 — FastAPI behavior
+
+Use FastAPI `StreamingResponse` with:
+
+```python
+media_type="text/event-stream"
+```
+
+The route remains a thin adapter.
+
+The route must not:
+
+- issue SQL
+- construct prompts
+- call Ollama directly
+- call `MemoryService` directly for generation logic
+- accept client-supplied scored memories
+- accept client-supplied provenance rows
+
+FastAPI's built-in `StreamingResponse` is sufficient for the initial contract. Do not introduce
+extra SSE dependencies such as `EventSourceResponse` unless implementation later proves they are
+necessary.
+
+### D7.6.11 — Privacy invariants
+
+Stage 7 privacy guarantees extend to SSE:
+
+- no token content logging at INFO-or-below
+- no SSE payload logging at INFO-or-below
+- no memory-content logging
+- no remote providers
+- no telemetry
+- no analytics
+- no CDN/remote assets
+
+Memory content must never appear inside SSE payloads.
+
+Only model-generated tokens and final metadata may be streamed.
+
+### D7.6.12 — Testing requirements
+
+Stage 7.6 implementation must include SSE-specific tests that prove:
+
+- non-streaming route remains unchanged
+- streaming uses the same retrieval/prompt invariants
+- token events emit before persistence
+- done event occurs only after persistence
+- provenance writes occur only after successful completion
+- canceled streams persist nothing
+- disconnects persist nothing
+- generator failures persist nothing
+- post-token failures emit SSE error event
+- assistant responses still create no episodes/embeddings
+- routes issue no SQL
+- routes construct no prompts
+- default tests use fake streaming generators
+- no real Ollama dependency in standard tests
+- no WebSocket implementation is added
+
+Tests should use streaming-capable FastAPI/httpx helpers, SSE parsing helpers, and event-sequence
+assertions.
+
 ## 7. Testing Requirements
 
 Stage 7 implementation must include tests that prove:

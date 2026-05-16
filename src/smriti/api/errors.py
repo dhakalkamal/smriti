@@ -4,6 +4,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from smriti.assistant import (
+    AssistantGenerationFailedError,
+    AssistantGenerationUnavailableError,
+    InvalidAssistantRequestError,
+)
 from smriti.embeddings import (
     EmbeddingConfigurationError,
     EmbeddingConnectionError,
@@ -33,6 +38,36 @@ def register_error_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         _ = (request, exc)
         return _json_error(status.HTTP_400_BAD_REQUEST, "Invalid request")
+
+    @app.exception_handler(InvalidAssistantRequestError)
+    async def invalid_assistant_request_handler(
+        request: Request,
+        exc: InvalidAssistantRequestError,
+    ) -> JSONResponse:
+        _ = (request, exc)
+        return _json_error(status.HTTP_400_BAD_REQUEST, "Invalid assistant request")
+
+    @app.exception_handler(AssistantGenerationUnavailableError)
+    async def assistant_generation_unavailable_handler(
+        request: Request,
+        exc: AssistantGenerationUnavailableError,
+    ) -> JSONResponse:
+        _ = (request, exc)
+        return _json_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Local assistant generation unavailable",
+        )
+
+    @app.exception_handler(AssistantGenerationFailedError)
+    async def assistant_generation_failed_handler(
+        request: Request,
+        exc: AssistantGenerationFailedError,
+    ) -> JSONResponse:
+        _ = (request, exc)
+        return _json_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Assistant generation failed",
+        )
 
     @app.exception_handler(InvalidMemoryRequestError)
     async def invalid_memory_request_handler(

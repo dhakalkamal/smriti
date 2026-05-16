@@ -14,9 +14,13 @@ from testcontainers.postgres import PostgresContainer
 from smriti.api import create_app
 from smriti.api.dependencies import (
     ApiAppState,
+    get_assistant_orchestrator,
+    get_chat_generator,
     get_current_local_user_id,
     get_memory_service,
 )
+from smriti.assistant import AssistantOrchestrator
+from smriti.chat import ChatGenerator, FakeChatGenerator
 from smriti.config import Settings
 from smriti.db.migrate import apply_migrations
 from smriti.embeddings import FakeEmbedder
@@ -28,7 +32,7 @@ from smriti.memory import (
 )
 
 LOCAL_USER_ID = UUID("11111111-1111-4111-8111-111111111111")
-EXPECTED_STAGE_6_ROUTES = {
+EXPECTED_STAGE_7_4_ROUTES = {
     ("GET", "/health"),
     ("GET", "/scopes"),
     ("POST", "/scopes"),
@@ -37,6 +41,7 @@ EXPECTED_STAGE_6_ROUTES = {
     ("GET", "/conversations/{conversation_id}/messages"),
     ("POST", "/conversations/{conversation_id}/messages"),
     ("POST", "/retrieval/search"),
+    ("POST", "/conversations/{conversation_id}/assistant-response"),
 }
 DEFAULT_DOCUMENTATION_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
@@ -45,13 +50,13 @@ def _to_asyncpg_dsn(container_url: str) -> str:
     return re.sub(r"^postgresql\+[^:]+://", "postgresql://", container_url)
 
 
-def test_create_app_registers_only_stage_6_http_routes_without_binding_socket() -> None:
+def test_create_app_registers_only_stage_7_4_http_routes_without_binding_socket() -> None:
     app = create_app(settings=Settings(), embedder=FakeEmbedder(dimensions=768))
 
     route_paths = {getattr(route, "path", None) for route in app.routes}
 
     assert app.title == "Smriti Local API"
-    assert _external_http_api_routes(app) == EXPECTED_STAGE_6_ROUTES
+    assert _external_http_api_routes(app) == EXPECTED_STAGE_7_4_ROUTES
     assert DEFAULT_DOCUMENTATION_PATHS.isdisjoint(route_paths)
 
 
@@ -149,16 +154,24 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
         )
         asyncio.run(apply_migrations(settings=settings, migrations_dir=settings.migrations_dir))
         embedder = FakeEmbedder(dimensions=768)
-        app = create_app(settings=settings, embedder=embedder)
+        chat_generator = FakeChatGenerator()
+        app = create_app(settings=settings, embedder=embedder, chat_generator=chat_generator)
 
         @app.get("/_test/dependencies")
         async def dependency_probe(
             memory_service: Annotated[MemoryService, Depends(get_memory_service)],
+            chat_generator: Annotated[ChatGenerator, Depends(get_chat_generator)],
+            assistant_orchestrator: Annotated[
+                AssistantOrchestrator,
+                Depends(get_assistant_orchestrator),
+            ],
             local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
         ) -> dict[str, str]:
             return {
                 "local_user_id": str(local_user_id),
                 "memory_service": type(memory_service).__name__,
+                "chat_generator": type(chat_generator).__name__,
+                "assistant_orchestrator": type(assistant_orchestrator).__name__,
             }
 
         with TestClient(app) as client:
@@ -168,6 +181,9 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
             assert state.embedder is embedder
             assert state.memory_service.pool is state.pool
             assert state.memory_service.embedder is embedder
+            assert state.chat_generator is chat_generator
+            assert state.assistant_orchestrator.memory_service is state.memory_service
+            assert state.assistant_orchestrator.chat_generator is chat_generator
             assert state.local_user_id == LOCAL_USER_ID
 
             response = client.get("/_test/dependencies")
@@ -176,6 +192,8 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
         assert response.json() == {
             "local_user_id": str(LOCAL_USER_ID),
             "memory_service": "MemoryService",
+            "chat_generator": "FakeChatGenerator",
+            "assistant_orchestrator": "AssistantOrchestrator",
         }
         assert asyncio.run(_local_user_count(settings, LOCAL_USER_ID)) == 1
 

@@ -1198,10 +1198,15 @@ async def test_retrieve_scoped_episodes_sql_filters_scope_before_similarity_orde
     scope_predicate = "WHERE episodes.scope_id = $1"
     user_predicate = "AND conversations.user_id = $2"
     order_clause = "ORDER BY similarity DESC"
+    limit_clause = "LIMIT $5"
     assert scope_predicate in retrieval_sql
     assert user_predicate in retrieval_sql
+    assert order_clause in retrieval_sql
+    assert limit_clause in retrieval_sql
     assert retrieval_sql.index(scope_predicate) < retrieval_sql.index(order_clause)
     assert retrieval_sql.index(user_predicate) < retrieval_sql.index(order_clause)
+    assert retrieval_sql.index(scope_predicate) < retrieval_sql.index(limit_clause)
+    assert retrieval_sql.index(user_predicate) < retrieval_sql.index(limit_clause)
 
 
 @pytest.mark.asyncio

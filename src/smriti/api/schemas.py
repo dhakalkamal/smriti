@@ -151,6 +151,29 @@ class CreatedMessageResponse(BaseModel):
         )
 
 
+class CreateAssistantResponseBody(BaseModel):
+    """Request body for creating a local assistant response."""
+
+    scope_id: UUID
+    query_message_id: UUID
+    top_k: int = Field(default=5, ge=1, le=50)
+    max_prompt_chars: int = Field(default=16000, ge=1, le=100000)
+    recent_message_limit: int = Field(default=20, ge=1, le=200)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AssistantGenerationResponse(BaseModel):
+    """HTTP representation of a generated assistant response."""
+
+    assistant_message: MessageResponse
+    chat_model: str
+    finish_reason: str | None
+    used_memory_episode_ids: list[UUID]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RetrievalSearchBody(BaseModel):
     """Request body for scoped retrieval search."""
 
