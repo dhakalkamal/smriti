@@ -34,6 +34,15 @@ class ListMessagesRequest:
 
 
 @dataclass(frozen=True)
+class LoadAssistantGenerationContextRequest:
+    user_id: UUID
+    scope_id: UUID
+    conversation_id: UUID
+    query_message_id: UUID
+    recent_message_limit: int = 20
+
+
+@dataclass(frozen=True)
 class CreateConversationRequest:
     user_id: UUID
     scope_id: UUID
@@ -57,6 +66,19 @@ class AppendMessageWithEpisodeRequest:
     role: MessageRole
     content: str
     token_count: int
+
+
+@dataclass(frozen=True)
+class AppendAssistantResponseWithProvenanceRequest:
+    user_id: UUID
+    scope_id: UUID
+    conversation_id: UUID
+    query_message_id: UUID
+    content: str
+    token_count: int
+    used: tuple[ScoredEpisode, ...]
+    scoring_version: str | None = None
+    retrieved_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +138,14 @@ class MessageEpisodeRecord:
 
 
 @dataclass(frozen=True)
+class AssistantGenerationContextRecord:
+    scope: ScopeRecord
+    conversation: ConversationRecord
+    query_message: MessageRecord
+    recent_messages: tuple[MessageRecord, ...]
+
+
+@dataclass(frozen=True)
 class ScoredEpisode:
     result_rank: int
     id: UUID
@@ -139,3 +169,11 @@ class ScoredEpisode:
     importance_score: float
     frequency_score: float
     score: float
+
+
+@dataclass(frozen=True)
+class AssistantResponseRecord:
+    message: MessageRecord
+    used_episode_ids: tuple[UUID, ...]
+    scoring_version: str
+    retrieved_at: datetime

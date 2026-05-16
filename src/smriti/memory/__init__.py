@@ -20,8 +20,11 @@ from smriti.memory.eval import (
     run_retrieval_eval,
 )
 from smriti.memory.models import (
+    AppendAssistantResponseWithProvenanceRequest,
     AppendMessageRequest,
     AppendMessageWithEpisodeRequest,
+    AssistantGenerationContextRecord,
+    AssistantResponseRecord,
     ConversationRecord,
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
@@ -31,6 +34,7 @@ from smriti.memory.models import (
     ListConversationsRequest,
     ListMessagesRequest,
     ListScopesRequest,
+    LoadAssistantGenerationContextRequest,
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
@@ -40,8 +44,11 @@ from smriti.memory.models import (
 from smriti.memory.service import MemoryService
 
 __all__ = [
+    "AppendAssistantResponseWithProvenanceRequest",
     "AppendMessageRequest",
     "AppendMessageWithEpisodeRequest",
+    "AssistantGenerationContextRecord",
+    "AssistantResponseRecord",
     "ConversationAccessDeniedError",
     "ConversationNotFoundError",
     "ConversationRecord",
@@ -57,6 +64,7 @@ __all__ = [
     "ListConversationsRequest",
     "ListMessagesRequest",
     "ListScopesRequest",
+    "LoadAssistantGenerationContextRequest",
     "MemoryAccessDeniedError",
     "MemoryService",
     "MemoryServiceError",

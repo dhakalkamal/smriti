@@ -21,8 +21,11 @@ from smriti.memory.errors import (
     VectorDimensionError,
 )
 from smriti.memory.models import (
+    AppendAssistantResponseWithProvenanceRequest,
     AppendMessageRequest,
     AppendMessageWithEpisodeRequest,
+    AssistantGenerationContextRecord,
+    AssistantResponseRecord,
     ConversationRecord,
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
@@ -32,6 +35,7 @@ from smriti.memory.models import (
     ListConversationsRequest,
     ListMessagesRequest,
     ListScopesRequest,
+    LoadAssistantGenerationContextRequest,
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
@@ -77,6 +81,20 @@ class _ScoredEpisodeCandidate:
     importance_score: float
     frequency_score: float
     score: float
+
+
+@dataclass(frozen=True)
+class _PreparedUsedMemories:
+    used_episodes: list[ScoredEpisode]
+    episode_ids: list[UUID]
+    scoring_version: str
+    retrieved_at: datetime
+
+
+@dataclass(frozen=True)
+class _ProvenanceQueryMessageContext:
+    conversation_id: UUID
+    position: int
 
 
 @dataclass(frozen=True)
@@ -169,6 +187,113 @@ class MemoryService:
             )
 
         return [_message_from_row(row) for row in rows]
+
+    async def load_assistant_generation_context(
+        self,
+        request: LoadAssistantGenerationContextRequest,
+    ) -> AssistantGenerationContextRecord:
+        """Load scope prompt and recent conversation messages for assistant generation."""
+
+        if request.recent_message_limit < 1:
+            raise InvalidMemoryRequestError("recent_message_limit must be at least one")
+
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT
+                    scopes.id AS scope_id,
+                    scopes.user_id AS scope_user_id,
+                    scopes.name AS scope_name,
+                    scopes.system_prompt AS scope_system_prompt,
+                    scopes.created_at AS scope_created_at,
+                    scopes.updated_at AS scope_updated_at,
+                    conversations.id AS conversation_id,
+                    conversations.user_id AS conversation_user_id,
+                    conversations.scope_id AS conversation_scope_id,
+                    conversations.title AS conversation_title,
+                    conversations.created_at AS conversation_created_at,
+                    conversations.updated_at AS conversation_updated_at,
+                    query_messages.id AS query_message_id,
+                    query_messages.conversation_id AS query_conversation_id,
+                    query_messages.position AS query_position,
+                    query_messages.role AS query_role,
+                    query_messages.content AS query_content,
+                    query_messages.token_count AS query_token_count,
+                    query_messages.created_at AS query_created_at
+                FROM conversations
+                INNER JOIN scopes
+                    ON scopes.id = conversations.scope_id
+                LEFT JOIN messages AS query_messages
+                    ON query_messages.conversation_id = conversations.id
+                   AND query_messages.id = $2
+                WHERE conversations.id = $1;
+                """,
+                request.conversation_id,
+                request.query_message_id,
+            )
+            if row is None:
+                raise ConversationNotFoundError("Conversation does not exist")
+            if cast(UUID, row["conversation_user_id"]) != request.user_id:
+                raise ConversationAccessDeniedError("Conversation belongs to a different user")
+            if cast(UUID, row["conversation_scope_id"]) != request.scope_id:
+                raise ConversationNotFoundError("Conversation is not in the expected scope")
+            if cast(UUID, row["scope_user_id"]) != request.user_id:
+                raise ScopeAccessDeniedError("Scope belongs to a different user")
+            if row["query_message_id"] is None:
+                raise ConversationNotFoundError("Query message is not in the expected conversation")
+            if cast(str, row["query_role"]) != "user":
+                raise InvalidProvenanceTargetError(
+                    "Assistant generation requires a user query message"
+                )
+
+            recent_rows = await connection.fetch(
+                """
+                SELECT id, conversation_id, position, role, content, token_count, created_at
+                FROM (
+                    SELECT id, conversation_id, position, role, content, token_count, created_at
+                    FROM messages
+                    WHERE conversation_id = $1
+                      AND position <= $2
+                    ORDER BY position DESC, id DESC
+                    LIMIT $3
+                ) AS recent_messages
+                ORDER BY position ASC, id ASC;
+                """,
+                request.conversation_id,
+                cast(int, row["query_position"]),
+                request.recent_message_limit,
+            )
+
+        query_message = MessageRecord(
+            id=cast(UUID, row["query_message_id"]),
+            conversation_id=cast(UUID, row["query_conversation_id"]),
+            position=cast(int, row["query_position"]),
+            role=cast(MessageRole, row["query_role"]),
+            content=cast(str, row["query_content"]),
+            token_count=cast(int, row["query_token_count"]),
+            created_at=cast(datetime, row["query_created_at"]),
+        )
+
+        return AssistantGenerationContextRecord(
+            scope=ScopeRecord(
+                id=cast(UUID, row["scope_id"]),
+                user_id=cast(UUID, row["scope_user_id"]),
+                name=cast(str, row["scope_name"]),
+                system_prompt=cast(str, row["scope_system_prompt"]),
+                created_at=cast(datetime, row["scope_created_at"]),
+                updated_at=cast(datetime, row["scope_updated_at"]),
+            ),
+            conversation=ConversationRecord(
+                id=cast(UUID, row["conversation_id"]),
+                user_id=cast(UUID, row["conversation_user_id"]),
+                scope_id=cast(UUID, row["conversation_scope_id"]),
+                title=cast(str | None, row["conversation_title"]),
+                created_at=cast(datetime, row["conversation_created_at"]),
+                updated_at=cast(datetime, row["conversation_updated_at"]),
+            ),
+            query_message=query_message,
+            recent_messages=tuple(_message_from_row(recent_row) for recent_row in recent_rows),
+        )
 
     async def create_conversation(
         self,
@@ -477,21 +602,13 @@ class MemoryService:
     ) -> None:
         """Persist immutable provenance snapshots for memories used in one assistant response."""
 
-        used_episodes = list(used)
-        if not used_episodes:
-            return
-
-        if scoring_version.strip() == "":
-            raise InvalidRetrievalRequestError("scoring_version must not be empty")
-
-        resolved_retrieved_at = (
-            datetime.now(timezone.utc)  # noqa: UP017
-            if retrieved_at is None
-            else _ensure_aware_utc(retrieved_at)
+        prepared = self._prepare_used_memories(
+            used=used,
+            scoring_version=scoring_version,
+            retrieved_at=retrieved_at,
         )
-        episode_ids = [episode.id for episode in used_episodes]
-        if len(set(episode_ids)) != len(episode_ids):
-            raise InvalidRetrievalRequestError("used episodes must not contain duplicate ids")
+        if not prepared.used_episodes:
+            return
 
         async with self.pool.acquire() as connection, connection.transaction():
             query_conversation_id = await self._provenance_message_conversation_id(
@@ -505,7 +622,7 @@ class MemoryService:
                 connection=connection,
                 user_id=user_id,
                 scope_id=scope_id,
-                episode_ids=episode_ids,
+                episode_ids=prepared.episode_ids,
             )
             await self._insert_message_retrievals(
                 connection=connection,
@@ -513,10 +630,83 @@ class MemoryService:
                 assistant_message_id=assistant_message_id,
                 query_conversation_id=query_conversation_id,
                 scope_id=scope_id,
-                used=used_episodes,
-                scoring_version=scoring_version,
-                retrieved_at=resolved_retrieved_at,
+                used=prepared.used_episodes,
+                scoring_version=prepared.scoring_version,
+                retrieved_at=prepared.retrieved_at,
             )
+
+    async def append_assistant_response_with_provenance(
+        self,
+        request: AppendAssistantResponseWithProvenanceRequest,
+    ) -> AssistantResponseRecord:
+        """Append an assistant message and its used-memory provenance atomically."""
+
+        if request.token_count < 0:
+            raise InvalidMemoryRequestError("token_count must be non-negative")
+
+        prepared = self._prepare_used_memories(
+            used=request.used,
+            scoring_version=request.scoring_version or SCORING_VERSION,
+            retrieved_at=request.retrieved_at,
+        )
+
+        async with self.pool.acquire() as connection, connection.transaction():
+            query_context = await self._provenance_query_message_context(
+                connection=connection,
+                user_id=request.user_id,
+                scope_id=request.scope_id,
+                conversation_id=request.conversation_id,
+                query_message_id=request.query_message_id,
+            )
+            if prepared.used_episodes:
+                await self._ensure_used_episodes_belong_to_scope_user(
+                    connection=connection,
+                    user_id=request.user_id,
+                    scope_id=request.scope_id,
+                    episode_ids=prepared.episode_ids,
+                )
+            assistant_row = await connection.fetchrow(
+                """
+                INSERT INTO messages (conversation_id, position, role, content, token_count)
+                VALUES (
+                    $1,
+                    (
+                        SELECT COALESCE(MAX(position), 0) + 1
+                        FROM messages
+                        WHERE conversation_id = $1
+                    ),
+                    'assistant',
+                    $2,
+                    $3
+                )
+                RETURNING id, conversation_id, position, role, content, token_count, created_at;
+                """,
+                request.conversation_id,
+                request.content,
+                request.token_count,
+            )
+            if assistant_row is None:
+                raise ConversationNotFoundError("Assistant response was not appended")
+
+            assistant_message_id = cast(UUID, assistant_row["id"])
+            if prepared.used_episodes:
+                await self._insert_message_retrievals(
+                    connection=connection,
+                    query_message_id=request.query_message_id,
+                    assistant_message_id=assistant_message_id,
+                    query_conversation_id=query_context.conversation_id,
+                    scope_id=request.scope_id,
+                    used=prepared.used_episodes,
+                    scoring_version=prepared.scoring_version,
+                    retrieved_at=prepared.retrieved_at,
+                )
+
+        return AssistantResponseRecord(
+            message=_message_from_row(assistant_row),
+            used_episode_ids=tuple(prepared.episode_ids),
+            scoring_version=prepared.scoring_version,
+            retrieved_at=prepared.retrieved_at,
+        )
 
     async def _get_message_for_scope(
         self,
@@ -575,6 +765,69 @@ class MemoryService:
         if scope_owner_id != user_id:
             raise ScopeAccessDeniedError("Scope belongs to a different user")
 
+    def _prepare_used_memories(
+        self,
+        used: Sequence[ScoredEpisode],
+        scoring_version: str,
+        retrieved_at: datetime | None,
+    ) -> _PreparedUsedMemories:
+        used_episodes = list(used)
+        if scoring_version.strip() == "":
+            raise InvalidRetrievalRequestError("scoring_version must not be empty")
+
+        resolved_retrieved_at = (
+            datetime.now(timezone.utc)  # noqa: UP017
+            if retrieved_at is None
+            else _ensure_aware_utc(retrieved_at)
+        )
+        episode_ids = [episode.id for episode in used_episodes]
+        if len(set(episode_ids)) != len(episode_ids):
+            raise InvalidRetrievalRequestError("used episodes must not contain duplicate ids")
+
+        return _PreparedUsedMemories(
+            used_episodes=used_episodes,
+            episode_ids=episode_ids,
+            scoring_version=scoring_version,
+            retrieved_at=resolved_retrieved_at,
+        )
+
+    async def _provenance_query_message_context(
+        self,
+        connection: asyncpg.Connection,
+        user_id: UUID,
+        scope_id: UUID,
+        conversation_id: UUID,
+        query_message_id: UUID,
+    ) -> _ProvenanceQueryMessageContext:
+        row = await connection.fetchrow(
+            """
+            SELECT
+                query_messages.conversation_id AS query_conversation_id,
+                query_messages.position AS query_position,
+                query_messages.role AS query_role,
+                query_conversations.user_id AS query_user_id,
+                query_conversations.scope_id AS query_scope_id
+            FROM messages AS query_messages
+            INNER JOIN conversations AS query_conversations
+                ON query_conversations.id = query_messages.conversation_id
+            WHERE query_messages.id = $1
+            FOR UPDATE OF query_conversations;
+            """,
+            query_message_id,
+        )
+        query_conversation_id = self._validate_provenance_query_message(
+            row=row,
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+        )
+        if row is None:
+            raise ConversationNotFoundError("Query message does not exist")
+        return _ProvenanceQueryMessageContext(
+            conversation_id=query_conversation_id,
+            position=cast(int, row["query_position"]),
+        )
+
     async def _provenance_message_conversation_id(
         self,
         connection: asyncpg.Connection,
@@ -606,15 +859,49 @@ class MemoryService:
             query_message_id,
             assistant_message_id,
         )
+        query_conversation_id = self._validate_provenance_query_message(
+            row=row,
+            user_id=user_id,
+            scope_id=scope_id,
+        )
+        self._validate_provenance_assistant_message(
+            row=row,
+            user_id=user_id,
+            scope_id=scope_id,
+            query_conversation_id=query_conversation_id,
+        )
+
+        return query_conversation_id
+
+    def _validate_provenance_query_message(
+        self,
+        row: asyncpg.Record | None,
+        user_id: UUID,
+        scope_id: UUID,
+        conversation_id: UUID | None = None,
+    ) -> UUID:
         if row is None:
             raise ConversationNotFoundError("Query message does not exist")
         if cast(UUID, row["query_user_id"]) != user_id:
             raise ConversationAccessDeniedError("Conversation belongs to a different user")
         if cast(UUID, row["query_scope_id"]) != scope_id:
             raise ConversationNotFoundError("Query message is not in the expected scope")
+        query_conversation_id = cast(UUID, row["query_conversation_id"])
+        if conversation_id is not None and query_conversation_id != conversation_id:
+            raise ConversationNotFoundError("Query message is not in the expected conversation")
         if cast(str, row["query_role"]) != "user":
             raise InvalidProvenanceTargetError("Retrieval provenance requires a user query message")
+        return query_conversation_id
 
+    def _validate_provenance_assistant_message(
+        self,
+        row: asyncpg.Record | None,
+        user_id: UUID,
+        scope_id: UUID,
+        query_conversation_id: UUID,
+    ) -> None:
+        if row is None:
+            raise ConversationNotFoundError("Query message does not exist")
         if row["assistant_conversation_id"] is None:
             raise ConversationNotFoundError("Assistant message does not exist")
         if cast(UUID, row["assistant_user_id"]) != user_id:
@@ -622,15 +909,12 @@ class MemoryService:
         if cast(UUID, row["assistant_scope_id"]) != scope_id:
             raise ConversationNotFoundError("Assistant message is not in the expected scope")
         assistant_conversation_id = cast(UUID, row["assistant_conversation_id"])
-        query_conversation_id = cast(UUID, row["query_conversation_id"])
         if assistant_conversation_id != query_conversation_id:
             raise ConversationNotFoundError("Assistant message is not in the query conversation")
         if cast(str, row["assistant_role"]) != "assistant":
             raise InvalidProvenanceTargetError(
                 "Retrieval provenance requires an assistant response message"
             )
-
-        return query_conversation_id
 
     async def _ensure_used_episodes_belong_to_scope_user(
         self,

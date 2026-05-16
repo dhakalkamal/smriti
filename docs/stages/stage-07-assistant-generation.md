@@ -522,22 +522,155 @@ Justification: Stage 7.3 should complete the service-layer assistant flow while 
 adaptation to Stage 7.4. Keeping retrieval/scoring and streaming out of scope protects the current
 memory-service behavior while the first generation path is stabilized.
 
+## Stage 7.4 Detailed Contract
+
+The following Stage 7.4 decisions are locked before implementation. They define the non-streaming
+HTTP adapter for the Stage 7.3 assistant orchestrator and do not change Stage 7.1-7.3 decisions.
+
+### D7.4.1 — Route path
+
+The assistant-generation route is:
+
+```text
+POST /conversations/{conversation_id}/assistant-response
+```
+
+This matches the existing Stage 6 API naming style: conversation-owned behavior is nested under
+`/conversations/{conversation_id}/...`, and action-style POST routes may use explicit action names,
+as with `/retrieval/search`.
+
+### D7.4.2 — Route responsibility
+
+The route is a thin HTTP adapter.
+
+It must:
+
+- resolve the configured local user through the existing Stage 6 dependency path
+- construct `AssistantGenerationRequest`
+- call `AssistantOrchestrator.generate(...)`
+- serialize the structured result to JSON
+- map typed errors to HTTP responses
+
+It must not:
+
+- issue SQL
+- call `MemoryService` directly for generation behavior
+- call `ChatGenerator` directly
+- accept client-supplied scored memories
+- accept client-supplied provenance rows
+- construct prompts itself
+
+### D7.4.3 — Request body
+
+Request body fields:
+
+- `scope_id: UUID`
+- `query_message_id: UUID`
+- `top_k: int = 5`
+- `max_prompt_chars: int = 16000`
+- `recent_message_limit: int = 20`
+
+Validation:
+
+- `top_k >= 1`
+- `max_prompt_chars >= 1`
+- `recent_message_limit >= 1`
+
+The `conversation_id` comes only from the path.
+
+### D7.4.4 — Response body
+
+Response body fields:
+
+- `assistant_message`
+- `chat_model`
+- `finish_reason`
+- `used_memory_episode_ids`
+
+`assistant_message` uses the existing `MessageResponse` API shape.
+
+`used_memory_episode_ids` is a flat ordered UUID list in Stage 7.4. Richer provenance summaries are
+deferred.
+
+### D7.4.5 — Dependency wiring
+
+The API layer wires:
+
+- `MemoryService`
+- configured local `ChatGenerator`
+- `AssistantOrchestrator`
+
+Use the existing FastAPI dependency style from Stage 6. The configured local user should continue
+to flow through `get_current_local_user_id`, and assistant dependencies should be exposed through
+typed dependency getters analogous to the current `get_memory_service` path.
+
+Do not introduce global mutable singletons unless existing API patterns already do so. Prefer
+lifespan-created dependencies stored on the typed app state, matching the Stage 6 pattern.
+
+### D7.4.6 — Error mapping
+
+Update `src/smriti/api/errors.py` during Stage 7.4 implementation to map:
+
+```text
+InvalidAssistantRequestError          -> 400 Bad Request
+AssistantGenerationUnavailableError  -> 503 Service Unavailable
+AssistantGenerationFailedError       -> 500 Internal Server Error
+```
+
+Memory-service errors continue to use existing mappings.
+
+The route must not map raw `ChatError` subclasses because the orchestrator maps them first.
+
+### D7.4.7 — Local-only and privacy behavior
+
+The route must preserve:
+
+- localhost-only app behavior
+- localhost-only CORS behavior
+- no telemetry
+- no remote providers
+- no prompt/message/memory content in INFO-or-below logs
+
+### D7.4.8 — Stage scope
+
+Stage 7.4 includes:
+
+- API request/response models
+- assistant-generation route
+- API dependency wiring for `AssistantOrchestrator`
+- assistant error mappings in `src/smriti/api/errors.py`
+- route tests
+
+Stage 7.4 excludes:
+
+- SSE
+- frontend
+- MCP
+- streaming generation
+- schema/migration changes
+- retrieval/scoring redesign
+- prompt-builder changes unless tests reveal a Stage 7.3 bug
+
 ### Step 7.4: API Route
 
-- add a non-streaming assistant-generation route
+- add `POST /conversations/{conversation_id}/assistant-response`
+- add request and response models matching D7.4.3 and D7.4.4
 - resolve the configured local user through the Stage 6 dependency path
-- call the assistant orchestrator rather than issuing memory SQL directly
-- return the created assistant message and used-memory provenance summary
-- map memory service errors to the existing generic 404/400/500 behavior
-- map local chat generator connection and timeout errors to `503 Service Unavailable`
-- map local chat generator configuration or invalid-response errors to `500 Internal Server Error`
-
-Note: per D7.3.12, chat-generator errors are mapped to assistant-generation errors at the
-orchestrator boundary. Stage 7.4 route mappings should consume assistant-generation errors rather
-than raw ChatError subclasses.
-
-- preserve localhost-only CORS and app-binding behavior
-- add no SSE, frontend, MCP, telemetry, analytics, or remote model provider
+- wire the configured local `ChatGenerator` and `AssistantOrchestrator` through existing FastAPI
+  dependency patterns
+- construct `AssistantGenerationRequest` from the path, body, and local user id
+- call `AssistantOrchestrator.generate(...)` and serialize its structured result
+- return the created assistant message using the existing `MessageResponse` API shape
+- return `chat_model`, `finish_reason`, and ordered `used_memory_episode_ids`
+- update `src/smriti/api/errors.py` to map assistant-generation errors per D7.4.6
+- continue to let memory-service errors use existing API mappings
+- do not map raw `ChatError` subclasses in the API layer
+- do not issue SQL, call `MemoryService` directly for generation behavior, call `ChatGenerator`
+  directly, accept client-supplied scored memories or provenance rows, or construct prompts in the
+  route
+- preserve localhost-only CORS and app-binding behavior, with no SSE, frontend, MCP, telemetry,
+  analytics, remote model provider, schema/migration changes, retrieval/scoring redesign, or
+  prompt-builder changes unless tests reveal a Stage 7.3 bug
 
 ## 7. Testing Requirements
 
