@@ -65,3 +65,8 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["asyncpg", "pgvector.asyncpg"]
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "uvicorn>=0.47.0",
+]
