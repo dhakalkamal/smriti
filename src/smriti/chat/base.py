@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 ChatRole = Literal["system", "user", "assistant"]
 
@@ -39,6 +40,25 @@ class ChatResponse:
     usage: ChatUsage = field(default_factory=ChatUsage)
 
 
+@dataclass(frozen=True)
+class ChatStreamToken:
+    """One generated text fragment from a streaming chat backend."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class ChatStreamFinal:
+    """Final metadata from a successfully completed streaming chat response."""
+
+    model: str
+    finish_reason: str | None = None
+    usage: ChatUsage = field(default_factory=ChatUsage)
+
+
+ChatStreamEvent = ChatStreamToken | ChatStreamFinal
+
+
 class ChatGenerator(Protocol):
     """Async interface for components that produce complete chat responses."""
 
@@ -48,3 +68,15 @@ class ChatGenerator(Protocol):
 
     async def generate(self, request: ChatRequest) -> ChatResponse:
         """Generate one complete assistant response."""
+
+
+@runtime_checkable
+class StreamingChatGenerator(Protocol):
+    """Async interface for components that stream typed chat events."""
+
+    @property
+    def model(self) -> str:
+        """Return the configured chat model identifier."""
+
+    def generate_stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamEvent]:
+        """Stream one assistant response as typed chunks and final metadata."""

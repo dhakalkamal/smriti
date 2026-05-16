@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import ParseResult, urlparse
 
 import httpx
 
-from smriti.chat.base import ChatMessage, ChatRequest, ChatResponse, ChatUsage
+from smriti.chat.base import (
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatStreamEvent,
+    ChatStreamFinal,
+    ChatStreamToken,
+    ChatUsage,
+)
 from smriti.chat.errors import (
     ChatConfigurationError,
     ChatConnectionError,
@@ -45,6 +55,18 @@ class OllamaChatGenerator:
         response = await self._post_json(payload)
         return self._parse_chat_response(response)
 
+    async def generate_stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamEvent]:
+        """Stream one assistant response through local Ollama."""
+
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [self._message_payload(message) for message in request.messages],
+            "stream": True,
+        }
+
+        async for event in self._stream_json(payload):
+            yield event
+
     async def _post_json(self, payload: dict[str, object]) -> Any:
         request_url = self._chat_url()
 
@@ -71,6 +93,44 @@ class OllamaChatGenerator:
             return response.json()
         except ValueError as exc:
             raise ChatResponseError("Ollama returned non-JSON chat response") from exc
+
+    async def _stream_json(self, payload: dict[str, object]) -> AsyncIterator[ChatStreamEvent]:
+        request_url = self._chat_url()
+        saw_final = False
+
+        try:
+            async with (
+                httpx.AsyncClient(
+                    follow_redirects=False,
+                    timeout=self.timeout_seconds,
+                    trust_env=False,
+                ) as client,
+                client.stream("POST", request_url, json=payload) as response,
+            ):
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    event = self._parse_chat_stream_event(self._parse_stream_line(line))
+                    if isinstance(event, ChatStreamFinal):
+                        saw_final = True
+                        yield event
+                        return
+                    if event.text:
+                        yield event
+        except httpx.TimeoutException as exc:
+            raise ChatTimeoutError(
+                f"Ollama chat request timed out after {self.timeout_seconds} seconds"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_error_detail(exc.response)
+            raise ChatResponseError(f"Ollama chat request failed: {detail}") from exc
+        except httpx.RequestError as exc:
+            message = f"Could not connect to Ollama at {self.base_url}"
+            raise ChatConnectionError(message) from exc
+
+        if not saw_final:
+            raise ChatResponseError("Ollama chat stream ended without final response")
 
     def _parse_base_url(self) -> ParseResult:
         parsed_url = urlparse(self.base_url)
@@ -131,6 +191,43 @@ class OllamaChatGenerator:
                 completion_tokens=self._optional_int(response.get("eval_count")),
             ),
         )
+
+    def _parse_stream_line(self, line: str) -> Any:
+        try:
+            return json.loads(line)
+        except ValueError as exc:
+            raise ChatResponseError("Ollama returned non-JSON chat stream event") from exc
+
+    def _parse_chat_stream_event(self, response: Any) -> ChatStreamEvent:
+        if not isinstance(response, dict):
+            raise ChatResponseError("Ollama chat stream event must be a JSON object")
+
+        if response.get("done") is True:
+            model = response.get("model")
+            if not isinstance(model, str) or not model:
+                raise ChatResponseError("Ollama final chat stream event is missing model")
+            return ChatStreamFinal(
+                model=model,
+                finish_reason=self._optional_string(response.get("done_reason")),
+                usage=ChatUsage(
+                    prompt_tokens=self._optional_int(response.get("prompt_eval_count")),
+                    completion_tokens=self._optional_int(response.get("eval_count")),
+                ),
+            )
+
+        message = response.get("message")
+        if not isinstance(message, dict):
+            raise ChatResponseError("Ollama chat stream event is missing message")
+
+        role = message.get("role")
+        if role is not None and role != "assistant":
+            raise ChatResponseError("Ollama chat stream message role must be assistant")
+
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ChatResponseError("Ollama chat stream event is missing message content")
+
+        return ChatStreamToken(text=content)
 
     def _message_payload(self, message: ChatMessage) -> dict[str, str]:
         return {"role": message.role, "content": message.content}

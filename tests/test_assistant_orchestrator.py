@@ -13,6 +13,10 @@ from smriti.assistant import (
     AssistantGenerationRequest,
     AssistantGenerationUnavailableError,
     AssistantOrchestrator,
+    AssistantStreamDone,
+    AssistantStreamError,
+    AssistantStreamStart,
+    AssistantStreamToken,
 )
 from smriti.chat import (
     ChatConfigurationError,
@@ -20,8 +24,10 @@ from smriti.chat import (
     ChatRequest,
     ChatResponse,
     ChatResponseError,
+    ChatStreamFinal,
     ChatTimeoutError,
     ChatUsage,
+    FakeStreamingChatGenerator,
 )
 from smriti.memory import (
     AppendAssistantResponseWithProvenanceRequest,
@@ -89,6 +95,185 @@ async def test_assistant_orchestrator_generates_once_and_persists_selected_memor
     assert result.chat_model == "fake-chat"
     assert result.finish_reason == "stop"
     assert result.used_memory_episode_ids == (high_memory.id,)
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_streams_tokens_then_persists_before_done() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 2, "user", "find memory")
+    memory = _episode(UUID(int=10), rank=1, score=0.9, content="high memory")
+    persisted_message = _message(UUID(int=20), conversation_id, 3, "assistant", "hello world")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[memory],
+        persisted=AssistantResponseRecord(
+            message=persisted_message,
+            used_episode_ids=(memory.id,),
+            scoring_version="stage-5.2-weighted-v1",
+            retrieved_at=FIXED_NOW,
+        ),
+    )
+    chat_generator = FakeStreamingChatGenerator(
+        tokens=["hello", " world"],
+        final=ChatStreamFinal(model="fake-stream", finish_reason="stop", usage=ChatUsage(2, 2)),
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=chat_generator,
+    )
+    request = AssistantGenerationRequest(
+        user_id=user_id,
+        scope_id=scope_id,
+        conversation_id=conversation_id,
+        query_message_id=query_message.id,
+        top_k=1,
+    )
+
+    prepared = await orchestrator.prepare_stream(request)
+    stream = orchestrator.stream_prepared(prepared)
+
+    assert await anext(stream) == AssistantStreamStart(
+        used_memory_episode_ids=(memory.id,),
+        chat_model="fake-stream",
+    )
+    assert memory_service.persist_requests == []
+    assert await anext(stream) == AssistantStreamToken(text="hello")
+    assert memory_service.persist_requests == []
+    assert await anext(stream) == AssistantStreamToken(text=" world")
+    assert memory_service.persist_requests == []
+    done = await anext(stream)
+
+    assert isinstance(done, AssistantStreamDone)
+    assert done.assistant_message == persisted_message
+    assert done.chat_model == "fake-stream"
+    assert done.finish_reason == "stop"
+    assert done.used_memory_episode_ids == (memory.id,)
+    assert memory_service.persist_requests[0].content == "hello world"
+    assert memory_service.persist_requests[0].used == (memory,)
+    assert memory_service.persist_requests[0].token_count == 2
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_stream_failure_after_token_persists_nothing() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 1, "user", "question")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=FakeStreamingChatGenerator(
+            tokens=["partial"],
+            error=ChatResponseError("PRIVATE_STREAM_FAILURE"),
+            fail_after_tokens=1,
+        ),
+    )
+    prepared = await orchestrator.prepare_stream(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+        )
+    )
+
+    events = [event async for event in orchestrator.stream_prepared(prepared)]
+
+    assert events == [
+        AssistantStreamStart(
+            used_memory_episode_ids=(),
+            chat_model="fake-streaming-chat-generator",
+        ),
+        AssistantStreamToken(text="partial"),
+        AssistantStreamError(
+            code="assistant_generation_failed",
+            message="Local assistant generation failed",
+        ),
+    ]
+    assert memory_service.persist_requests == []
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_stream_generator_failure_persists_nothing() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 1, "user", "question")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=FakeStreamingChatGenerator(
+            tokens=[],
+            error=ChatConnectionError("PRIVATE_CONNECTION_FAILURE"),
+        ),
+    )
+    prepared = await orchestrator.prepare_stream(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+        )
+    )
+
+    events = [event async for event in orchestrator.stream_prepared(prepared)]
+
+    assert events == [
+        AssistantStreamStart(
+            used_memory_episode_ids=(),
+            chat_model="fake-streaming-chat-generator",
+        ),
+        AssistantStreamError(
+            code="assistant_generation_unavailable",
+            message="Local assistant generation unavailable",
+        ),
+    ]
+    assert memory_service.persist_requests == []
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_stream_cancellation_persists_nothing() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 1, "user", "question")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=FakeStreamingChatGenerator(tokens=["partial", " ignored"]),
+    )
+    prepared = await orchestrator.prepare_stream(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+        )
+    )
+    stream = orchestrator.stream_prepared(prepared)
+
+    assert isinstance(await anext(stream), AssistantStreamStart)
+    assert await anext(stream) == AssistantStreamToken(text="partial")
+    await stream.aclose()
+
+    assert memory_service.persist_requests == []
 
 
 @pytest.mark.asyncio
@@ -225,6 +410,52 @@ async def test_assistant_orchestrator_does_not_log_content_at_info_or_below(
                 top_k=1,
             )
         )
+
+    assistant_records = [
+        record
+        for record in caplog.records
+        if (record.name == "smriti.assistant" or record.name.startswith("smriti.assistant."))
+        and record.levelno <= logging.INFO
+    ]
+    assert all(sentinel not in record.getMessage() for record in assistant_records)
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_stream_does_not_log_content_at_info_or_below(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "ASSISTANT_STAGE_7_6_SENTINEL"
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 1, "user", sentinel)
+    persisted_message = _message(UUID(int=20), conversation_id, 2, "assistant", sentinel)
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[_episode(UUID(int=10), rank=1, score=0.9, content=sentinel)],
+        persisted=AssistantResponseRecord(
+            message=persisted_message,
+            used_episode_ids=(UUID(int=10),),
+            scoring_version="stage-5.2-weighted-v1",
+            retrieved_at=FIXED_NOW,
+        ),
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=FakeStreamingChatGenerator(tokens=[sentinel]),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        prepared = await orchestrator.prepare_stream(
+            AssistantGenerationRequest(
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                query_message_id=query_message.id,
+                top_k=1,
+            )
+        )
+        _ = [event async for event in orchestrator.stream_prepared(prepared)]
 
     assistant_records = [
         record

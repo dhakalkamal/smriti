@@ -17,10 +17,14 @@ from smriti.chat import (
     ChatRequest,
     ChatResponse,
     ChatResponseError,
+    ChatStreamFinal,
+    ChatStreamToken,
     ChatTimeoutError,
     ChatUsage,
     FakeChatGenerator,
+    FakeStreamingChatGenerator,
     OllamaChatGenerator,
+    StreamingChatGenerator,
 )
 
 
@@ -58,6 +62,36 @@ async def test_fake_chat_generator_raises_configured_error() -> None:
 
     with pytest.raises(ChatTimeoutError):
         await generator.generate(ChatRequest(messages=(ChatMessage(role="user", content="hi"),)))
+
+
+@pytest.mark.asyncio
+async def test_fake_streaming_chat_generator_yields_tokens_and_default_final() -> None:
+    generator: StreamingChatGenerator = FakeStreamingChatGenerator(tokens=["hello", " world"])
+    request = ChatRequest(messages=(ChatMessage(role="user", content="hi"),))
+
+    events = [event async for event in generator.generate_stream(request)]
+
+    assert events == [
+        ChatStreamToken(text="hello"),
+        ChatStreamToken(text=" world"),
+        ChatStreamFinal(model="fake-streaming-chat-generator", finish_reason="stop"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fake_streaming_chat_generator_raises_mid_stream_error() -> None:
+    generator = FakeStreamingChatGenerator(
+        tokens=["before", "after"],
+        error=ChatResponseError("stream failed"),
+        fail_after_tokens=1,
+    )
+    stream = generator.generate_stream(
+        ChatRequest(messages=(ChatMessage(role="user", content="hi"),))
+    )
+
+    assert await anext(stream) == ChatStreamToken(text="before")
+    with pytest.raises(ChatResponseError):
+        await anext(stream)
 
 
 def test_chat_errors_mirror_embedding_error_names() -> None:
@@ -159,6 +193,96 @@ async def test_ollama_chat_generator_posts_non_streaming_request_to_local_chat_e
                     {"role": "user", "content": "Say hello."},
                 ],
                 "stream": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ollama_chat_generator_streams_local_chat_events() -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        request_head = await reader.readuntil(b"\r\n\r\n")
+        headers = _parse_request_headers(request_head)
+        body = await reader.readexactly(int(headers["content-length"]))
+        request_line = request_head.decode("iso-8859-1").split("\r\n", maxsplit=1)[0]
+        requests.append((request_line, json.loads(body.decode("utf-8"))))
+
+        response_body = (
+            json.dumps(
+                {
+                    "model": "qwen2.5:7b",
+                    "message": {"role": "assistant", "content": "hel"},
+                    "done": False,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "model": "qwen2.5:7b",
+                    "message": {"role": "assistant", "content": "lo"},
+                    "done": False,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "model": "qwen2.5:7b",
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 11,
+                    "eval_count": 2,
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/x-ndjson\r\n"
+            + f"Content-Length: {len(response_body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + response_body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    try:
+        port = _server_port(server)
+        generator = OllamaChatGenerator(
+            base_url=f"http://127.0.0.1:{port}",
+            model="qwen2.5:7b",
+            timeout_seconds=1.0,
+        )
+
+        events = [
+            event
+            async for event in generator.generate_stream(
+                ChatRequest(messages=(ChatMessage(role="user", content="Say hello."),))
+            )
+        ]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert events == [
+        ChatStreamToken(text="hel"),
+        ChatStreamToken(text="lo"),
+        ChatStreamFinal(
+            model="qwen2.5:7b",
+            finish_reason="stop",
+            usage=ChatUsage(prompt_tokens=11, completion_tokens=2),
+        ),
+    ]
+    assert requests == [
+        (
+            "POST /api/chat HTTP/1.1",
+            {
+                "model": "qwen2.5:7b",
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "stream": True,
             },
         )
     ]

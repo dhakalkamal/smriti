@@ -39,3 +39,42 @@ class AssistantGenerationResult:
     chat_model: str
     finish_reason: str | None
     used_memory_episode_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
+class AssistantStreamPreparation:
+    request: AssistantGenerationRequest
+    chat_request: ChatRequest
+    selected_memories: tuple[ScoredEpisode, ...]
+    used_memory_episode_ids: tuple[UUID, ...]
+    chat_model: str
+
+
+@dataclass(frozen=True)
+class AssistantStreamStart:
+    used_memory_episode_ids: tuple[UUID, ...]
+    chat_model: str | None = None
+
+
+@dataclass(frozen=True)
+class AssistantStreamToken:
+    text: str
+
+
+@dataclass(frozen=True)
+class AssistantStreamDone:
+    assistant_message: MessageRecord
+    chat_model: str
+    finish_reason: str | None
+    used_memory_episode_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
+class AssistantStreamError:
+    code: str
+    message: str
+
+
+AssistantStreamEvent = (
+    AssistantStreamStart | AssistantStreamToken | AssistantStreamDone | AssistantStreamError
+)

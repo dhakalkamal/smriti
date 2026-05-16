@@ -32,7 +32,7 @@ from smriti.memory import (
 )
 
 LOCAL_USER_ID = UUID("11111111-1111-4111-8111-111111111111")
-EXPECTED_STAGE_7_4_ROUTES = {
+EXPECTED_STAGE_7_6_ROUTES = {
     ("GET", "/health"),
     ("GET", "/scopes"),
     ("POST", "/scopes"),
@@ -42,6 +42,7 @@ EXPECTED_STAGE_7_4_ROUTES = {
     ("POST", "/conversations/{conversation_id}/messages"),
     ("POST", "/retrieval/search"),
     ("POST", "/conversations/{conversation_id}/assistant-response"),
+    ("POST", "/conversations/{conversation_id}/assistant-response/stream"),
 }
 DEFAULT_DOCUMENTATION_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
@@ -50,13 +51,13 @@ def _to_asyncpg_dsn(container_url: str) -> str:
     return re.sub(r"^postgresql\+[^:]+://", "postgresql://", container_url)
 
 
-def test_create_app_registers_only_stage_7_4_http_routes_without_binding_socket() -> None:
+def test_create_app_registers_only_stage_7_6_http_routes_without_binding_socket() -> None:
     app = create_app(settings=Settings(), embedder=FakeEmbedder(dimensions=768))
 
     route_paths = {getattr(route, "path", None) for route in app.routes}
 
     assert app.title == "Smriti Local API"
-    assert _external_http_api_routes(app) == EXPECTED_STAGE_7_4_ROUTES
+    assert _external_http_api_routes(app) == EXPECTED_STAGE_7_6_ROUTES
     assert DEFAULT_DOCUMENTATION_PATHS.isdisjoint(route_paths)
 
 

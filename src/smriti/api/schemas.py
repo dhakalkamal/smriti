@@ -174,6 +174,43 @@ class AssistantGenerationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AssistantStreamStartData(BaseModel):
+    """SSE payload for the start of assistant streaming."""
+
+    used_memory_episode_ids: list[UUID]
+    chat_model: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AssistantStreamTokenData(BaseModel):
+    """SSE payload for one assistant token fragment."""
+
+    text: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AssistantStreamDoneData(BaseModel):
+    """SSE payload for a successfully persisted streaming assistant response."""
+
+    assistant_message: MessageResponse
+    chat_model: str
+    finish_reason: str | None
+    used_memory_episode_ids: list[UUID]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AssistantStreamErrorData(BaseModel):
+    """SSE payload for a post-stream-start assistant error."""
+
+    code: str
+    message: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RetrievalSearchBody(BaseModel):
     """Request body for scoped retrieval search."""
 

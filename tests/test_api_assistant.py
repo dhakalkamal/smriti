@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from smriti.api import create_app
@@ -19,8 +22,15 @@ from smriti.assistant import (
     AssistantGenerationResult,
     AssistantGenerationUnavailableError,
     AssistantOrchestrator,
+    AssistantStreamDone,
+    AssistantStreamError,
+    AssistantStreamEvent,
+    AssistantStreamPreparation,
+    AssistantStreamStart,
+    AssistantStreamToken,
     InvalidAssistantRequestError,
 )
+from smriti.chat import ChatRequest
 from smriti.config import Settings
 from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
@@ -241,6 +251,239 @@ def test_assistant_route_preserves_memory_error_mappings(
     assert response.status_code == expected_status
 
 
+def test_assistant_stream_route_emits_start_tokens_and_done() -> None:
+    conversation_id = uuid4()
+    scope_id = uuid4()
+    query_message_id = uuid4()
+    first_episode_id = uuid4()
+    assistant_message = _message(
+        message_id=uuid4(),
+        conversation_id=conversation_id,
+        content="Hello streamed answer.",
+    )
+    orchestrator = StreamingAssistantOrchestrator(
+        events=[
+            AssistantStreamStart(
+                used_memory_episode_ids=(first_episode_id,),
+                chat_model="fake-stream",
+            ),
+            AssistantStreamToken(text="Hello "),
+            AssistantStreamToken(text="streamed answer."),
+            AssistantStreamDone(
+                assistant_message=assistant_message,
+                chat_model="fake-stream",
+                finish_reason="stop",
+                used_memory_episode_ids=(first_episode_id,),
+            ),
+        ]
+    )
+    client = _client(orchestrator)
+
+    with client.stream(
+        "POST",
+        f"/conversations/{conversation_id}/assistant-response/stream",
+        json={"scope_id": str(scope_id), "query_message_id": str(query_message_id)},
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert _parse_sse(body) == [
+        {
+            "event": "start",
+            "data": {
+                "used_memory_episode_ids": [str(first_episode_id)],
+                "chat_model": "fake-stream",
+            },
+        },
+        {"event": "token", "data": {"text": "Hello "}},
+        {"event": "token", "data": {"text": "streamed answer."}},
+        {
+            "event": "done",
+            "data": {
+                "assistant_message": {
+                    "id": str(assistant_message.id),
+                    "conversation_id": str(conversation_id),
+                    "position": 2,
+                    "role": "assistant",
+                    "content": "Hello streamed answer.",
+                    "token_count": assistant_message.token_count,
+                    "created_at": "2026-01-01T12:00:00Z",
+                },
+                "chat_model": "fake-stream",
+                "finish_reason": "stop",
+                "used_memory_episode_ids": [str(first_episode_id)],
+            },
+        },
+    ]
+    assert orchestrator.prepare_requests == [
+        AssistantGenerationRequest(
+            user_id=LOCAL_USER_ID,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message_id,
+            top_k=5,
+            max_prompt_chars=16000,
+            recent_message_limit=20,
+        )
+    ]
+
+
+def test_assistant_stream_route_maps_pre_stream_errors_to_http_responses() -> None:
+    response = _client(
+        StreamingAssistantOrchestrator(prepare_error=InvalidAssistantRequestError())
+    ).post(
+        f"/conversations/{uuid4()}/assistant-response/stream",
+        json={"scope_id": str(uuid4()), "query_message_id": str(uuid4())},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid assistant request"}
+
+
+def test_assistant_stream_route_emits_post_token_error_event() -> None:
+    orchestrator = StreamingAssistantOrchestrator(
+        events=[
+            AssistantStreamStart(used_memory_episode_ids=(), chat_model="fake-stream"),
+            AssistantStreamToken(text="partial"),
+            AssistantStreamError(
+                code="assistant_generation_failed",
+                message="Local assistant generation failed",
+            ),
+        ]
+    )
+
+    response = _client(orchestrator).post(
+        f"/conversations/{uuid4()}/assistant-response/stream",
+        json={"scope_id": str(uuid4()), "query_message_id": str(uuid4())},
+    )
+
+    assert response.status_code == 200
+    assert _parse_sse(response.text) == [
+        {
+            "event": "start",
+            "data": {"used_memory_episode_ids": [], "chat_model": "fake-stream"},
+        },
+        {"event": "token", "data": {"text": "partial"}},
+        {
+            "event": "error",
+            "data": {
+                "code": "assistant_generation_failed",
+                "message": "Local assistant generation failed",
+            },
+        },
+    ]
+
+
+def test_assistant_stream_route_payloads_do_not_include_memory_content() -> None:
+    memory_sentinel = "RETRIEVED_MEMORY_CONTENT_SENTINEL"
+    orchestrator = StreamingAssistantOrchestrator(
+        events=[
+            AssistantStreamStart(used_memory_episode_ids=(uuid4(),), chat_model="fake-stream"),
+            AssistantStreamToken(text="generated token"),
+            AssistantStreamDone(
+                assistant_message=_message(uuid4(), uuid4(), "generated token"),
+                chat_model="fake-stream",
+                finish_reason="stop",
+                used_memory_episode_ids=(),
+            ),
+        ]
+    )
+
+    response = _client(orchestrator).post(
+        f"/conversations/{uuid4()}/assistant-response/stream",
+        json={"scope_id": str(uuid4()), "query_message_id": str(uuid4())},
+    )
+
+    assert response.status_code == 200
+    assert memory_sentinel not in response.text
+
+
+@pytest.mark.asyncio
+async def test_assistant_stream_route_disconnect_stops_before_persistence() -> None:
+    user_id = uuid4()
+    scope_id = uuid4()
+    conversation_id = uuid4()
+    query_message_id = uuid4()
+    orchestrator = StreamingAssistantOrchestrator(
+        events=[
+            AssistantStreamStart(used_memory_episode_ids=(), chat_model="fake-stream"),
+            AssistantStreamToken(text="partial"),
+            AssistantStreamDone(
+                assistant_message=_message(uuid4(), conversation_id, "should not be sent"),
+                chat_model="fake-stream",
+                finish_reason="stop",
+                used_memory_episode_ids=(),
+            ),
+        ]
+    )
+    prepared = await orchestrator.prepare_stream(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message_id,
+            top_k=1,
+        )
+    )
+    request = _DisconnectingRequest(disconnect_after_checks=2)
+
+    chunks = [
+        chunk
+        async for chunk in assistant_routes._stream_sse_events(
+            request=cast(Request, request),
+            events=orchestrator.stream_prepared(prepared),
+        )
+    ]
+
+    assert [event["event"] for event in _parse_sse("".join(chunks))] == ["start", "token"]
+    assert orchestrator.events_sent == 2
+
+
+def test_assistant_stream_route_does_not_log_private_content_at_info_or_below(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user_content_sentinel = "USER_QUERY_CONTENT_SENTINEL"
+    memory_content_sentinel = "RETRIEVED_MEMORY_CONTENT_SENTINEL"
+    assistant_content_sentinel = "ASSISTANT_RESPONSE_CONTENT_SENTINEL"
+    conversation_id = uuid4()
+    orchestrator = StreamingAssistantOrchestrator(
+        events=[
+            AssistantStreamStart(used_memory_episode_ids=(uuid4(),), chat_model="fake-stream"),
+            AssistantStreamToken(text=assistant_content_sentinel),
+            AssistantStreamDone(
+                assistant_message=_message(uuid4(), conversation_id, assistant_content_sentinel),
+                chat_model="fake-stream",
+                finish_reason="stop",
+                used_memory_episode_ids=(),
+            ),
+        ]
+    )
+    client = _client(orchestrator)
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            f"/conversations/{conversation_id}/assistant-response/stream",
+            json={
+                "scope_id": str(uuid4()),
+                "query_message_id": str(uuid4()),
+            },
+        )
+
+    assert response.status_code == 200
+    api_records = [
+        record
+        for record in caplog.records
+        if (record.name == "smriti.api" or record.name.startswith("smriti.api."))
+        and record.levelno <= logging.INFO
+    ]
+    for record in api_records:
+        message = record.getMessage()
+        assert user_content_sentinel not in message
+        assert memory_content_sentinel not in message
+        assert assistant_content_sentinel not in message
+
+
 @pytest.mark.parametrize(
     ("error", "expected_detail"),
     [
@@ -331,6 +574,10 @@ def test_assistant_route_module_stays_a_thin_adapter() -> None:
         "append_assistant_response_with_provenance",
         "record_used_memories",
         "chat_generator.generate",
+        "generate_stream",
+        "WebSocket",
+        "websocket",
+        "socket.io",
     ]
     source = inspect.getsource(assistant_routes)
 
@@ -359,8 +606,54 @@ class RaisingAssistantOrchestrator:
         raise self.error
 
 
+@dataclass
+class StreamingAssistantOrchestrator:
+    events: list[AssistantStreamEvent] = field(default_factory=list)
+    prepare_error: Exception | None = None
+    prepare_requests: list[AssistantGenerationRequest] = field(default_factory=list)
+    events_sent: int = 0
+
+    async def generate(self, request: AssistantGenerationRequest) -> AssistantGenerationResult:
+        _ = request
+        raise AssertionError("non-streaming generate should not be called")
+
+    async def prepare_stream(
+        self,
+        request: AssistantGenerationRequest,
+    ) -> AssistantStreamPreparation:
+        self.prepare_requests.append(request)
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return AssistantStreamPreparation(
+            request=request,
+            chat_request=ChatRequest(messages=()),
+            selected_memories=(),
+            used_memory_episode_ids=(),
+            chat_model="fake-stream",
+        )
+
+    async def stream_prepared(
+        self,
+        prepared: AssistantStreamPreparation,
+    ) -> AsyncIterator[AssistantStreamEvent]:
+        _ = prepared
+        for event in self.events:
+            self.events_sent += 1
+            yield event
+
+
+@dataclass
+class _DisconnectingRequest:
+    disconnect_after_checks: int
+    checks: int = 0
+
+    async def is_disconnected(self) -> bool:
+        self.checks += 1
+        return self.checks > self.disconnect_after_checks
+
+
 def _client(
-    orchestrator: RecordingAssistantOrchestrator | RaisingAssistantOrchestrator,
+    orchestrator: object,
 ) -> TestClient:
     app = create_app(settings=Settings(), embedder=FakeEmbedder(dimensions=768))
     app.dependency_overrides[get_assistant_orchestrator] = lambda: cast(
@@ -369,6 +662,23 @@ def _client(
     )
     app.dependency_overrides[get_current_local_user_id] = lambda: LOCAL_USER_ID
     return TestClient(app, raise_server_exceptions=False)
+
+
+def _parse_sse(body: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for block in body.strip().split("\n\n"):
+        if not block:
+            continue
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data_lines.append(line.removeprefix("data: "))
+        assert event_name is not None
+        events.append({"event": event_name, "data": json.loads("".join(data_lines))})
+    return events
 
 
 def _message(message_id: UUID, conversation_id: UUID, content: str) -> MessageRecord:
