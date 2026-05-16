@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 18% 98%;
+  --foreground: 222 28% 13%;
+  --muted: 216 14% 90%;
+  --muted-foreground: 221 12% 38%;
+  --border: 214 18% 82%;
+  --accent: 162 64% 34%;
+  --accent-foreground: 0 0% 100%;
+  --danger: 354 67% 44%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}

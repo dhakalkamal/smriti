@@ -9,6 +9,8 @@ build/
 dist/
 *.egg-info/
 .eggs/
+node_modules/
+.pnpm-store/
 
 # Virtual environments
 .venv/
