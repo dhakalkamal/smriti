@@ -401,4 +401,12 @@ When working on frontend code under `frontend/`, read both:
 
 If the two conflict, `AGENTS.md` wins for project-wide/privacy rules, and the more restrictive rule wins.
 
+### macOS editable-install hidden flag issue
+
+On some macOS setups, `.venv` or editable-install `.pth` files may regain the
+`hidden` filesystem flag, causing:
+
+```text
+ModuleNotFoundError: No module named 'smriti'
+
 Build incrementally. Do not pre-create empty packages.
