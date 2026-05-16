@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import cast
 from uuid import UUID, uuid4
 
+import asyncpg
+import httpx
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+from testcontainers.postgres import PostgresContainer
 
 from smriti.api import create_app
 from smriti.api.dependencies import get_assistant_orchestrator, get_current_local_user_id
@@ -30,15 +36,29 @@ from smriti.assistant import (
     AssistantStreamToken,
     InvalidAssistantRequestError,
 )
-from smriti.chat import ChatRequest
+from smriti.chat import (
+    ChatRequest,
+    ChatResponse,
+    ChatStreamEvent,
+    ChatStreamFinal,
+    ChatStreamToken,
+    FakeStreamingChatGenerator,
+)
 from smriti.config import Settings
+from smriti.db.client import close_pool, get_pool
+from smriti.db.migrate import apply_migrations
 from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
+    AppendMessageWithEpisodeRequest,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
+    CreateConversationRequest,
+    CreateScopeRequest,
     InvalidProvenanceTargetError,
+    MemoryService,
     MemoryServiceError,
     MessageRecord,
+    ScoredEpisode,
 )
 
 LOCAL_USER_ID = UUID("66666666-6666-4666-8666-666666666666")
@@ -440,6 +460,160 @@ async def test_assistant_stream_route_disconnect_stops_before_persistence() -> N
     assert orchestrator.events_sent == 2
 
 
+@pytest.mark.asyncio
+async def test_assistant_stream_route_disconnect_persists_no_rows_in_postgres() -> None:
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        settings = Settings(
+            database_url=_to_asyncpg_dsn(postgres.get_connection_url()),
+            local_user_id=LOCAL_USER_ID,
+        )
+        await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
+        chat_generator = _BlockingStreamingChatGenerator()
+        app = create_app(
+            settings=settings,
+            embedder=FakeEmbedder(dimensions=768),
+            chat_generator=chat_generator,
+        )
+
+        async with app.router.lifespan_context(app):
+            transport = _StreamingASGITransport(app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                scope = await _create_scope(client)
+                conversation = await _create_conversation(client, scope_id=UUID(scope["id"]))
+                query_message = await _create_user_message(
+                    client,
+                    conversation_id=UUID(conversation["id"]),
+                )
+
+                chunks: list[str] = []
+                async with client.stream(
+                    "POST",
+                    f"/conversations/{conversation['id']}/assistant-response/stream",
+                    json={
+                        "scope_id": scope["id"],
+                        "query_message_id": query_message["id"],
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    async for chunk in response.aiter_text():
+                        chunks.append(chunk)
+                        if "event: token" in "".join(chunks):
+                            break
+
+                streamed = _parse_sse("".join(chunks))
+                assert [event["event"] for event in streamed] == ["start", "token"]
+                assert chat_generator.first_token_sent.is_set()
+
+        counts = await _assistant_stream_storage_counts(
+            settings=settings,
+            conversation_id=UUID(conversation["id"]),
+        )
+        assert counts == {"assistant_messages": 0, "message_retrievals": 0}
+
+
+@pytest.mark.asyncio
+async def test_assistant_stream_persistence_failure_rolls_back_postgres_rows() -> None:
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        settings = Settings(
+            database_url=_to_asyncpg_dsn(postgres.get_connection_url()),
+            local_user_id=LOCAL_USER_ID,
+        )
+        await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            async with pool.acquire() as connection:
+                await connection.execute("INSERT INTO users (id) VALUES ($1);", LOCAL_USER_ID)
+            scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=LOCAL_USER_ID,
+                    name="Persistence failure scope",
+                    system_prompt="Keep memory scoped.",
+                )
+            )
+            conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=LOCAL_USER_ID,
+                    scope_id=scope.id,
+                    title="Streaming failure",
+                )
+            )
+            query_message = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=LOCAL_USER_ID,
+                    conversation_id=conversation.id,
+                    role="user",
+                    content="Remember this before failing.",
+                    token_count=5,
+                )
+            )
+            retrieved = await service.retrieve_scoped_episodes(
+                user_id=LOCAL_USER_ID,
+                scope_id=scope.id,
+                query=query_message.message.content,
+                top_k=1,
+            )
+            poisoned_memories = tuple(
+                replace(memory, embedding_model_id=999999) for memory in retrieved
+            )
+            orchestrator = AssistantOrchestrator(
+                memory_service=_PoisonedRetrievalMemoryService(
+                    delegate=service,
+                    poisoned_memories=poisoned_memories,
+                ),  # type: ignore[arg-type]
+                chat_generator=FakeStreamingChatGenerator(
+                    tokens=["partial"],
+                    final=ChatStreamFinal(model="fake-stream", finish_reason="stop"),
+                ),
+            )
+
+            prepared = await orchestrator.prepare_stream(
+                AssistantGenerationRequest(
+                    user_id=LOCAL_USER_ID,
+                    scope_id=scope.id,
+                    conversation_id=conversation.id,
+                    query_message_id=query_message.message.id,
+                    top_k=1,
+                )
+            )
+
+            events = [event async for event in orchestrator.stream_prepared(prepared)]
+            counts = await _assistant_stream_storage_counts(
+                settings=settings,
+                conversation_id=conversation.id,
+            )
+
+            assert events == [
+                AssistantStreamStart(
+                    used_memory_episode_ids=(poisoned_memories[0].id,),
+                    chat_model="fake-stream",
+                ),
+                AssistantStreamToken(text="partial"),
+                AssistantStreamError(
+                    code="assistant_persistence_failed",
+                    message="Assistant response persistence failed",
+                ),
+            ]
+            assert all(not isinstance(event, AssistantStreamDone) for event in events)
+            assert counts == {"assistant_messages": 0, "message_retrievals": 0}
+        finally:
+            await close_pool()
+
+
 def test_assistant_stream_route_does_not_log_private_content_at_info_or_below(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -652,6 +826,149 @@ class _DisconnectingRequest:
         return self.checks > self.disconnect_after_checks
 
 
+@dataclass
+class _BlockingStreamingChatGenerator:
+    first_token_sent: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def model(self) -> str:
+        return "blocking-stream"
+
+    async def generate(self, request: ChatRequest) -> ChatResponse:
+        _ = request
+        return ChatResponse(content="partial after release", model=self.model, finish_reason="stop")
+
+    async def generate_stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamEvent]:
+        _ = request
+        self.first_token_sent.set()
+        yield ChatStreamToken(text="partial")
+        await self.release.wait()
+        yield ChatStreamFinal(model=self.model, finish_reason="stop")
+
+
+@dataclass
+class _PoisonedRetrievalMemoryService:
+    delegate: MemoryService
+    poisoned_memories: tuple[ScoredEpisode, ...]
+
+    async def load_assistant_generation_context(self, request):
+        return await self.delegate.load_assistant_generation_context(request)
+
+    async def retrieve_scoped_episodes(
+        self,
+        user_id: UUID,
+        scope_id: UUID,
+        query: str,
+        top_k: int,
+    ) -> list[ScoredEpisode]:
+        _ = (user_id, scope_id, query, top_k)
+        return list(self.poisoned_memories)
+
+    async def append_assistant_response_with_provenance(self, request):
+        return await self.delegate.append_assistant_response_with_provenance(request)
+
+
+class _StreamingASGITransport(httpx.AsyncBaseTransport):
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        request_body = await request.aread()
+        request_complete = False
+        response_started = asyncio.Event()
+        response_complete = asyncio.Event()
+        disconnect = asyncio.Event()
+        body_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        status_code: int | None = None
+        response_headers: list[tuple[bytes, bytes]] = []
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(key.lower(), value) for key, value in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": ("127.0.0.1", 123),
+            "root_path": "",
+        }
+
+        async def receive() -> dict[str, object]:
+            nonlocal request_complete
+            if not request_complete:
+                request_complete = True
+                return {"type": "http.request", "body": request_body, "more_body": False}
+            await disconnect.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, object]) -> None:
+            nonlocal status_code, response_headers
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+                response_headers = cast(list[tuple[bytes, bytes]], message.get("headers", []))
+                response_started.set()
+                return
+
+            if message["type"] == "http.response.body":
+                body = cast(bytes, message.get("body", b""))
+                more_body = bool(message.get("more_body", False))
+                if body and request.method != "HEAD":
+                    await body_queue.put(body)
+                if not more_body:
+                    response_complete.set()
+                    await body_queue.put(None)
+
+        async def run_app() -> None:
+            try:
+                await self._app(scope, receive, send)
+            finally:
+                if response_started.is_set() and not response_complete.is_set():
+                    response_complete.set()
+                    await body_queue.put(None)
+
+        app_task = asyncio.create_task(run_app())
+        await response_started.wait()
+        assert status_code is not None
+        return httpx.Response(
+            status_code,
+            headers=response_headers,
+            stream=_StreamingASGIByteStream(
+                body_queue=body_queue,
+                disconnect=disconnect,
+                response_complete=response_complete,
+                app_task=app_task,
+            ),
+            request=request,
+        )
+
+
+@dataclass
+class _StreamingASGIByteStream(httpx.AsyncByteStream):
+    body_queue: asyncio.Queue[bytes | None]
+    disconnect: asyncio.Event
+    response_complete: asyncio.Event
+    app_task: asyncio.Task[None]
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await self.body_queue.get()
+            if chunk is None:
+                break
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.disconnect.set()
+        if not self.response_complete.is_set():
+            self.app_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self.app_task
+
+
 def _client(
     orchestrator: object,
 ) -> TestClient:
@@ -662,6 +979,77 @@ def _client(
     )
     app.dependency_overrides[get_current_local_user_id] = lambda: LOCAL_USER_ID
     return TestClient(app, raise_server_exceptions=False)
+
+
+def _to_asyncpg_dsn(container_url: str) -> str:
+    return re.sub(r"^postgresql\+[^:]+://", "postgresql://", container_url)
+
+
+async def _create_scope(client: httpx.AsyncClient) -> dict[str, str]:
+    response = await client.post(
+        "/scopes",
+        json={"name": "Streaming Scope", "system_prompt": "Keep memory scoped."},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+async def _create_conversation(client: httpx.AsyncClient, scope_id: UUID) -> dict[str, str]:
+    response = await client.post(
+        "/conversations",
+        json={"scope_id": str(scope_id), "title": "Streaming Conversation"},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+async def _create_user_message(
+    client: httpx.AsyncClient,
+    conversation_id: UUID,
+) -> dict[str, str]:
+    response = await client.post(
+        f"/conversations/{conversation_id}/messages",
+        json={"role": "user", "content": "Please answer from memory.", "token_count": 5},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+async def _assistant_stream_storage_counts(
+    settings: Settings,
+    conversation_id: UUID,
+) -> dict[str, int]:
+    connection = await asyncpg.connect(
+        dsn=settings.database_url,
+        timeout=settings.database_connect_timeout,
+        command_timeout=settings.database_command_timeout,
+    )
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM messages
+                    WHERE conversation_id = $1
+                      AND role = 'assistant'
+                ) AS assistant_messages,
+                (
+                    SELECT COUNT(*)
+                    FROM message_retrievals
+                    WHERE query_conversation_id = $1
+                ) AS message_retrievals;
+            """,
+            conversation_id,
+        )
+    finally:
+        await connection.close()
+
+    assert row is not None
+    return {
+        "assistant_messages": int(row["assistant_messages"]),
+        "message_retrievals": int(row["message_retrievals"]),
+    }
 
 
 def _parse_sse(body: str) -> list[dict[str, object]]:

@@ -910,6 +910,12 @@ SSE payloads must not include:
 
 Pre-stream errors use normal HTTP error responses, and existing Stage 7 mappings still apply.
 
+Note: chat generator reachability errors (`ChatConnectionError`, `ChatTimeoutError` when raised
+before the first chunk) surface as SSE error events rather than HTTP responses, because the chat
+generator stream is not pre-opened before `StreamingResponse` is constructed. All other pre-stream
+errors — validation, scope, conversation, query message, and retrieval — map to HTTP responses as
+locked.
+
 Post-stream-start errors use SSE error events. The HTTP status remains `200`, and the stream closes
 after the error event.
 
