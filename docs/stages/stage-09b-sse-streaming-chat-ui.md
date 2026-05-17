@@ -339,10 +339,17 @@ performs no special reconciliation for this race.
 - `pnpm generate:api` must produce no diff in
   `frontend/src/api/types.ts` for Stage 9b, since no backend changes
   are made.
-- The generated types include `AssistantStreamStartData`,
-  `AssistantStreamTokenData`, `AssistantStreamDoneData`, and
-  `AssistantStreamErrorData` from Stage 7.6. The frontend uses these
-  types for the parsed `data:` payloads.
+- At the time of Stage 9b implementation, the stream payload schemas
+  (`AssistantStreamStartData`, `AssistantStreamTokenData`,
+  `AssistantStreamDoneData`, `AssistantStreamErrorData`) exist in
+  backend `schemas.py` but are not emitted into the OpenAPI document
+  because the streaming route returns `StreamingResponse` rather than
+  a typed JSON response model. Stage 9b therefore uses narrow
+  frontend-local TypeScript types defined in `src/lib/sse.ts` or
+  alongside the streaming hook that mirror the backend schemas exactly.
+  A future stage may expose these backend schemas through OpenAPI;
+  until then this duplication is accepted. Stage 9b implementers must
+  keep the frontend types faithful to the backend schemas.
 
 ## 5. Backend Flow
 

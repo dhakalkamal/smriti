@@ -17,7 +17,7 @@ const sourceFiles = import.meta.glob<string>(
 );
 
 const forbiddenPatterns = [
-  "/assistant-response/stream",
+  // Stage 9b introduces this path; superseded by stage9bContract.test.ts.
   "EventSource",
   "localStorage",
   "sessionStorage",

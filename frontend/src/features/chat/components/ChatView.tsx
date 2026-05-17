@@ -1,12 +1,5 @@
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-
-import { useAssistantResponse } from "../api/useAssistantResponse";
-import {
-  estimateUserMessageTokenCount,
-  useCreateMessage,
-} from "../../messages/api/useCreateMessage";
-import { messagesQueryKey, useMessages } from "../../messages/api/useMessages";
+import { useAssistantResponseStream } from "../api/useAssistantResponseStream";
+import { useMessages } from "../../messages/api/useMessages";
 import { MessageList } from "../../messages/components/MessageList";
 import { Composer } from "./Composer";
 
@@ -16,97 +9,99 @@ interface ChatViewProps {
   title: string;
 }
 
-interface AssistantFailure {
-  queryMessageId: string;
-}
-
 export function ChatView({ conversationId, scopeId, title }: ChatViewProps) {
-  const queryClient = useQueryClient();
   const messagesQuery = useMessages(conversationId);
-  const createMessage = useCreateMessage(conversationId);
-  const assistantResponse = useAssistantResponse(conversationId);
-  const [composerError, setComposerError] = useState<string | null>(null);
-  const [assistantFailure, setAssistantFailure] = useState<AssistantFailure | null>(null);
-  const [isChainPending, setIsChainPending] = useState(false);
-
-  async function refetchMessages() {
-    await queryClient.invalidateQueries({ queryKey: messagesQueryKey(conversationId) });
-  }
-
-  async function handleSubmit(content: string): Promise<boolean> {
-    setComposerError(null);
-    setAssistantFailure(null);
-    setIsChainPending(true);
-
-    try {
-      const createdMessage = await createMessage.mutateAsync({
-        role: "user",
-        content,
-        token_count: estimateUserMessageTokenCount(content),
-      });
-
-      try {
-        await assistantResponse.mutateAsync({
-          scope_id: scopeId,
-          query_message_id: createdMessage.id,
-        });
-        await refetchMessages();
-        return true;
-      } catch {
-        setAssistantFailure({ queryMessageId: createdMessage.id });
-        await refetchMessages();
-        return true;
-      }
-    } catch {
-      setComposerError("Message could not be saved.");
-      return false;
-    } finally {
-      setIsChainPending(false);
-    }
-  }
-
-  async function handleRetryAssistant() {
-    if (assistantFailure === null) {
-      return;
-    }
-
-    setIsChainPending(true);
-
-    try {
-      await assistantResponse.mutateAsync({
-        scope_id: scopeId,
-        query_message_id: assistantFailure.queryMessageId,
-      });
-      setAssistantFailure(null);
-      await refetchMessages();
-    } catch {
-      await refetchMessages();
-    } finally {
-      setIsChainPending(false);
-    }
-  }
+  const assistantStream = useAssistantResponseStream({ conversationId, scopeId });
 
   return (
     <section className="flex min-h-0 flex-1 flex-col" aria-label={title}>
       <header className="border-b border-border bg-background px-6 py-4">
         <h1 className="text-xl font-semibold tracking-normal text-foreground">{title}</h1>
-        {isChainPending ? (
+        {assistantStream.isSubmitting ? (
           <p className="mt-2 text-sm text-muted-foreground" aria-live="polite">
-            Assistant is thinking...
+            Saving message...
+          </p>
+        ) : null}
+        {assistantStream.isStreaming ? (
+          <p className="mt-2 text-sm text-muted-foreground" aria-live="polite">
+            Assistant is responding...
           </p>
         ) : null}
       </header>
       <MessageList
-        assistantError={assistantFailure !== null}
         isError={messagesQuery.isError}
         isLoading={messagesQuery.isPending}
-        isRetrying={isChainPending}
         messages={messagesQuery.data ?? []}
+      />
+      <AssistantStreamPanel
+        draft={assistantStream.streamState.draft}
+        isError={assistantStream.streamState.status === "error"}
+        isStreaming={assistantStream.isStreaming}
         onRetryAssistant={() => {
-          void handleRetryAssistant();
+          void assistantStream.retryAssistant();
         }}
       />
-      <Composer disabled={isChainPending} errorMessage={composerError} onSubmit={handleSubmit} />
+      <Composer
+        acceptedSubmissionCount={assistantStream.acceptedSubmissionCount}
+        disabled={assistantStream.isSubmitting}
+        errorMessage={assistantStream.composerError}
+        isStreaming={assistantStream.isStreaming}
+        onStop={assistantStream.stopStreaming}
+        onSubmit={assistantStream.submitMessage}
+      />
     </section>
   );
+}
+
+interface AssistantStreamPanelProps {
+  draft: string;
+  isError: boolean;
+  isStreaming: boolean;
+  onRetryAssistant: () => void;
+}
+
+function AssistantStreamPanel({
+  draft,
+  isError,
+  isStreaming,
+  onRetryAssistant,
+}: AssistantStreamPanelProps) {
+  if (draft !== "") {
+    return (
+      <div className="border-t border-border bg-muted/20 px-6 py-4">
+        <article className="max-w-[78%] rounded-lg border border-border bg-background px-4 py-3 text-sm leading-6 text-foreground shadow-sm">
+          <p className="mb-1 text-xs font-medium text-muted-foreground">Assistant</p>
+          <p className="whitespace-pre-wrap break-words">
+            {draft}
+            {isStreaming ? (
+              <span className="ml-1 text-muted-foreground" aria-hidden="true">
+                ...
+              </span>
+            ) : null}
+          </p>
+        </article>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="border-t border-border bg-background px-6 py-4">
+        <div className="rounded-md border border-danger/40 bg-danger/10 px-4 py-3">
+          <p className="text-sm font-medium text-danger" role="alert">
+            Assistant failed to respond.
+          </p>
+          <button
+            className="mt-3 rounded-md bg-danger px-3 py-2 text-sm font-medium text-white transition hover:bg-danger/90"
+            onClick={onRetryAssistant}
+            type="button"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }

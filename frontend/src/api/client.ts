@@ -6,6 +6,7 @@ const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost"]);
 type ApiPath = keyof paths;
 type ConversationApiPath =
   | `/conversations/${string}/assistant-response`
+  | `/conversations/${string}/assistant-response/stream`
   | `/conversations/${string}/messages`;
 type LocalApiPath = ApiPath | ConversationApiPath;
 
@@ -59,7 +60,28 @@ export async function apiFetch<TResponse>(
   return (await response.json()) as TResponse;
 }
 
-function buildApiUrl(path: LocalApiPath): URL {
+export async function postStream(
+  path: string,
+  body: unknown,
+  signal: AbortSignal,
+): Promise<Response> {
+  return fetch(
+    buildApiUrl(path),
+    buildRequestInit({
+      method: "POST",
+      body,
+      signal,
+      headers: { Accept: "text/event-stream" },
+    }),
+  );
+}
+
+export const client = {
+  apiFetch,
+  postStream,
+} as const;
+
+function buildApiUrl(path: string): URL {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return new URL(normalizedPath, `${getConfiguredApiBaseUrl()}/`);
 }

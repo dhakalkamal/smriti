@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { readJsonRequestBody } from "../test/fetchBody";
 import { renderWithQueryClient } from "../test/renderWithQueryClient";
+import { createSseResponseFromChunks, sseFrame } from "../test/sseStream";
 import ChatPage from "./ChatPage";
 
 afterEach(() => {
@@ -74,9 +75,7 @@ describe("ChatPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(
-      await screen.findByText("Assistant response could not be created."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Assistant failed to respond.")).toBeInTheDocument();
     expect(await screen.findByText("Hello from A")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Conversation B" }));
@@ -86,11 +85,9 @@ describe("ChatPage", () => {
 
     await waitFor(() => {
       expect(
-        screen.queryByText("Assistant response could not be created."),
+        screen.queryByText("Assistant failed to respond."),
       ).not.toBeInTheDocument();
-      expect(
-        screen.queryByRole("button", { name: "Retry assistant response" }),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     });
 
     const invalidAssistantRetry = fetchMock.mock.calls.some((call) => {
@@ -98,7 +95,7 @@ describe("ChatPage", () => {
 
       return (
         call[1]?.method === "POST" &&
-        url.pathname === "/conversations/conversation-b/assistant-response" &&
+        url.pathname === "/conversations/conversation-b/assistant-response/stream" &&
         isQueryMessageBodyFromConversationA(readJsonRequestBody(call[1]))
       );
     });
@@ -229,16 +226,26 @@ function mockConversationSwitchFetch() {
 
     if (
       method === "POST" &&
-      url.pathname === "/conversations/conversation-a/assistant-response"
+      url.pathname === "/conversations/conversation-a/assistant-response/stream"
     ) {
-      return Promise.resolve(new Response("nope", { status: 500 }));
+      return Promise.resolve(
+        createSseResponseFromChunks([
+          sseFrame("start", { used_memory_episode_ids: [], chat_model: null }),
+          sseFrame("error", { code: "backend_error", message: "hidden" }),
+        ]),
+      );
     }
 
     if (
       method === "POST" &&
-      url.pathname === "/conversations/conversation-b/assistant-response"
+      url.pathname === "/conversations/conversation-b/assistant-response/stream"
     ) {
-      return Promise.resolve(jsonResponseWithStatus({}, 201));
+      return Promise.resolve(
+        createSseResponseFromChunks([
+          sseFrame("start", { used_memory_episode_ids: [], chat_model: null }),
+          sseFrame("error", { code: "backend_error", message: "hidden" }),
+        ]),
+      );
     }
 
     throw new Error(`Unexpected ${method} request to ${url.pathname}.`);

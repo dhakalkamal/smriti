@@ -1,5 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import type { MessageResponse } from "../api/useMessages";
 import { MessageList } from "./MessageList";
@@ -29,12 +29,9 @@ describe("MessageList", () => {
   it("renders messages sorted by position", () => {
     render(
       <MessageList
-        assistantError={false}
         isError={false}
         isLoading={false}
-        isRetrying={false}
         messages={unsortedMessages}
-        onRetryAssistant={vi.fn()}
       />,
     );
 
@@ -50,12 +47,9 @@ describe("MessageList", () => {
   it("renders the empty message state", () => {
     render(
       <MessageList
-        assistantError={false}
         isError={false}
         isLoading={false}
-        isRetrying={false}
         messages={[]}
-        onRetryAssistant={vi.fn()}
       />,
     );
 
