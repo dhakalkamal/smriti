@@ -14,8 +14,8 @@ export function ChatView({ conversationId, scopeId, title }: ChatViewProps) {
   const assistantStream = useAssistantResponseStream({ conversationId, scopeId });
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label={title}>
-      <header className="border-b border-border bg-background px-6 py-4">
+    <section className="flex min-h-0 flex-1 flex-col overflow-hidden" aria-label={title}>
+      <header className="shrink-0 border-b border-border bg-background px-6 py-3">
         <h1 className="text-xl font-semibold tracking-normal text-foreground">{title}</h1>
         {assistantStream.isSubmitting ? (
           <p className="mt-2 text-sm text-muted-foreground" aria-live="polite">
@@ -68,8 +68,8 @@ function AssistantStreamPanel({
 }: AssistantStreamPanelProps) {
   if (draft !== "") {
     return (
-      <div className="border-t border-border bg-muted/20 px-6 py-4">
-        <article className="max-w-[78%] rounded-lg border border-border bg-background px-4 py-3 text-sm leading-6 text-foreground shadow-sm">
+      <div className="shrink-0 border-t border-border bg-muted/20 px-6 py-3">
+        <article className="max-h-48 max-w-[78%] overflow-y-auto rounded-lg border border-border bg-background px-4 py-2.5 text-sm leading-6 text-foreground shadow-sm">
           <p className="mb-1 text-xs font-medium text-muted-foreground">Assistant</p>
           <p className="whitespace-pre-wrap break-words">
             {draft}
@@ -86,7 +86,7 @@ function AssistantStreamPanel({
 
   if (isError) {
     return (
-      <div className="border-t border-border bg-background px-6 py-4">
+      <div className="shrink-0 border-t border-border bg-background px-6 py-3">
         <div className="rounded-md border border-danger/40 bg-danger/10 px-4 py-3">
           <p className="text-sm font-medium text-danger" role="alert">
             Assistant failed to respond.

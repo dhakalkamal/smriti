@@ -21,7 +21,7 @@ export function MessageList({
 
   if (isLoading) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-10">
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6 py-8">
         <p className="text-sm text-muted-foreground">Loading messages...</p>
       </div>
     );
@@ -29,7 +29,7 @@ export function MessageList({
 
   if (isError) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-10">
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6 py-8">
         <p className="text-sm text-danger" role="alert">
           Messages could not be loaded.
         </p>
@@ -38,7 +38,7 @@ export function MessageList({
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
+    <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
       {sortedMessages.length === 0 ? (
         <div className="flex min-h-full items-center justify-center">
           <p className="text-sm text-muted-foreground">
@@ -46,7 +46,7 @@ export function MessageList({
           </p>
         </div>
       ) : (
-        <ol className="space-y-4" aria-label="Messages">
+        <ol className="space-y-2" aria-label="Messages">
           {sortedMessages.map((message) => (
             <MessageItem key={message.id} message={message} />
           ))}

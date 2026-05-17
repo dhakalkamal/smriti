@@ -33,8 +33,8 @@ function ChatPage() {
   }
 
   return (
-    <main className="flex min-h-screen flex-col bg-background text-foreground lg:flex-row">
-      <aside className="flex w-full flex-col gap-6 border-b border-border bg-muted/30 px-5 py-6 lg:min-h-screen lg:max-w-sm lg:border-b-0 lg:border-r">
+    <main className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background text-foreground lg:flex-row">
+      <aside className="flex min-h-0 w-full flex-col gap-6 overflow-y-auto border-b border-border bg-muted/30 px-5 py-6 lg:h-dvh lg:max-w-sm lg:shrink-0 lg:border-b-0 lg:border-r">
         <div className="border-l-4 border-accent pl-4">
           <p className="text-sm font-medium uppercase tracking-normal text-muted-foreground">
             Smriti
@@ -85,7 +85,7 @@ function ChatPage() {
         </section>
       </aside>
 
-      <section className="flex min-h-[32rem] min-w-0 flex-1 lg:min-h-screen">
+      <section className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {renderMainPane({
           conversationsLoading: conversationsQuery.isPending,
           conversationsForSelectedScopeCount: conversationsForSelectedScope.length,
