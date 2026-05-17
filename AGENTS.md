@@ -408,5 +408,12 @@ On some macOS setups, `.venv` or editable-install `.pth` files may regain the
 
 ```text
 ModuleNotFoundError: No module named 'smriti'
+```
+
+Recovery: run `./scripts/fix-venv.sh` (or `chflags -R nouchg,nohidden .venv`
+directly). The root cause is unclear and may be related to macOS file metadata
+events. Treat this as an environment issue, not a packaging or code issue.
+
+---
 
 Build incrementally. Do not pre-create empty packages.
