@@ -4,6 +4,10 @@ const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 type ApiPath = keyof paths;
+type ConversationApiPath =
+  | `/conversations/${string}/assistant-response`
+  | `/conversations/${string}/messages`;
+type LocalApiPath = ApiPath | ConversationApiPath;
 
 interface ApiRequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
@@ -36,7 +40,7 @@ export function getApiBaseUrl(envValue?: string): string {
 }
 
 export async function apiFetch<TResponse>(
-  path: ApiPath,
+  path: LocalApiPath,
   options: ApiRequestOptions = {},
 ): Promise<TResponse> {
   const response = await fetch(buildApiUrl(path), buildRequestInit(options));
@@ -55,7 +59,7 @@ export async function apiFetch<TResponse>(
   return (await response.json()) as TResponse;
 }
 
-function buildApiUrl(path: ApiPath): URL {
+function buildApiUrl(path: LocalApiPath): URL {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return new URL(normalizedPath, `${getConfiguredApiBaseUrl()}/`);
 }
