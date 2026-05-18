@@ -5,6 +5,7 @@ import { ChatView } from "../features/chat/components/ChatView";
 import { ConversationList } from "../features/conversations/components/ConversationList";
 import { CreateConversationForm } from "../features/conversations/components/CreateConversationForm";
 import { useConversations } from "../features/conversations/api/useConversations";
+import { conversationTitleOrFallback } from "../features/conversations/lib/conversationTitle";
 import { CreateScopeForm } from "../features/scopes/components/CreateScopeForm";
 import { ScopeSelector } from "../features/scopes/components/ScopeSelector";
 import { useScopes } from "../features/scopes/api/useScopes";
@@ -92,8 +93,11 @@ function ChatPage() {
           scopesCount: scopes.length,
           scopesLoading: scopesQuery.isPending,
           selectedConversationId,
-          selectedConversationTitle: selectedConversation?.title ?? "Untitled conversation",
+          selectedConversationTitle: conversationTitleOrFallback(selectedConversation?.title),
           selectedScopeId,
+          onSelectedConversationDeleted: () => {
+            setSelectedConversationId(null);
+          },
         })}
       </section>
     </main>
@@ -108,11 +112,13 @@ interface MainPaneState {
   selectedConversationId: string | null;
   selectedConversationTitle: string;
   selectedScopeId: string | null;
+  onSelectedConversationDeleted: () => void;
 }
 
 function renderMainPane({
   conversationsForSelectedScopeCount,
   conversationsLoading,
+  onSelectedConversationDeleted,
   scopesCount,
   scopesLoading,
   selectedConversationId,
@@ -177,6 +183,7 @@ function renderMainPane({
     <ChatView
       conversationId={selectedConversationId}
       key={selectedConversationId}
+      onDeleted={onSelectedConversationDeleted}
       scopeId={selectedScopeId}
       title={selectedConversationTitle}
     />

@@ -102,6 +102,68 @@ describe("ChatPage", () => {
 
     expect(invalidAssistantRetry).toBe(false);
   });
+
+  it("clears the selected conversation after deleting the active conversation", async () => {
+    const conversationsFetch = mockConversationDeleteFetch();
+    vi.stubGlobal("fetch", conversationsFetch.fetchMock);
+
+    renderWithQueryClient(<ChatPage />);
+
+    expect(await screen.findByRole("option", { name: "Research Notes" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Scope"), {
+      target: { value: "scope-1" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Conversation A" }));
+
+    expect(await screen.findByRole("heading", { name: "Conversation A" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete conversation" }));
+
+    expect(screen.getByRole("dialog", { name: "Delete conversation?" })).toHaveTextContent(
+      "Conversation A",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Select a conversation" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Conversation A" })).not.toBeInTheDocument();
+    expect(conversationsFetch.getDeletedConversationIds()).toEqual(["conversation-a"]);
+    expect(conversationsFetch.getConversationListRequestCount()).toBeGreaterThanOrEqual(2);
+  });
+
+  it("preserves the selected conversation after deleting an inactive conversation", async () => {
+    const conversationsFetch = mockConversationDeleteFetch();
+    vi.stubGlobal("fetch", conversationsFetch.fetchMock);
+
+    renderWithQueryClient(<ChatPage />);
+
+    expect(await screen.findByRole("option", { name: "Research Notes" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Scope"), {
+      target: { value: "scope-1" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Conversation A" }));
+
+    expect(await screen.findByRole("heading", { name: "Conversation A" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Conversation B" }));
+
+    expect(screen.getByRole("dialog", { name: "Delete conversation?" })).toHaveTextContent(
+      "Conversation B",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Conversation B" })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("heading", { name: "Conversation A" })).toBeInTheDocument();
+    expect(conversationsFetch.getDeletedConversationIds()).toEqual(["conversation-b"]);
+    expect(conversationsFetch.getConversationListRequestCount()).toBeGreaterThanOrEqual(2);
+  });
 });
 
 interface MockListFetchOptions {
@@ -250,6 +312,80 @@ function mockConversationSwitchFetch() {
 
     throw new Error(`Unexpected ${method} request to ${url.pathname}.`);
   });
+}
+
+function mockConversationDeleteFetch() {
+  const deletedConversationIds = new Set<string>();
+  let conversationListRequestCount = 0;
+  const fetchMock = vi.fn<typeof fetch>().mockImplementation((input, init) => {
+    const url = requestUrl(input);
+    const method = init?.method ?? "GET";
+
+    if (method === "GET" && url.pathname === "/scopes") {
+      return Promise.resolve(
+        jsonResponse([
+          {
+            id: "scope-1",
+            name: "Research Notes",
+            system_prompt: "",
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+          },
+        ]),
+      );
+    }
+
+    if (method === "GET" && url.pathname === "/conversations") {
+      conversationListRequestCount += 1;
+
+      return Promise.resolve(
+        jsonResponse(
+          [
+            {
+              id: "conversation-a",
+              scope_id: "scope-1",
+              title: "Conversation A",
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
+            {
+              id: "conversation-b",
+              scope_id: "scope-1",
+              title: "Conversation B",
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
+          ].filter((conversation) => !deletedConversationIds.has(conversation.id)),
+        ),
+      );
+    }
+
+    if (
+      method === "GET" &&
+      (url.pathname === "/conversations/conversation-a/messages" ||
+        url.pathname === "/conversations/conversation-b/messages")
+    ) {
+      return Promise.resolve(jsonResponse([]));
+    }
+
+    if (
+      method === "DELETE" &&
+      (url.pathname === "/conversations/conversation-a" ||
+        url.pathname === "/conversations/conversation-b")
+    ) {
+      deletedConversationIds.add(url.pathname.replace("/conversations/", ""));
+
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }
+
+    throw new Error(`Unexpected ${method} request to ${url.pathname}.`);
+  });
+
+  return {
+    fetchMock,
+    getConversationListRequestCount: () => conversationListRequestCount,
+    getDeletedConversationIds: () => Array.from(deletedConversationIds),
+  };
 }
 
 function isQueryMessageBodyFromConversationA(body: unknown): boolean {

@@ -517,6 +517,107 @@ describe("ChatView", () => {
     expect(await screen.findByText("Conversation A message")).toBeInTheDocument();
     expect(screen.queryByText(/draft from conversation A/)).not.toBeInTheDocument();
   });
+
+  it.each([
+    { name: "done", terminalEvent: "done" },
+    { name: "error", terminalEvent: "error" },
+    { name: "abort", terminalEvent: "abort" },
+  ] as const)(
+    "disables active deletion during streaming and re-enables after $name",
+    async ({ terminalEvent }) => {
+      const streams: ControlledSseStream[] = [];
+      const messageListResponses: unknown[] = [
+        [],
+        [userMessage],
+        [userMessage, assistantMessage],
+      ];
+      mockFetchImplementation((input, init) => {
+        const url = requestUrl(input);
+
+        if (url.pathname.endsWith("/messages") && init?.method !== "POST") {
+          return nextJsonResponse(messageListResponses);
+        }
+
+        if (url.pathname.endsWith("/messages") && init?.method === "POST") {
+          return jsonResponse(createdUserMessage, 201);
+        }
+
+        if (url.pathname.endsWith("/assistant-response/stream")) {
+          const stream = createControlledSseStream({ signal: init?.signal ?? undefined });
+          streams.push(stream);
+          return stream.response;
+        }
+
+        throw new Error(`Unexpected request: ${url.pathname}`);
+      });
+
+      renderWithQueryClient(
+        <ChatView
+          conversationId="conversation-1"
+          scopeId="scope-1"
+          title="Daily notes"
+        />,
+      );
+
+      expect(await screen.findByText(/No messages yet/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Delete conversation" })).toBeEnabled();
+
+      fireEvent.change(screen.getByLabelText("Message"), {
+        target: { value: "Hello memory" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      await waitFor(() => {
+        expect(streams).toHaveLength(1);
+      });
+
+      act(() => {
+        streams[0]?.enqueue(sseFrame("start", { used_memory_episode_ids: [], chat_model: null }));
+        streams[0]?.enqueue(sseFrame("token", { text: "streaming draft" }));
+      });
+
+      expect(await screen.findByText(/streaming draft/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Delete conversation" })).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Delete conversation" }));
+
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+      if (terminalEvent === "done") {
+        act(() => {
+          streams[0]?.enqueue(
+            sseFrame("done", {
+              assistant_message: assistantMessage,
+              chat_model: "fake-chat",
+              finish_reason: "stop",
+              used_memory_episode_ids: [],
+            }),
+          );
+          streams[0]?.close();
+        });
+
+        expect(await screen.findByText("Persisted assistant reply.")).toBeInTheDocument();
+      }
+
+      if (terminalEvent === "error") {
+        act(() => {
+          streams[0]?.enqueue(
+            sseFrame("error", { code: "backend_error", message: "hidden" }),
+          );
+        });
+
+        expect(await screen.findByText("Assistant failed to respond.")).toBeInTheDocument();
+      }
+
+      if (terminalEvent === "abort") {
+        fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+      }
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Delete conversation" })).toBeEnabled();
+      });
+    },
+  );
 });
 
 function SwitchableChatView() {
