@@ -21,6 +21,7 @@ from smriti.memory import (
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
     CreateScopeRequest,
+    DeleteConversationRequest,
     InvalidMemoryRequestError,
     InvalidProvenanceTargetError,
     InvalidRetrievalRequestError,
@@ -237,6 +238,383 @@ async def test_memory_service_appends_message_episode_and_embedding() -> None:
             assert counts["embeddings"] == 1
             assert counts["dimensions"] == 768
             assert counts["episode_scope_id"] == scope.id
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_cascades_memory_rows_and_preserves_other_conversations() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, deleted_conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            cross_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=scope_id,
+                    title="Cross-conversation provenance",
+                )
+            )
+            same_scope_unrelated_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=scope_id,
+                    title="Same scope survivor",
+                )
+            )
+            other_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=user_id,
+                    name="Other Scope",
+                    system_prompt="Keep this partition separate.",
+                )
+            )
+            other_scope_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=other_scope.id,
+                    title="Other scope survivor",
+                )
+            )
+
+            deleted_message_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=deleted_conversation_id,
+                content="deleted conversation memory",
+            )
+            deleted_query_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=deleted_conversation_id,
+                role="user",
+                content="Use memory from another conversation.",
+            )
+            deleted_assistant_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=deleted_conversation_id,
+                role="assistant",
+                content="I used that external memory.",
+            )
+
+            cross_message_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=cross_conversation.id,
+                content="external memory that must survive deletion",
+            )
+            cross_query_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=cross_conversation.id,
+                role="user",
+                content="Use memory from the deleted conversation.",
+            )
+            cross_assistant_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=cross_conversation.id,
+                role="assistant",
+                content="I used the deleted conversation memory.",
+            )
+            same_scope_unrelated_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=same_scope_unrelated_conversation.id,
+                content="same scope unrelated memory",
+            )
+            other_scope_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=other_scope.id,
+                conversation_id=other_scope_conversation.id,
+                content="other scope memory",
+            )
+
+            summary_vector = await service.embedder.embed_text("deleted summary memory")
+            async with pool.acquire() as connection:
+                deleted_summary_episode_id = await connection.fetchval(
+                    """
+                    INSERT INTO episodes (
+                        conversation_id,
+                        scope_id,
+                        kind,
+                        range_start,
+                        range_end,
+                        content
+                    )
+                    VALUES ($1, $2, 'summary', 1, 3, $3)
+                    RETURNING id;
+                    """,
+                    deleted_conversation_id,
+                    scope_id,
+                    "summary for the deleted conversation",
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO embeddings_768 (episode_id, model_id, embedding)
+                    VALUES ($1, $2, $3);
+                    """,
+                    deleted_summary_episode_id,
+                    deleted_message_episode.embedding_model_id,
+                    list(summary_vector),
+                )
+
+            await service.record_used_memories(
+                user_id=user_id,
+                scope_id=scope_id,
+                query_message_id=cross_query_message.id,
+                assistant_message_id=cross_assistant_message.id,
+                used=[_scored_episode_stub(episode_id=deleted_message_episode.id)],
+                retrieved_at=FIXED_RETRIEVAL_NOW,
+            )
+            await service.record_used_memories(
+                user_id=user_id,
+                scope_id=scope_id,
+                query_message_id=deleted_query_message.id,
+                assistant_message_id=deleted_assistant_message.id,
+                used=[_scored_episode_stub(episode_id=cross_message_episode.id)],
+                retrieved_at=FIXED_RETRIEVAL_NOW + timedelta(minutes=1),
+            )
+
+            async with pool.acquire() as connection:
+                cross_references_deleted_retrieval_id = await connection.fetchval(
+                    """
+                    SELECT id
+                    FROM message_retrievals
+                    WHERE query_conversation_id = $1
+                      AND episode_id = $2;
+                    """,
+                    cross_conversation.id,
+                    deleted_message_episode.id,
+                )
+                deleted_references_cross_retrieval_id = await connection.fetchval(
+                    """
+                    SELECT id
+                    FROM message_retrievals
+                    WHERE query_conversation_id = $1
+                      AND episode_id = $2;
+                    """,
+                    deleted_conversation_id,
+                    cross_message_episode.id,
+                )
+                pre_delete_summary_embedding_exists = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM embeddings_768
+                        WHERE episode_id = $1
+                    );
+                    """,
+                    deleted_summary_episode_id,
+                )
+
+            assert cross_references_deleted_retrieval_id is not None
+            assert deleted_references_cross_retrieval_id is not None
+            assert pre_delete_summary_embedding_exists is True
+
+            await service.delete_conversation(
+                DeleteConversationRequest(
+                    user_id=user_id,
+                    conversation_id=deleted_conversation_id,
+                )
+            )
+
+            async with pool.acquire() as connection:
+                conversation_rows = await connection.fetch(
+                    """
+                    SELECT id
+                    FROM conversations
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [
+                        deleted_conversation_id,
+                        cross_conversation.id,
+                        same_scope_unrelated_conversation.id,
+                        other_scope_conversation.id,
+                    ],
+                )
+                message_rows = await connection.fetch(
+                    """
+                    SELECT id
+                    FROM messages
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [
+                        deleted_message_episode.message_id,
+                        deleted_query_message.id,
+                        deleted_assistant_message.id,
+                        cross_message_episode.message_id,
+                        cross_query_message.id,
+                        cross_assistant_message.id,
+                        same_scope_unrelated_episode.message_id,
+                        other_scope_episode.message_id,
+                    ],
+                )
+                episode_rows = await connection.fetch(
+                    """
+                    SELECT id
+                    FROM episodes
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [
+                        deleted_message_episode.id,
+                        deleted_summary_episode_id,
+                        cross_message_episode.id,
+                        same_scope_unrelated_episode.id,
+                        other_scope_episode.id,
+                    ],
+                )
+                embedding_rows = await connection.fetch(
+                    """
+                    SELECT episode_id
+                    FROM embeddings_768
+                    WHERE episode_id = ANY($1::uuid[]);
+                    """,
+                    [
+                        deleted_message_episode.id,
+                        deleted_summary_episode_id,
+                        cross_message_episode.id,
+                        same_scope_unrelated_episode.id,
+                        other_scope_episode.id,
+                    ],
+                )
+                retrieval_rows = await connection.fetch(
+                    """
+                    SELECT id
+                    FROM message_retrievals
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [
+                        cross_references_deleted_retrieval_id,
+                        deleted_references_cross_retrieval_id,
+                    ],
+                )
+
+            conversation_ids = {row["id"] for row in conversation_rows}
+            assert deleted_conversation_id not in conversation_ids
+            assert cross_conversation.id in conversation_ids
+            assert same_scope_unrelated_conversation.id in conversation_ids
+            assert other_scope_conversation.id in conversation_ids
+
+            message_ids = {row["id"] for row in message_rows}
+            assert deleted_message_episode.message_id not in message_ids
+            assert deleted_query_message.id not in message_ids
+            assert deleted_assistant_message.id not in message_ids
+            assert cross_message_episode.message_id in message_ids
+            assert cross_query_message.id in message_ids
+            assert cross_assistant_message.id in message_ids
+            assert same_scope_unrelated_episode.message_id in message_ids
+            assert other_scope_episode.message_id in message_ids
+
+            episode_ids = {row["id"] for row in episode_rows}
+            assert deleted_message_episode.id not in episode_ids
+            assert deleted_summary_episode_id not in episode_ids
+            assert cross_message_episode.id in episode_ids
+            assert same_scope_unrelated_episode.id in episode_ids
+            assert other_scope_episode.id in episode_ids
+
+            embedding_episode_ids = {row["episode_id"] for row in embedding_rows}
+            assert deleted_message_episode.id not in embedding_episode_ids
+            assert deleted_summary_episode_id not in embedding_episode_ids
+            assert cross_message_episode.id in embedding_episode_ids
+            assert same_scope_unrelated_episode.id in embedding_episode_ids
+            assert other_scope_episode.id in embedding_episode_ids
+
+            retrieval_ids = {row["id"] for row in retrieval_rows}
+            assert cross_references_deleted_retrieval_id not in retrieval_ids
+            assert deleted_references_cross_retrieval_id not in retrieval_ids
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_raises_not_found_for_missing_and_non_owned() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, _, _ = await _create_user_scope_conversation(service, pool)
+            async with pool.acquire() as connection:
+                other_user_id = await connection.fetchval(
+                    "INSERT INTO users DEFAULT VALUES RETURNING id;"
+                )
+            other_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=other_user_id,
+                    name="Other User Scope",
+                    system_prompt="Private to another user.",
+                )
+            )
+            other_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=other_user_id,
+                    scope_id=other_scope.id,
+                    title="Other user's conversation",
+                )
+            )
+
+            for conversation_id in [uuid4(), other_conversation.id]:
+                with pytest.raises(
+                    ConversationNotFoundError,
+                    match="Conversation does not exist",
+                ):
+                    await service.delete_conversation(
+                        DeleteConversationRequest(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                        )
+                    )
+
+            async with pool.acquire() as connection:
+                other_conversation_exists = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM conversations
+                        WHERE id = $1
+                    );
+                    """,
+                    other_conversation.id,
+                )
+
+            assert other_conversation_exists is True
         finally:
             await close_pool()
 

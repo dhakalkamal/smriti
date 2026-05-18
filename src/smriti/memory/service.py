@@ -30,6 +30,7 @@ from smriti.memory.models import (
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
     CreateScopeRequest,
+    DeleteConversationRequest,
     EpisodeKind,
     EpisodeRecord,
     ListConversationsRequest,
@@ -332,6 +333,27 @@ class MemoryService:
         if row is None:
             raise ConversationNotFoundError("Conversation was not created")
         return _conversation_from_row(row)
+
+    async def delete_conversation(
+        self,
+        request: DeleteConversationRequest,
+    ) -> None:
+        """Hard-delete a user-owned conversation and rely on schema cascades."""
+
+        async with self.pool.acquire() as connection, connection.transaction():
+            row = await connection.fetchrow(
+                """
+                DELETE FROM conversations
+                WHERE id = $1
+                  AND user_id = $2
+                RETURNING id;
+                """,
+                request.conversation_id,
+                request.user_id,
+            )
+
+        if row is None:
+            raise ConversationNotFoundError("Conversation does not exist")
 
     async def append_message(self, request: AppendMessageRequest) -> MessageRecord:
         """Append an immutable message to a conversation in the expected scope."""

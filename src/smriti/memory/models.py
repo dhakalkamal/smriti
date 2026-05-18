@@ -50,6 +50,12 @@ class CreateConversationRequest:
 
 
 @dataclass(frozen=True)
+class DeleteConversationRequest:
+    user_id: UUID
+    conversation_id: UUID
+
+
+@dataclass(frozen=True)
 class AppendMessageRequest:
     user_id: UUID
     scope_id: UUID
