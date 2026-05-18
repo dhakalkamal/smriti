@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 
 from smriti.api.dependencies import get_current_local_user_id, get_memory_service
 from smriti.api.schemas import ConversationResponse, CreateConversationBody
 from smriti.memory import (
     CreateConversationRequest,
+    DeleteConversationRequest,
     ListConversationsRequest,
     MemoryService,
 )
@@ -49,3 +50,23 @@ async def create_conversation(
         )
     )
     return ConversationResponse.from_record(conversation)
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_conversation(
+    conversation_id: UUID,
+    memory_service: Annotated[MemoryService, Depends(get_memory_service)],
+    local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
+) -> Response:
+    """Delete a local user's conversation."""
+
+    await memory_service.delete_conversation(
+        DeleteConversationRequest(
+            user_id=local_user_id,
+            conversation_id=conversation_id,
+        )
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

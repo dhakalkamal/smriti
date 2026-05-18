@@ -38,6 +38,7 @@ EXPECTED_STAGE_7_6_ROUTES = {
     ("POST", "/scopes"),
     ("GET", "/conversations"),
     ("POST", "/conversations"),
+    ("DELETE", "/conversations/{conversation_id}"),
     ("GET", "/conversations/{conversation_id}/messages"),
     ("POST", "/conversations/{conversation_id}/messages"),
     ("POST", "/retrieval/search"),
@@ -91,6 +92,7 @@ def test_cors_allows_only_documented_localhost_origins() -> None:
         assert _header_values(response.headers["access-control-allow-methods"]) == {
             "GET",
             "POST",
+            "DELETE",
         }
 
     denied_response = client.options(

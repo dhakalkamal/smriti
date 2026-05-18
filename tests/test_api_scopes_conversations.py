@@ -22,6 +22,7 @@ from smriti.memory import (
     ConversationRecord,
     CreateConversationRequest,
     CreateScopeRequest,
+    DeleteConversationRequest,
     ListConversationsRequest,
     ListScopesRequest,
     MemoryService,
@@ -88,10 +89,13 @@ def test_scope_and_conversation_routes_create_and_list_local_records() -> None:
                 listed_conversation["id"] for listed_conversation in conversations_response.json()
             ] == [conversation["id"]]
 
+            delete_response = client.delete(f"/conversations/{conversation['id']}")
+            assert delete_response.status_code == 204
+            assert delete_response.content == b""
+            assert client.get("/conversations").json() == []
+
         assert asyncio.run(_scope_owner_id(settings, UUID(scope["id"]))) == LOCAL_USER_ID
-        assert (
-            asyncio.run(_conversation_owner_id(settings, UUID(conversation["id"]))) == LOCAL_USER_ID
-        )
+        assert asyncio.run(_conversation_exists(settings, UUID(conversation["id"]))) is False
 
 
 def test_scope_and_conversation_routes_map_invalid_forbidden_and_missing_cases() -> None:
@@ -140,6 +144,19 @@ def test_scope_and_conversation_routes_map_invalid_forbidden_and_missing_cases()
             )
             assert forbidden_scope_response.status_code == 403
 
+            missing_conversation_response = client.delete(f"/conversations/{uuid4()}")
+
+            other_conversation_id = asyncio.run(_create_other_user_conversation(settings))
+            forbidden_conversation_response = client.delete(
+                f"/conversations/{other_conversation_id}"
+            )
+
+            assert missing_conversation_response.status_code == 404
+            assert forbidden_conversation_response.status_code == 404
+            assert missing_conversation_response.json() == forbidden_conversation_response.json()
+            assert missing_conversation_response.json() == {"detail": "Conversation not found"}
+            assert asyncio.run(_conversation_exists(settings, other_conversation_id)) is True
+
 
 def test_scope_and_conversation_routes_delegate_to_memory_service_dependencies() -> None:
     local_user_id = uuid4()
@@ -186,6 +203,7 @@ def test_scope_and_conversation_routes_delegate_to_memory_service_dependencies()
         ).status_code
         == 201
     )
+    assert client.delete(f"/conversations/{conversation_id}").status_code == 204
 
     assert service.calls == [
         ("list_scopes", ListScopesRequest(user_id=local_user_id)),
@@ -204,6 +222,13 @@ def test_scope_and_conversation_routes_delegate_to_memory_service_dependencies()
                 user_id=local_user_id,
                 scope_id=scope_id,
                 title="Paper trail",
+            ),
+        ),
+        (
+            "delete_conversation",
+            DeleteConversationRequest(
+                user_id=local_user_id,
+                conversation_id=conversation_id,
             ),
         ),
     ]
@@ -230,7 +255,8 @@ class RecordingMemoryService:
                 ListScopesRequest
                 | CreateScopeRequest
                 | ListConversationsRequest
-                | CreateConversationRequest,
+                | CreateConversationRequest
+                | DeleteConversationRequest,
             ]
         ] = []
 
@@ -255,6 +281,12 @@ class RecordingMemoryService:
     ) -> ConversationRecord:
         self.calls.append(("create_conversation", request))
         return self.conversation
+
+    async def delete_conversation(
+        self,
+        request: DeleteConversationRequest,
+    ) -> None:
+        self.calls.append(("delete_conversation", request))
 
 
 async def _scope_owner_id(settings: Settings, scope_id: UUID) -> UUID:
@@ -283,6 +315,25 @@ async def _conversation_owner_id(settings: Settings, conversation_id: UUID) -> U
     return cast(UUID, value)
 
 
+async def _conversation_exists(settings: Settings, conversation_id: UUID) -> bool:
+    connection = await _connect(settings)
+    try:
+        value = await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM conversations
+                WHERE id = $1
+            );
+            """,
+            conversation_id,
+        )
+    finally:
+        await connection.close()
+
+    return cast(bool, value)
+
+
 async def _create_other_user_scope(settings: Settings) -> UUID:
     connection = await _connect(settings)
     try:
@@ -308,6 +359,43 @@ async def _create_other_user_scope(settings: Settings) -> UUID:
         await connection.close()
 
     return cast(UUID, scope_id)
+
+
+async def _create_other_user_conversation(settings: Settings) -> UUID:
+    connection = await _connect(settings)
+    try:
+        await connection.execute(
+            """
+            INSERT INTO users (id)
+            VALUES ($1)
+            ON CONFLICT (id) DO NOTHING;
+            """,
+            OTHER_USER_ID,
+        )
+        scope_id = await connection.fetchval(
+            """
+            INSERT INTO scopes (user_id, name, system_prompt)
+            VALUES ($1, $2, $3)
+            RETURNING id;
+            """,
+            OTHER_USER_ID,
+            f"Other User Scope {uuid4()}",
+            "Private.",
+        )
+        conversation_id = await connection.fetchval(
+            """
+            INSERT INTO conversations (user_id, scope_id, title)
+            VALUES ($1, $2, $3)
+            RETURNING id;
+            """,
+            OTHER_USER_ID,
+            scope_id,
+            "Other user conversation",
+        )
+    finally:
+        await connection.close()
+
+    return cast(UUID, conversation_id)
 
 
 async def _connect(settings: Settings) -> asyncpg.Connection:
