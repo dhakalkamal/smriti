@@ -693,6 +693,43 @@
         ]
       }
     },
+    "/conversations/{conversation_id}": {
+      "delete": {
+        "description": "Delete a local user's conversation.",
+        "operationId": "delete_conversation_conversations__conversation_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Conversation",
+        "tags": [
+          "conversations"
+        ]
+      }
+    },
     "/conversations/{conversation_id}/assistant-response": {
       "post": {
         "description": "Generate and persist one assistant response for a local conversation.",

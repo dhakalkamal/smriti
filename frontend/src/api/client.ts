@@ -5,6 +5,7 @@ const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 type ApiPath = keyof paths;
 type ConversationApiPath =
+  | `/conversations/${string}`
   | `/conversations/${string}/assistant-response`
   | `/conversations/${string}/assistant-response/stream`
   | `/conversations/${string}/messages`;
