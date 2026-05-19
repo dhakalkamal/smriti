@@ -5,9 +5,7 @@ conversation history in user-defined scopes, embeds user messages with Ollama,
 retrieves relevant memories from the active scope, and uses those memories while
 generating assistant responses through a local Ollama chat model.
 
-The project is in early development. The current implementation is complete
-through Stage 10a.
-
+This project is in active development. Contributions are welcome. 
 ## Current Status
 
 Implemented:
@@ -31,7 +29,6 @@ Implemented:
 
 Not implemented:
 
-- MCP server
 - Rolling summarization
 - Scope editing or deletion
 - Conversation rename
@@ -41,7 +38,6 @@ Not implemented:
 - Cross-scope retrieval
 - Hybrid search, rerankers, or query rewriting
 - Authentication or multi-user accounts
-- Cloud model providers
 
 ## Privacy Model
 
