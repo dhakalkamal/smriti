@@ -297,4 +297,6 @@ Next planned areas:
 
 ## License
 
-TBD.
+MIT License. See [LICENSE](/Users/kamal/Desktop/projects/smriti/LICENSE).
+
+Copyright (c) 2026 Kamal Dhakal.
