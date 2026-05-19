@@ -1,155 +1,299 @@
-# smriti
+# Smriti
 
-Long-memory companions you can shape to your purpose. Local LLMs on your machine, with memory that spans months instead of minutes.
+Smriti is a localhost-only memory and chat application for local LLMs. It stores
+conversation history in user-defined scopes, embeds user messages with Ollama,
+retrieves relevant memories from the active scope, and uses those memories while
+generating assistant responses through a local Ollama chat model.
 
-*smriti* (स्मृति) is Sanskrit for "memory" or "remembrance."
+The project is in early development. The current implementation is complete
+through Stage 10a.
 
-> **Status:** early development.
+## Current Status
 
-## What it is
+Implemented:
 
-Local LLMs run well on Apple Silicon, but their effective context window is small. Once a chat passes ~8k–32k tokens, the model forgets. You can't have a long-running conversation with a local model the way you can with ChatGPT or Claude.
+- Python memory service using raw SQL, asyncpg, Postgres 16, and pgvector
+- Append-only messages and message-backed retrieval episodes
+- User-defined scopes with enforced scope-filtered retrieval
+- Ollama embeddings with `nomic-embed-text`, 768 dimensions
+- Weighted retrieval scoring using similarity, recency, access reinforcement,
+  importance, and access frequency
+- Used-memory provenance for assistant responses
+- Local FastAPI API with narrow localhost CORS
+- Non-streaming and SSE streaming assistant generation
+- React, TypeScript, Vite, Tailwind, and TanStack Query frontend
+- Scope creation and listing in the UI
+- Conversation creation, listing, selection, and hard deletion in the UI
+- Streaming chat UI with transient assistant drafts, Stop, and Retry
+- Offline OpenAPI export and generated frontend API types
+- Deterministic fake embedders and chat generators for tests
+- Minimal retrieval eval helper
 
-smriti fixes that by giving local LLMs a long-term memory layer. You define **scopes** — bounded memory spaces for whatever purpose you choose. A scope might be a journaling companion, a counselor persona, a research assistant, a coding partner. Each scope has its own system prompt and its own memory pool. Conversations within a scope share memory; conversations across scopes never bleed into each other.
+Not implemented:
 
-The bot remembers what you said weeks ago. It surfaces relevant past moments when you ask about them. It can notice patterns over time. And none of your data ever leaves your machine.
+- MCP server
+- Rolling summarization
+- Scope editing or deletion
+- Conversation rename
+- Message-level deletion
+- Memory episode management UI
+- Provenance visualization in the UI
+- Cross-scope retrieval
+- Hybrid search, rerankers, or query rewriting
+- Authentication or multi-user accounts
+- Cloud model providers
 
-## Privacy model
+## Privacy Model
 
-This is the part to read carefully.
+With the bundled UI, FastAPI backend, Postgres database, and Ollama running on
+localhost, user data stays on the machine. Messages, embeddings, retrieved
+memory context, assistant prompts, and generated responses are handled by local
+services.
 
-**With the bundled chat UI + Ollama:** nothing leaves your machine. Messages, embeddings, summaries — all local. You can verify with `lsof -i` or Little Snitch.
+The current codebase does not include an MCP server. External MCP clients are
+therefore not part of the current product path.
 
-**With external MCP clients (Claude Desktop, ChatGPT Desktop, Cline-with-cloud-models):** the MCP server itself is local, but those clients send your messages — and any memories retrieved on your behalf — to their respective cloud providers. This is fine if you trust them, but it is *not* the local-only mode. Use the bundled UI for the strict privacy guarantee.
+Smriti does not include telemetry, analytics, accounts, signup flows, CDN
+assets, Google Fonts, or remote model providers. Runtime defaults bind services
+to localhost:
 
-No telemetry, no analytics, no auto-update, no account, no signup. Postgres binds to localhost. Ollama binds to localhost. The only outbound network calls the system makes are the ones *you* explicitly configure.
+- Postgres: `127.0.0.1:5432`
+- FastAPI: `127.0.0.1:8000`
+- Vite: `127.0.0.1:5173`
+- Ollama: `127.0.0.1:11434`
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       User's Mac (M-series)                      │
-│                                                                  │
-│  ┌──────────────────┐         ┌─────────────────────────────┐   │
-│  │ Browser          │         │ External MCP client          │   │
-│  │ React app        │         │ (Claude Desktop, Cline, etc.)│   │
-│  │ localhost:5173   │         │                              │   │
-│  └────────┬─────────┘         └─────────────┬────────────────┘   │
-│           │ HTTP/SSE                        │ MCP (stdio)        │
-│           ▼                                 ▼                    │
-│  ┌──────────────────┐         ┌─────────────────────────────┐   │
-│  │ FastAPI          │         │ FastMCP server               │   │
-│  │ localhost:8000   │         │                              │   │
-│  │ + chat           │         │ Tools: recall, remember,     │   │
-│  │   orchestrator   │         │ list_scopes, forget          │   │
-│  └────────┬─────────┘         └─────────────┬────────────────┘   │
-│           │                                 │                    │
-│           └───────────────┬─────────────────┘                    │
-│                           ▼                                      │
-│           ┌───────────────────────────────────┐                  │
-│           │   Memory service (Python)         │                  │
-│           │   archive · retrieve · summarize  │                  │
-│           │   score (multi-component)         │                  │
-│           └───────────────┬───────────────────┘                  │
-│                           │                                      │
-│             ┌─────────────┴─────────────┐                        │
-│             ▼                           ▼                        │
-│   ┌──────────────────┐         ┌──────────────────┐              │
-│   │ Postgres 16 +    │         │ Ollama           │              │
-│   │ pgvector         │         │ localhost:11434  │              │
-│   │ 127.0.0.1:5432   │         │                  │              │
-│   │ (Docker)         │         │ - embeddings     │              │
-│   └──────────────────┘         │ - chat           │              │
-│                                └──────────────────┘              │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-
-         No network egress. All boxes are on localhost.
+```text
++------------------------------- User machine -------------------------------+
+|                                                                            |
+|  Browser                                                                   |
+|  React app                                                                 |
+|  127.0.0.1:5173                                                            |
+|      |                                                                     |
+|      | HTTP and fetch-based SSE                                            |
+|      v                                                                     |
+|  FastAPI local API                                                         |
+|  127.0.0.1:8000                                                            |
+|      |                                                                     |
+|      | calls service layer only                                            |
+|      v                                                                     |
+|  Memory service and assistant orchestrator                                 |
+|      |                                                                     |
+|      | raw SQL                         local HTTP                          |
+|      v                                 v                                   |
+|  Postgres 16 + pgvector             Ollama                                 |
+|  127.0.0.1:5432                     127.0.0.1:11434                       |
+|  Docker                             embeddings and chat                    |
+|                                                                            |
++----------------------------------------------------------------------------+
 ```
 
-The memory service is the core. FastAPI and the MCP server are both thin wrappers over it. One memory implementation, two ways to use it.
+The memory service is the core boundary. FastAPI routes depend on it rather than
+issuing memory SQL directly. The assistant orchestrator composes the memory
+service with the local chat generator for prompt construction, generation,
+persistence, and provenance.
 
-## Tech stack
+## API Surface
 
-**Backend:**
-- Python 3.11+, async-first. The project environment is pinned to CPython 3.13; Python 3.14 is excluded until uv editable installs on macOS no longer hide `.pth` files from Python's startup checks.
-- Postgres 16 + pgvector (HNSW indexes)
-- asyncpg for database access (no ORM)
-- Ollama for embeddings (`nomic-embed-text`, 768d) and chat (`qwen2.5:7b` by default)
-- FastAPI for the HTTP/SSE layer
-- FastMCP for the MCP server
-- uv for dependency management
+The local FastAPI app currently exposes:
 
-**Frontend:**
-- React + TypeScript
-- Vite as the build tool
-- Tailwind + shadcn/ui for styling
-- All assets vendored locally — no Google Fonts, no CDNs
+- `GET /health`
+- `GET /scopes`
+- `POST /scopes`
+- `GET /conversations`
+- `POST /conversations`
+- `DELETE /conversations/{conversation_id}`
+- `GET /conversations/{conversation_id}/messages`
+- `POST /conversations/{conversation_id}/messages`
+- `POST /retrieval/search`
+- `POST /conversations/{conversation_id}/assistant-response`
+- `POST /conversations/{conversation_id}/assistant-response/stream`
 
-## Quick start (once implemented)
+The app disables HTTP documentation and OpenAPI routes at runtime. OpenAPI JSON
+for frontend type generation is exported offline through
+`scripts/export_openapi.py`.
+
+## Data Model
+
+Key tables:
+
+- `users`: local identity. The API bootstraps one configured local user.
+- `scopes`: user-defined memory partitions with system prompts.
+- `conversations`: chat threads that belong to one scope.
+- `messages`: immutable user and assistant turns.
+- `episodes`: retrieval units. Current UI-created user messages create
+  `kind = 'message'` episodes.
+- `embedding_models`: local embedding model registry.
+- `embeddings_768`: pgvector embeddings for 768-dimensional episode vectors.
+- `message_retrievals`: provenance records for memories used in assistant
+  responses.
+- `eval_*`: early eval harness scaffolding.
+
+Generated assistant responses are persisted as messages with provenance, but
+they are not embedded as memory episodes in the current stage. Rolling summary
+episodes are part of a later stage.
+
+## Setup
+
+Requirements:
+
+- Python 3.13.x
+- uv
+- Docker with Docker Compose
+- Ollama
+- Node.js with pnpm
+
+Install backend dependencies:
 
 ```bash
-# Bring up Postgres
-docker compose up -d
-
-# Install backend deps and apply migrations
 uv sync --python 3.13 --extra dev
-uv run migrate up
+```
 
-# Pull local models
+On macOS, if editable imports fail with `ModuleNotFoundError: No module named
+'smriti'`, clear hidden flags on the virtual environment before changing
+packaging:
+
+```bash
+chflags -R nouchg,nohidden .venv
+uv run python -c "import smriti; print(smriti.__file__)"
+```
+
+Create a local environment file if you want to override defaults:
+
+```bash
+cp .env.example .env
+```
+
+Start Postgres and apply migrations:
+
+```bash
+docker compose up -d
+uv run migrate up
+```
+
+Install Ollama models:
+
+```bash
 ollama pull nomic-embed-text
 ollama pull qwen2.5:7b
+```
 
-# Run backend (one terminal)
-uv run smriti serve
+Run the backend:
 
-# Run frontend (another terminal)
+```bash
+uv run uvicorn smriti.api:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Install and run the frontend:
+
+```bash
 cd frontend
-npm install
-npm run dev
+pnpm install
+pnpm dev
+```
 
-# Open browser at http://localhost:5173
+Open:
+
+```text
+http://127.0.0.1:5173
+```
+
+## Frontend API Types
+
+Generated API types are committed at `frontend/src/api/types.ts`. Regenerate
+them after backend API shape changes:
+
+```bash
+cd frontend
+pnpm generate:api
+```
+
+This command runs the backend OpenAPI exporter offline. It should not require
+Postgres, Ollama, or a running FastAPI server.
+
+## Validation
+
+Backend validation from the repository root:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/smriti/db src/smriti/config.py
+uv run pytest -q
+```
+
+Frontend validation from `frontend/`:
+
+```bash
+pnpm generate:api
+pnpm typecheck
+pnpm lint
+pnpm test
+pnpm build
+```
+
+Repository hygiene:
+
+```bash
+git diff --check
 ```
 
 ## Concepts
 
-**Scopes.** A scope is a user-defined memory partition with its own system prompt. You might create a "Family Companion" scope, a "Research Notes" scope, a "Coding Helper" scope. The bot only retrieves memories from within the current scope — never across scopes.
+**Scopes.** A scope is a user-defined memory partition with its own system
+prompt. Retrieval requires a `scope_id` and only returns episodes from that
+scope.
 
-**Conversations.** A conversation is a single chat thread within a scope. You can have many concurrent threads in the same scope; they share memory.
+**Conversations.** A conversation is a chat thread inside one scope. Multiple
+conversations in the same scope share the same retrieval pool.
 
-**Messages.** Individual turns. Stored immutably — the audit trail.
+**Messages.** Messages are immutable conversation turns. User messages submitted
+through the normal message endpoint are also archived as retrieval episodes.
 
-**Episodes.** The unit of retrieval. Either an individual message or a summary of a range of older messages. Both kinds coexist in one table; retrieval searches both transparently.
+**Episodes.** Episodes are the retrieval unit. The schema supports message and
+summary episodes, but summary creation is not implemented yet.
 
-**Memory retrieval.** When you send a message, smriti embeds it, searches the current scope's episodes for relevant matches, scores them by similarity + recency + importance + reinforcement + frequency, and injects the top results into the prompt alongside your recent live messages.
+**Retrieval.** Retrieval embeds the query, searches only episodes in the active
+scope, scores candidates, updates access metadata for returned episodes, and
+returns structured scored records.
 
-## Roadmap
+**Assistant generation.** Assistant generation starts from a persisted user
+message. The backend retrieves scoped memories, builds a prompt from the scope
+prompt, fixed local instructions, selected memories, and recent messages, calls
+local Ollama, then persists the assistant response and used-memory provenance.
 
-**v1 — basic working memory**
-- [x] Schema, migrations, db client
-- [ ] Scopes (migration 002)
-- [ ] Ollama embedder, fake embedder for tests
-- [ ] Memory service: archive, retrieve, score
-- [ ] MCP server with `recall` + `remember`
-- [ ] FastAPI layer with SSE streaming
-- [ ] React chat UI with scope and conversation management
-- [ ] Rolling summarization
+**SSE streaming.** The streaming endpoint emits `start`, `token`, `done`, and
+`error` events over a `POST` request. The frontend uses `fetch` with
+`ReadableStream`, not `EventSource`, because the stream is initiated by `POST`.
 
-**v1.1 — confident upgrades (measure before/after with eval harness)**
-- [ ] Eval harness with synthetic conversations
-- [ ] Hybrid search (BM25 + vector + RRF)
-- [ ] Contextual retrieval (Anthropic-style prefix embedding)
-- [ ] Cross-encoder reranking (local model)
+**Conversation deletion.** Stage 10a implements hard deletion for conversations.
+Deleting a conversation removes dependent messages, episodes, embeddings, and
+provenance rows through schema cascades. The UI requires confirmation and does
+not delete active conversations while a stream is running.
 
-**v2 — pattern detection and richer memory**
-- [ ] Batch clustering of embeddings → generated insight episodes
-- [ ] Time-aware retrieval
-- [ ] Query rewriting with the local LLM
-- [ ] Multi-model embedding comparison
+## Stage Roadmap
 
-**v3 — experimental, contingent on v2 results**
-- [ ] Lightweight knowledge graph for entity resolution
-- [ ] Agentic retrieval (model issues follow-up queries)
+Completed:
+
+- Stage 1 through 4: schema, migrations, database client, scopes, embeddings,
+  and memory service core
+- Stage 5: scoped retrieval, scoring, access metadata, provenance groundwork,
+  and minimal eval helper
+- Stage 6: local FastAPI API layer
+- Stage 7: assistant generation, local Ollama chat, provenance persistence, and
+  SSE backend route
+- Stage 8: React frontend foundation
+- Stage 9a: non-streaming chat UI
+- Stage 9b: SSE streaming chat UI
+- Stage 10a: conversation deletion and cleanup UI
+
+Next planned areas:
+
+- Scope management UI beyond create and list
+- Rolling summarization
+- Expanded retrieval eval harness
+- Optional MCP server after the core local UI product is complete
 
 ## License
 
