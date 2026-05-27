@@ -116,12 +116,15 @@ def test_ollama_chat_generator_rejects_unsupported_base_urls(base_url: str) -> N
         OllamaChatGenerator(base_url=base_url)
 
 
-def test_ollama_chat_generator_rejects_invalid_model_and_timeout() -> None:
+def test_ollama_chat_generator_rejects_invalid_model_timeout_and_context_window() -> None:
     with pytest.raises(ChatConfigurationError):
         OllamaChatGenerator(model="")
 
     with pytest.raises(ChatConfigurationError):
         OllamaChatGenerator(timeout_seconds=0.0)
+
+    with pytest.raises(ChatConfigurationError):
+        OllamaChatGenerator(num_ctx=0)
 
 
 @pytest.mark.asyncio
@@ -163,6 +166,7 @@ async def test_ollama_chat_generator_posts_non_streaming_request_to_local_chat_e
             base_url=f"http://127.0.0.1:{port}",
             model="qwen2.5:7b",
             timeout_seconds=1.0,
+            num_ctx=16384,
         )
 
         response = await generator.generate(
@@ -193,6 +197,7 @@ async def test_ollama_chat_generator_posts_non_streaming_request_to_local_chat_e
                     {"role": "user", "content": "Say hello."},
                 ],
                 "stream": False,
+                "options": {"num_ctx": 16384},
             },
         )
     ]
@@ -255,6 +260,7 @@ async def test_ollama_chat_generator_streams_local_chat_events() -> None:
             base_url=f"http://127.0.0.1:{port}",
             model="qwen2.5:7b",
             timeout_seconds=1.0,
+            num_ctx=4096,
         )
 
         events = [
@@ -283,6 +289,7 @@ async def test_ollama_chat_generator_streams_local_chat_events() -> None:
                 "model": "qwen2.5:7b",
                 "messages": [{"role": "user", "content": "Say hello."}],
                 "stream": True,
+                "options": {"num_ctx": 4096},
             },
         )
     ]

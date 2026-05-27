@@ -11,6 +11,8 @@ def test_settings_defaults_include_local_ollama_chat_configuration() -> None:
 
     assert settings.ollama_base_url == "http://127.0.0.1:11434"
     assert settings.ollama_chat_model == "qwen2.5:7b"
+    assert settings.ollama_chat_num_ctx == 8192
+    assert settings.ollama_embed_num_ctx == 8192
     assert settings.ollama_chat_timeout_seconds == 60.0
 
 
@@ -19,12 +21,16 @@ def test_settings_loads_local_ollama_chat_configuration_from_environment(
 ) -> None:
     monkeypatch.setenv("SMRITI_OLLAMA_BASE_URL", "http://localhost:11434")
     monkeypatch.setenv("SMRITI_OLLAMA_CHAT_MODEL", "qwen3:8b")
+    monkeypatch.setenv("SMRITI_OLLAMA_CHAT_NUM_CTX", "16384")
+    monkeypatch.setenv("SMRITI_OLLAMA_EMBED_NUM_CTX", "4096")
     monkeypatch.setenv("SMRITI_OLLAMA_CHAT_TIMEOUT_SECONDS", "12.5")
 
     settings = Settings(_env_file=None)
 
     assert settings.ollama_base_url == "http://localhost:11434"
     assert settings.ollama_chat_model == "qwen3:8b"
+    assert settings.ollama_chat_num_ctx == 16384
+    assert settings.ollama_embed_num_ctx == 4096
     assert settings.ollama_chat_timeout_seconds == 12.5
 
 
@@ -34,3 +40,9 @@ def test_settings_rejects_invalid_local_ollama_chat_configuration() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, ollama_chat_timeout_seconds=0.0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ollama_chat_num_ctx=0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, ollama_embed_num_ctx=0)

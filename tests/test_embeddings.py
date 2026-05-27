@@ -61,6 +61,11 @@ def test_ollama_embedder_rejects_non_localhost_base_url() -> None:
         OllamaEmbedder(base_url="https://127.0.0.1:11434")
 
 
+def test_ollama_embedder_rejects_invalid_context_window() -> None:
+    with pytest.raises(EmbeddingConfigurationError):
+        OllamaEmbedder(num_ctx=0)
+
+
 @pytest.mark.asyncio
 async def test_ollama_embedder_posts_batch_to_local_embed_endpoint() -> None:
     requests: list[tuple[str, dict[str, object]]] = []
@@ -97,6 +102,7 @@ async def test_ollama_embedder_posts_batch_to_local_embed_endpoint() -> None:
             model="nomic-embed-text",
             dimensions=2,
             timeout_seconds=1.0,
+            num_ctx=6144,
         )
 
         vectors = await embedder.embed_texts(["one", "two"])
@@ -111,6 +117,7 @@ async def test_ollama_embedder_posts_batch_to_local_embed_endpoint() -> None:
             {
                 "model": "nomic-embed-text",
                 "input": ["one", "two"],
+                "options": {"num_ctx": 6144},
                 "dimensions": 2,
             },
         )

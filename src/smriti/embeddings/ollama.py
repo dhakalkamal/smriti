@@ -27,6 +27,7 @@ class OllamaEmbedder:
     timeout_seconds: float = 30.0
     dimensions: int | None = None
     truncate: bool | None = None
+    num_ctx: int = 8192
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -35,6 +36,8 @@ class OllamaEmbedder:
             raise EmbeddingConfigurationError("Ollama timeout must be positive")
         if self.dimensions is not None and self.dimensions <= 0:
             raise EmbeddingConfigurationError("Ollama dimensions must be positive when set")
+        if self.num_ctx <= 0:
+            raise EmbeddingConfigurationError("Ollama context window must be positive")
 
         self._parse_base_url()
 
@@ -53,6 +56,7 @@ class OllamaEmbedder:
         payload: dict[str, object] = {
             "model": self.model,
             "input": list(texts),
+            "options": {"num_ctx": self.num_ctx},
         }
         if self.dimensions is not None:
             payload["dimensions"] = self.dimensions

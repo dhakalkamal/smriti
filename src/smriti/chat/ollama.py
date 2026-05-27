@@ -34,12 +34,15 @@ class OllamaChatGenerator:
     model: str = "qwen2.5:7b"
     base_url: str = "http://127.0.0.1:11434"
     timeout_seconds: float = 60.0
+    num_ctx: int = 8192
 
     def __post_init__(self) -> None:
         if not self.model:
             raise ChatConfigurationError("Ollama model name must not be empty")
         if self.timeout_seconds <= 0:
             raise ChatConfigurationError("Ollama timeout must be positive")
+        if self.num_ctx <= 0:
+            raise ChatConfigurationError("Ollama context window must be positive")
 
         self._parse_base_url()
 
@@ -50,6 +53,7 @@ class OllamaChatGenerator:
             "model": self.model,
             "messages": [self._message_payload(message) for message in request.messages],
             "stream": False,
+            "options": {"num_ctx": self.num_ctx},
         }
 
         response = await self._post_json(payload)
@@ -62,6 +66,7 @@ class OllamaChatGenerator:
             "model": self.model,
             "messages": [self._message_payload(message) for message in request.messages],
             "stream": True,
+            "options": {"num_ctx": self.num_ctx},
         }
 
         async for event in self._stream_json(payload):

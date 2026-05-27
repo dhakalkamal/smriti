@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import UUID
@@ -25,6 +26,8 @@ from smriti.db.client import close_pool, get_pool
 from smriti.embeddings import Embedder, OllamaEmbedder
 from smriti.memory import MemoryService
 
+logger = logging.getLogger(__name__)
+
 LOCAL_CORS_ORIGINS = ("http://127.0.0.1:5173", "http://localhost:5173")
 
 
@@ -39,14 +42,22 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_settings = settings or get_settings()
-        print(f"Smriti resolved Ollama chat model: {resolved_settings.ollama_chat_model}")
+        logger.info(
+            "Smriti Ollama config resolved: chat_model=%s chat_num_ctx=%s embed_num_ctx=%s",
+            resolved_settings.ollama_chat_model,
+            resolved_settings.ollama_chat_num_ctx,
+            resolved_settings.ollama_embed_num_ctx,
+        )
         pool = await get_pool(resolved_settings)
-        resolved_embedder = embedder or OllamaEmbedder()
+        resolved_embedder = embedder or OllamaEmbedder(
+            num_ctx=resolved_settings.ollama_embed_num_ctx,
+        )
         memory_service = MemoryService(pool=pool, embedder=resolved_embedder)
         resolved_chat_generator = chat_generator or OllamaChatGenerator(
             model=resolved_settings.ollama_chat_model,
             base_url=resolved_settings.ollama_base_url,
             timeout_seconds=resolved_settings.ollama_chat_timeout_seconds,
+            num_ctx=resolved_settings.ollama_chat_num_ctx,
         )
         assistant_orchestrator = AssistantOrchestrator(
             memory_service=memory_service,
