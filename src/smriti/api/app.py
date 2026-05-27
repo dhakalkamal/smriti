@@ -39,6 +39,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_settings = settings or get_settings()
+        print(f"Smriti resolved Ollama chat model: {resolved_settings.ollama_chat_model}")
         pool = await get_pool(resolved_settings)
         resolved_embedder = embedder or OllamaEmbedder()
         memory_service = MemoryService(pool=pool, embedder=resolved_embedder)

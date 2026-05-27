@@ -29,6 +29,10 @@ class ConversationNotFoundError(MemoryServiceError):
     """Raised when a conversation is missing from the expected user and scope."""
 
 
+class AssistantMessageNotFoundError(MemoryServiceError):
+    """Raised when an assistant message is missing from the expected conversation."""
+
+
 class InvalidRetrievalRequestError(MemoryServiceError):
     """Raised when a retrieval request cannot be executed safely."""
 

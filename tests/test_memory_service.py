@@ -15,13 +15,16 @@ from smriti.db.client import close_pool, get_pool
 from smriti.db.migrate import apply_migrations
 from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
+    AppendAssistantResponseWithProvenanceRequest,
     AppendMessageRequest,
+    AssistantMessageNotFoundError,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
     CreateScopeRequest,
     DeleteConversationRequest,
+    EpisodeRecord,
     InvalidMemoryRequestError,
     InvalidProvenanceTargetError,
     InvalidRetrievalRequestError,
@@ -1775,6 +1778,331 @@ async def test_record_used_memories_writes_immutable_score_snapshots() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_message_retrievals_returns_ordered_records_and_is_read_only() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            async with pool.acquire() as connection:
+                user_id = await connection.fetchval(
+                    "INSERT INTO users DEFAULT VALUES RETURNING id;"
+                )
+
+            scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=user_id,
+                    name="Inspection Scope",
+                    system_prompt="Keep inspection scoped.",
+                )
+            )
+            query_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=scope.id,
+                    title="Question thread",
+                )
+            )
+            source_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=scope.id,
+                    title="Source Conversation",
+                )
+            )
+            query_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope.id,
+                conversation_id=query_conversation.id,
+                role="user",
+                content="Which memories were used?",
+            )
+            rank_two_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope.id,
+                conversation_id=source_conversation.id,
+                content="The slower memory came second.",
+            )
+            rank_one_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope.id,
+                conversation_id=source_conversation.id,
+                content="The best memory came first.",
+            )
+            await _set_episode_scoring_fields(
+                pool=pool,
+                episode_id=rank_two_episode.id,
+                created_at=FIXED_RETRIEVAL_NOW - timedelta(days=2),
+                last_accessed_at=FIXED_RETRIEVAL_NOW - timedelta(hours=3),
+                importance=0.25,
+                access_count=4,
+            )
+            await _set_episode_scoring_fields(
+                pool=pool,
+                episode_id=rank_one_episode.id,
+                created_at=FIXED_RETRIEVAL_NOW - timedelta(days=1),
+                last_accessed_at=FIXED_RETRIEVAL_NOW - timedelta(hours=2),
+                importance=0.5,
+                access_count=7,
+            )
+            retrieved_at = FIXED_RETRIEVAL_NOW + timedelta(minutes=10)
+            assistant_response = await service.append_assistant_response_with_provenance(
+                AppendAssistantResponseWithProvenanceRequest(
+                    user_id=user_id,
+                    scope_id=scope.id,
+                    conversation_id=query_conversation.id,
+                    query_message_id=query_message.id,
+                    content="I found two memories.",
+                    token_count=5,
+                    used=(
+                        _scored_episode_for_retrieval(
+                            episode=rank_two_episode,
+                            user_id=user_id,
+                            result_rank=2,
+                            similarity=0.82,
+                            recency_score=0.31,
+                            access_score=0.42,
+                            frequency_score=0.53,
+                            importance_score=0.64,
+                            score=0.75,
+                        ),
+                        _scored_episode_for_retrieval(
+                            episode=rank_one_episode,
+                            user_id=user_id,
+                            result_rank=1,
+                            similarity=0.93,
+                            recency_score=0.34,
+                            access_score=0.45,
+                            frequency_score=0.56,
+                            importance_score=0.67,
+                            score=0.86,
+                        ),
+                    ),
+                    scoring_version="inspection-test-v1",
+                    retrieved_at=retrieved_at,
+                )
+            )
+
+            episode_ids = [rank_one_episode.id, rank_two_episode.id]
+            before_access_metadata = await _episode_access_metadata(pool, episode_ids)
+
+            records = await service.list_message_retrievals(
+                user_id=user_id,
+                conversation_id=query_conversation.id,
+                assistant_message_id=assistant_response.message.id,
+            )
+
+            after_access_metadata = await _episode_access_metadata(pool, episode_ids)
+
+            assert before_access_metadata == after_access_metadata
+            assert [record.rank for record in records] == [1, 2]
+
+            first_record, second_record = records
+            assert first_record.similarity == pytest.approx(0.93)
+            assert first_record.score == pytest.approx(0.86)
+            assert first_record.recency_score == pytest.approx(0.34)
+            assert first_record.access_score == pytest.approx(0.45)
+            assert first_record.frequency_score == pytest.approx(0.56)
+            assert first_record.importance_score == pytest.approx(0.67)
+            assert first_record.scoring_version == "inspection-test-v1"
+            assert first_record.retrieved_at == retrieved_at
+            assert first_record.query.message_id == query_message.id
+            assert first_record.query.content == "Which memories were used?"
+            assert first_record.episode.id == rank_one_episode.id
+            assert first_record.episode.kind == "message"
+            assert first_record.episode.content == "The best memory came first."
+            assert first_record.episode.source_conversation_id == source_conversation.id
+            assert first_record.episode.source_conversation_title == "Source Conversation"
+            assert first_record.episode.source_scope_id == scope.id
+            assert first_record.episode.source_scope_name == "Inspection Scope"
+
+            assert second_record.episode.id == rank_two_episode.id
+            assert second_record.rank == 2
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_list_message_retrievals_rejects_invalid_assistant_message_ids() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            user_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                role="user",
+                content="I am not an assistant message.",
+            )
+            system_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                role="system",
+                content="System messages cannot own retrieval provenance.",
+            )
+            owned_other_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=scope_id,
+                    title="Other owned conversation",
+                )
+            )
+            other_conversation_assistant = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=owned_other_conversation.id,
+                role="assistant",
+                content="Assistant in the wrong owned conversation.",
+            )
+
+            async with pool.acquire() as connection:
+                other_user_id = await connection.fetchval(
+                    "INSERT INTO users DEFAULT VALUES RETURNING id;"
+                )
+            other_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=other_user_id,
+                    name="Other user's scope",
+                    system_prompt="Private to another user.",
+                )
+            )
+            other_user_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=other_user_id,
+                    scope_id=other_scope.id,
+                    title="Other user's conversation",
+                )
+            )
+            other_user_assistant = await _append_message(
+                service=service,
+                user_id=other_user_id,
+                scope_id=other_scope.id,
+                conversation_id=other_user_conversation.id,
+                role="assistant",
+                content="Assistant in another user's conversation.",
+            )
+
+            invalid_assistant_message_ids = [
+                uuid4(),
+                user_message.id,
+                system_message.id,
+                other_conversation_assistant.id,
+                other_user_assistant.id,
+            ]
+            for assistant_message_id in invalid_assistant_message_ids:
+                with pytest.raises(AssistantMessageNotFoundError):
+                    await service.list_message_retrievals(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        assistant_message_id=assistant_message_id,
+                    )
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_list_message_retrievals_uses_conversation_authorization_first() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            assistant_message = await _append_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Valid assistant message.",
+            )
+
+            async with pool.acquire() as connection:
+                other_user_id = await connection.fetchval(
+                    "INSERT INTO users DEFAULT VALUES RETURNING id;"
+                )
+            other_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=other_user_id,
+                    name="Conversation authorization scope",
+                    system_prompt="Private to another user.",
+                )
+            )
+            other_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=other_user_id,
+                    scope_id=other_scope.id,
+                    title="Other user's conversation",
+                )
+            )
+
+            with pytest.raises(ConversationNotFoundError):
+                await service.list_message_retrievals(
+                    user_id=user_id,
+                    conversation_id=uuid4(),
+                    assistant_message_id=assistant_message.id,
+                )
+
+            with pytest.raises(ConversationAccessDeniedError):
+                await service.list_message_retrievals(
+                    user_id=user_id,
+                    conversation_id=other_conversation.id,
+                    assistant_message_id=assistant_message.id,
+                )
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
 async def test_record_used_memories_empty_used_is_noop_without_pool() -> None:
     service = MemoryService(pool=None, embedder=FakeEmbedder(dimensions=768))  # type: ignore[arg-type]
 
@@ -2730,6 +3058,66 @@ def _scored_episode_stub(
         frequency_score=0.0,
         score=0.75,
     )
+
+
+def _scored_episode_for_retrieval(
+    episode: EpisodeRecord,
+    user_id: UUID,
+    result_rank: int,
+    similarity: float,
+    recency_score: float,
+    access_score: float,
+    frequency_score: float,
+    importance_score: float,
+    score: float,
+) -> ScoredEpisode:
+    return ScoredEpisode(
+        result_rank=result_rank,
+        id=episode.id,
+        user_id=user_id,
+        scope_id=episode.scope_id,
+        conversation_id=episode.conversation_id,
+        kind="message",
+        message_id=episode.message_id,
+        message_position=None,
+        range_start=None,
+        range_end=None,
+        content=episode.content,
+        created_at=episode.created_at,
+        importance=0.0,
+        access_count=0,
+        last_accessed_at=None,
+        embedding_model_id=episode.embedding_model_id,
+        similarity=similarity,
+        recency_score=recency_score,
+        access_score=access_score,
+        importance_score=importance_score,
+        frequency_score=frequency_score,
+        score=score,
+    )
+
+
+async def _episode_access_metadata(
+    pool,
+    episode_ids: list[UUID],
+) -> dict[UUID, tuple[int, datetime | None]]:
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT id, access_count, last_accessed_at
+            FROM episodes
+            WHERE id = ANY($1::uuid[])
+            ORDER BY id ASC;
+            """,
+            episode_ids,
+        )
+    return {
+        row["id"]: (
+            row["access_count"],
+            row["last_accessed_at"],
+        )
+        for row in rows
+    }
 
 
 async def _set_episode_scoring_fields(

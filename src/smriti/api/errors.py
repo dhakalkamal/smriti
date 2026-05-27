@@ -16,6 +16,7 @@ from smriti.embeddings import (
     EmbeddingTimeoutError,
 )
 from smriti.memory import (
+    AssistantMessageNotFoundError,
     ConversationNotFoundError,
     EmbeddingModelNotFoundError,
     InvalidMemoryRequestError,
@@ -116,6 +117,14 @@ def register_error_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         _ = (request, exc)
         return _json_error(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+    @app.exception_handler(AssistantMessageNotFoundError)
+    async def assistant_message_not_found_handler(
+        request: Request,
+        exc: AssistantMessageNotFoundError,
+    ) -> JSONResponse:
+        _ = (request, exc)
+        return _json_error(status.HTTP_404_NOT_FOUND, "Assistant message not found")
 
     @app.exception_handler(EmbeddingConnectionError)
     async def embedding_connection_error_handler(

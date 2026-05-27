@@ -178,6 +178,38 @@ class ScoredEpisode:
 
 
 @dataclass(frozen=True)
+class RetrievalQueryMessage:
+    message_id: UUID
+    content: str
+
+
+@dataclass(frozen=True)
+class RetrievalEpisodeSource:
+    id: UUID
+    kind: EpisodeKind
+    content: str
+    source_conversation_id: UUID
+    source_conversation_title: str | None
+    source_scope_id: UUID
+    source_scope_name: str
+
+
+@dataclass(frozen=True)
+class RetrievalRecord:
+    rank: int
+    similarity: float
+    score: float
+    recency_score: float
+    access_score: float
+    frequency_score: float
+    importance_score: float
+    scoring_version: str
+    retrieved_at: datetime
+    query: RetrievalQueryMessage
+    episode: RetrievalEpisodeSource
+
+
+@dataclass(frozen=True)
 class AssistantResponseRecord:
     message: MessageRecord
     used_episode_ids: tuple[UUID, ...]

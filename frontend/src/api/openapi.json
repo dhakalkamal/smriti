@@ -357,6 +357,179 @@
         "title": "MessageResponse",
         "type": "object"
       },
+      "MessageRetrievalsResponse": {
+        "additionalProperties": false,
+        "description": "HTTP representation of recorded retrieval provenance for one assistant message.",
+        "properties": {
+          "assistant_message_id": {
+            "format": "uuid",
+            "title": "Assistant Message Id",
+            "type": "string"
+          },
+          "retrievals": {
+            "items": {
+              "$ref": "#/components/schemas/RetrievalEntry"
+            },
+            "title": "Retrievals",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "assistant_message_id",
+          "total",
+          "retrievals"
+        ],
+        "title": "MessageRetrievalsResponse",
+        "type": "object"
+      },
+      "RetrievalEntry": {
+        "additionalProperties": false,
+        "description": "HTTP representation of one recorded retrieval provenance row.",
+        "properties": {
+          "access_score": {
+            "title": "Access Score",
+            "type": "number"
+          },
+          "episode": {
+            "$ref": "#/components/schemas/RetrievalEpisode"
+          },
+          "frequency_score": {
+            "title": "Frequency Score",
+            "type": "number"
+          },
+          "importance_score": {
+            "title": "Importance Score",
+            "type": "number"
+          },
+          "query": {
+            "$ref": "#/components/schemas/RetrievalQuery"
+          },
+          "rank": {
+            "title": "Rank",
+            "type": "integer"
+          },
+          "recency_score": {
+            "title": "Recency Score",
+            "type": "number"
+          },
+          "retrieved_at": {
+            "format": "date-time",
+            "title": "Retrieved At",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "scoring_version": {
+            "title": "Scoring Version",
+            "type": "string"
+          },
+          "similarity": {
+            "title": "Similarity",
+            "type": "number"
+          }
+        },
+        "required": [
+          "rank",
+          "similarity",
+          "score",
+          "recency_score",
+          "access_score",
+          "frequency_score",
+          "importance_score",
+          "scoring_version",
+          "retrieved_at",
+          "query",
+          "episode"
+        ],
+        "title": "RetrievalEntry",
+        "type": "object"
+      },
+      "RetrievalEpisode": {
+        "additionalProperties": false,
+        "description": "HTTP representation of the episode source used by a retrieval result.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "message",
+              "summary"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "source_conversation_id": {
+            "format": "uuid",
+            "title": "Source Conversation Id",
+            "type": "string"
+          },
+          "source_conversation_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Conversation Title"
+          },
+          "source_scope_id": {
+            "format": "uuid",
+            "title": "Source Scope Id",
+            "type": "string"
+          },
+          "source_scope_name": {
+            "title": "Source Scope Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "content",
+          "source_conversation_id",
+          "source_conversation_title",
+          "source_scope_id",
+          "source_scope_name"
+        ],
+        "title": "RetrievalEpisode",
+        "type": "object"
+      },
+      "RetrievalQuery": {
+        "additionalProperties": false,
+        "description": "HTTP representation of the query message that produced retrieval provenance.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id",
+          "content"
+        ],
+        "title": "RetrievalQuery",
+        "type": "object"
+      },
       "RetrievalSearchBody": {
         "additionalProperties": false,
         "description": "Request body for scoped retrieval search.",
@@ -931,6 +1104,60 @@
           }
         },
         "summary": "Create Message",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
+    "/conversations/{conversation_id}/messages/{message_id}/retrievals": {
+      "get": {
+        "description": "List recorded retrieval provenance for a local user's assistant message.",
+        "operationId": "list_message_retrievals_conversations__conversation_id__messages__message_id__retrievals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageRetrievalsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Message Retrievals",
         "tags": [
           "messages"
         ]

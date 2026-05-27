@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     local_user_id: UUID = Field(default=UUID("00000000-0000-4000-8000-000000000001"))
     ollama_base_url: str = Field(default="http://127.0.0.1:11434", min_length=1)
     ollama_chat_model: str = Field(default="qwen2.5:7b", min_length=1)
+    ollama_chat_num_ctx: int = 8192
+    ollama_embed_num_ctx: int = 8192
     ollama_chat_timeout_seconds: float = Field(default=60.0, gt=0)
 
     model_config = SettingsConfigDict(

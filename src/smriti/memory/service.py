@@ -10,6 +10,7 @@ import asyncpg
 
 from smriti.embeddings import Embedder, EmbeddingVector
 from smriti.memory.errors import (
+    AssistantMessageNotFoundError,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
     EmbeddingModelNotFoundError,
@@ -40,6 +41,9 @@ from smriti.memory.models import (
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
+    RetrievalEpisodeSource,
+    RetrievalQueryMessage,
+    RetrievalRecord,
     ScopeRecord,
     ScoredEpisode,
 )
@@ -188,6 +192,77 @@ class MemoryService:
             )
 
         return [_message_from_row(row) for row in rows]
+
+    async def list_message_retrievals(
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        assistant_message_id: UUID,
+    ) -> list[RetrievalRecord]:
+        """List immutable retrieval provenance for a persisted assistant message."""
+
+        async with self.pool.acquire() as connection:
+            await self._conversation_scope_for_user(
+                connection=connection,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+            message_role = cast(
+                str | None,
+                await connection.fetchval(
+                    """
+                    SELECT role
+                    FROM messages
+                    WHERE conversation_id = $1
+                      AND id = $2;
+                    """,
+                    conversation_id,
+                    assistant_message_id,
+                ),
+            )
+            if message_role != "assistant":
+                raise AssistantMessageNotFoundError(
+                    "Assistant message does not exist in the expected conversation"
+                )
+
+            rows = await connection.fetch(
+                """
+                SELECT
+                    mr.result_rank,
+                    mr.similarity,
+                    mr.score,
+                    mr.recency_score,
+                    mr.access_score,
+                    mr.frequency_score,
+                    mr.importance_score,
+                    mr.scoring_version,
+                    mr.retrieved_at,
+                    qm.id AS query_message_id,
+                    qm.content AS query_content,
+                    e.id AS episode_id,
+                    e.kind AS episode_kind,
+                    e.content AS episode_content,
+                    sc.id AS source_conversation_id,
+                    sc.title AS source_conversation_title,
+                    s.id AS source_scope_id,
+                    s.name AS source_scope_name
+                FROM message_retrievals mr
+                INNER JOIN episodes e
+                    ON e.id = mr.episode_id
+                   AND e.scope_id = mr.scope_id
+                INNER JOIN conversations sc
+                    ON sc.id = e.conversation_id
+                INNER JOIN scopes s
+                    ON s.id = sc.scope_id
+                INNER JOIN messages qm
+                    ON qm.id = mr.query_message_id
+                WHERE mr.assistant_message_id = $1
+                ORDER BY mr.result_rank ASC;
+                """,
+                assistant_message_id,
+            )
+
+        return [_retrieval_record_from_row(row) for row in rows]
 
     async def load_assistant_generation_context(
         self,
@@ -1169,6 +1244,33 @@ def _message_from_row(row: asyncpg.Record) -> MessageRecord:
         content=cast(str, row["content"]),
         token_count=cast(int, row["token_count"]),
         created_at=cast(datetime, row["created_at"]),
+    )
+
+
+def _retrieval_record_from_row(row: asyncpg.Record) -> RetrievalRecord:
+    return RetrievalRecord(
+        rank=cast(int, row["result_rank"]),
+        similarity=cast(float, row["similarity"]),
+        score=cast(float, row["score"]),
+        recency_score=cast(float, row["recency_score"]),
+        access_score=cast(float, row["access_score"]),
+        frequency_score=cast(float, row["frequency_score"]),
+        importance_score=cast(float, row["importance_score"]),
+        scoring_version=cast(str, row["scoring_version"]),
+        retrieved_at=cast(datetime, row["retrieved_at"]),
+        query=RetrievalQueryMessage(
+            message_id=cast(UUID, row["query_message_id"]),
+            content=cast(str, row["query_content"]),
+        ),
+        episode=RetrievalEpisodeSource(
+            id=cast(UUID, row["episode_id"]),
+            kind=cast(EpisodeKind, row["episode_kind"]),
+            content=cast(str, row["episode_content"]),
+            source_conversation_id=cast(UUID, row["source_conversation_id"]),
+            source_conversation_title=cast(str | None, row["source_conversation_title"]),
+            source_scope_id=cast(UUID, row["source_scope_id"]),
+            source_scope_name=cast(str, row["source_scope_name"]),
+        ),
     )
 
 

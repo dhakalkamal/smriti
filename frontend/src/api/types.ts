@@ -112,6 +112,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/conversations/{conversation_id}/messages/{message_id}/retrievals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Message Retrievals
+         * @description List recorded retrieval provenance for a local user's assistant message.
+         */
+        get: operations["list_message_retrievals_conversations__conversation_id__messages__message_id__retrievals_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -382,6 +402,95 @@ export interface components {
             role: "system" | "user" | "assistant";
             /** Token Count */
             token_count: number;
+        };
+        /**
+         * MessageRetrievalsResponse
+         * @description HTTP representation of recorded retrieval provenance for one assistant message.
+         */
+        MessageRetrievalsResponse: {
+            /**
+             * Assistant Message Id
+             * Format: uuid
+             */
+            assistant_message_id: string;
+            /** Retrievals */
+            retrievals: components["schemas"]["RetrievalEntry"][];
+            /** Total */
+            total: number;
+        };
+        /**
+         * RetrievalEntry
+         * @description HTTP representation of one recorded retrieval provenance row.
+         */
+        RetrievalEntry: {
+            /** Access Score */
+            access_score: number;
+            episode: components["schemas"]["RetrievalEpisode"];
+            /** Frequency Score */
+            frequency_score: number;
+            /** Importance Score */
+            importance_score: number;
+            query: components["schemas"]["RetrievalQuery"];
+            /** Rank */
+            rank: number;
+            /** Recency Score */
+            recency_score: number;
+            /**
+             * Retrieved At
+             * Format: date-time
+             */
+            retrieved_at: string;
+            /** Score */
+            score: number;
+            /** Scoring Version */
+            scoring_version: string;
+            /** Similarity */
+            similarity: number;
+        };
+        /**
+         * RetrievalEpisode
+         * @description HTTP representation of the episode source used by a retrieval result.
+         */
+        RetrievalEpisode: {
+            /** Content */
+            content: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "message" | "summary";
+            /**
+             * Source Conversation Id
+             * Format: uuid
+             */
+            source_conversation_id: string;
+            /** Source Conversation Title */
+            source_conversation_title: string | null;
+            /**
+             * Source Scope Id
+             * Format: uuid
+             */
+            source_scope_id: string;
+            /** Source Scope Name */
+            source_scope_name: string;
+        };
+        /**
+         * RetrievalQuery
+         * @description HTTP representation of the query message that produced retrieval provenance.
+         */
+        RetrievalQuery: {
+            /** Content */
+            content: string;
+            /**
+             * Message Id
+             * Format: uuid
+             */
+            message_id: string;
         };
         /**
          * RetrievalSearchBody
@@ -713,6 +822,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CreatedMessageResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_message_retrievals_conversations__conversation_id__messages__message_id__retrievals_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+                message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageRetrievalsResponse"];
                 };
             };
             /** @description Validation Error */

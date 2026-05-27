@@ -1,6 +1,7 @@
-import { render, screen, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
+import { renderWithQueryClient } from "../../../test/renderWithQueryClient";
 import type { MessageResponse } from "../api/useMessages";
 import { MessageList } from "./MessageList";
 
@@ -27,7 +28,7 @@ const unsortedMessages = [
 
 describe("MessageList", () => {
   it("renders messages sorted by position", () => {
-    render(
+    renderWithQueryClient(
       <MessageList
         isError={false}
         isLoading={false}
@@ -38,14 +39,13 @@ describe("MessageList", () => {
     const list = screen.getByLabelText("Messages");
     const renderedMessages = within(list).getAllByRole("article");
 
-    expect(renderedMessages.map((message) => message.textContent)).toEqual([
-      "YouFirst persisted message.",
-      "AssistantSecond persisted message.",
-    ]);
+    expect(
+      renderedMessages.map((message) => within(message).getByText(/persisted message/).textContent),
+    ).toEqual(["First persisted message.", "Second persisted message."]);
   });
 
   it("renders the empty message state", () => {
-    render(
+    renderWithQueryClient(
       <MessageList
         isError={false}
         isLoading={false}

@@ -25,6 +25,7 @@ from smriti.config import Settings
 from smriti.db.migrate import apply_migrations
 from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
+    AssistantMessageNotFoundError,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
     InvalidProvenanceTargetError,
@@ -40,6 +41,7 @@ EXPECTED_STAGE_7_6_ROUTES = {
     ("POST", "/conversations"),
     ("DELETE", "/conversations/{conversation_id}"),
     ("GET", "/conversations/{conversation_id}/messages"),
+    ("GET", "/conversations/{conversation_id}/messages/{message_id}/retrievals"),
     ("POST", "/conversations/{conversation_id}/messages"),
     ("POST", "/retrieval/search"),
     ("POST", "/conversations/{conversation_id}/assistant-response"),
@@ -129,6 +131,10 @@ def test_error_handlers_map_access_denied_missing_and_invalid_provenance() -> No
     async def conversation_not_found_probe() -> None:
         raise ConversationNotFoundError("Conversation does not exist")
 
+    @app.get("/_test/assistant-message-not-found")
+    async def assistant_message_not_found_probe() -> None:
+        raise AssistantMessageNotFoundError("Assistant message does not exist")
+
     @app.get("/_test/invalid-provenance-target")
     async def invalid_provenance_target_probe() -> None:
         raise InvalidProvenanceTargetError("Retrieval provenance requires a user query message")
@@ -137,10 +143,13 @@ def test_error_handlers_map_access_denied_missing_and_invalid_provenance() -> No
 
     access_denied_response = client.get("/_test/conversation-access-denied")
     not_found_response = client.get("/_test/conversation-not-found")
+    assistant_not_found_response = client.get("/_test/assistant-message-not-found")
     invalid_provenance_response = client.get("/_test/invalid-provenance-target")
 
     assert access_denied_response.status_code == 403
     assert not_found_response.status_code == 404
+    assert assistant_not_found_response.status_code == 404
+    assert assistant_not_found_response.json() == {"detail": "Assistant message not found"}
     assert invalid_provenance_response.status_code == 400
 
 

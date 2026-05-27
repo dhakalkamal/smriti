@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from smriti.memory.errors import (
+    AssistantMessageNotFoundError,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
     EmbeddingModelNotFoundError,
@@ -39,6 +40,9 @@ from smriti.memory.models import (
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
+    RetrievalEpisodeSource,
+    RetrievalQueryMessage,
+    RetrievalRecord,
     ScopeRecord,
     ScoredEpisode,
 )
@@ -49,6 +53,7 @@ __all__ = [
     "AppendMessageRequest",
     "AppendMessageWithEpisodeRequest",
     "AssistantGenerationContextRecord",
+    "AssistantMessageNotFoundError",
     "AssistantResponseRecord",
     "ConversationAccessDeniedError",
     "ConversationNotFoundError",
@@ -73,9 +78,12 @@ __all__ = [
     "MessageEpisodeRecord",
     "MessageRecord",
     "MessageRole",
+    "RetrievalEpisodeSource",
     "RetrievalEvalCase",
     "RetrievalEvalResult",
     "RetrievalEvalSummary",
+    "RetrievalQueryMessage",
+    "RetrievalRecord",
     "ScoredEpisode",
     "ScopeAccessDeniedError",
     "ScopeNotFoundError",

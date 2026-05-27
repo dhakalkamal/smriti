@@ -8,9 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from smriti.memory import (
     ConversationRecord,
+    EpisodeKind,
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
+    RetrievalEpisodeSource,
+    RetrievalQueryMessage,
+    RetrievalRecord,
     ScopeRecord,
     ScoredEpisode,
 )
@@ -207,6 +211,89 @@ class AssistantStreamErrorData(BaseModel):
 
     code: str
     message: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RetrievalQuery(BaseModel):
+    """HTTP representation of the query message that produced retrieval provenance."""
+
+    message_id: UUID
+    content: str
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def from_record(cls, record: RetrievalQueryMessage) -> RetrievalQuery:
+        return cls(message_id=record.message_id, content=record.content)
+
+
+class RetrievalEpisode(BaseModel):
+    """HTTP representation of the episode source used by a retrieval result."""
+
+    id: UUID
+    kind: EpisodeKind
+    content: str
+    source_conversation_id: UUID
+    source_conversation_title: str | None
+    source_scope_id: UUID
+    source_scope_name: str
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def from_record(cls, record: RetrievalEpisodeSource) -> RetrievalEpisode:
+        return cls(
+            id=record.id,
+            kind=record.kind,
+            content=record.content,
+            source_conversation_id=record.source_conversation_id,
+            source_conversation_title=record.source_conversation_title,
+            source_scope_id=record.source_scope_id,
+            source_scope_name=record.source_scope_name,
+        )
+
+
+class RetrievalEntry(BaseModel):
+    """HTTP representation of one recorded retrieval provenance row."""
+
+    rank: int
+    similarity: float
+    score: float
+    recency_score: float
+    access_score: float
+    frequency_score: float
+    importance_score: float
+    scoring_version: str
+    retrieved_at: datetime
+    query: RetrievalQuery
+    episode: RetrievalEpisode
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def from_record(cls, record: RetrievalRecord) -> RetrievalEntry:
+        return cls(
+            rank=record.rank,
+            similarity=record.similarity,
+            score=record.score,
+            recency_score=record.recency_score,
+            access_score=record.access_score,
+            frequency_score=record.frequency_score,
+            importance_score=record.importance_score,
+            scoring_version=record.scoring_version,
+            retrieved_at=record.retrieved_at,
+            query=RetrievalQuery.from_record(record.query),
+            episode=RetrievalEpisode.from_record(record.episode),
+        )
+
+
+class MessageRetrievalsResponse(BaseModel):
+    """HTTP representation of recorded retrieval provenance for one assistant message."""
+
+    assistant_message_id: UUID
+    total: int
+    retrievals: list[RetrievalEntry]
 
     model_config = ConfigDict(extra="forbid")
 

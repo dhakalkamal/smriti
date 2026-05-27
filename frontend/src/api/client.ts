@@ -8,7 +8,8 @@ type ConversationApiPath =
   | `/conversations/${string}`
   | `/conversations/${string}/assistant-response`
   | `/conversations/${string}/assistant-response/stream`
-  | `/conversations/${string}/messages`;
+  | `/conversations/${string}/messages`
+  | `/conversations/${string}/messages/${string}/retrievals`;
 type LocalApiPath = ApiPath | ConversationApiPath;
 
 interface ApiRequestOptions extends Omit<RequestInit, "body"> {

@@ -6,7 +6,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from smriti.api.dependencies import get_current_local_user_id, get_memory_service
-from smriti.api.schemas import CreatedMessageResponse, CreateMessageBody, MessageResponse
+from smriti.api.schemas import (
+    CreatedMessageResponse,
+    CreateMessageBody,
+    MessageResponse,
+    MessageRetrievalsResponse,
+    RetrievalEntry,
+)
 from smriti.memory import (
     AppendMessageWithEpisodeRequest,
     ListMessagesRequest,
@@ -31,6 +37,30 @@ async def list_messages(
         ListMessagesRequest(user_id=local_user_id, conversation_id=conversation_id)
     )
     return [MessageResponse.from_record(message) for message in messages]
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/{message_id}/retrievals",
+    response_model=MessageRetrievalsResponse,
+)
+async def list_message_retrievals(
+    conversation_id: UUID,
+    message_id: UUID,
+    memory_service: Annotated[MemoryService, Depends(get_memory_service)],
+    local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
+) -> MessageRetrievalsResponse:
+    """List recorded retrieval provenance for a local user's assistant message."""
+
+    records = await memory_service.list_message_retrievals(
+        user_id=local_user_id,
+        conversation_id=conversation_id,
+        assistant_message_id=message_id,
+    )
+    return MessageRetrievalsResponse(
+        assistant_message_id=message_id,
+        total=len(records),
+        retrievals=[RetrievalEntry.from_record(record) for record in records],
+    )
 
 
 @router.post(
