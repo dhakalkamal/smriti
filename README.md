@@ -26,6 +26,10 @@ Implemented:
 - Offline OpenAPI export and generated frontend API types
 - Deterministic fake embedders and chat generators for tests
 - Minimal retrieval eval helper
+- Provenance visualization in the UI
+- Read-only retrieval inspection panel 
+- Explicit Ollama context window configuration 
+
 
 Not implemented:
 
@@ -34,7 +38,6 @@ Not implemented:
 - Conversation rename
 - Message-level deletion
 - Memory episode management UI
-- Provenance visualization in the UI
 - Cross-scope retrieval
 - Hybrid search, rerankers, or query rewriting
 - Authentication or multi-user accounts
@@ -169,10 +172,13 @@ uv run migrate up
 ```
 
 Install Ollama models:
+## choose either of 7b model or 14b models
+## currently config has default qwen2.5:7b  but can be .env file overwrites it
 
 ```bash
 ollama pull nomic-embed-text
-ollama pull qwen2.5:7b
+ollama pull qwen2.5:7b 
+ollama pull qwen3:14b
 ```
 
 Run the backend:
