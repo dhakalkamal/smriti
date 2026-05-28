@@ -283,11 +283,13 @@ Completed:
 - Stage 9a: non-streaming chat UI
 - Stage 9b: SSE streaming chat UI
 - Stage 10a: conversation deletion and cleanup UI
+- Stage 10b: read-only retrieval inspection panel
+- Stage 10c: explicit Ollama context window configuration
 
 Next planned areas:
 
+- Stage 11: window summary episodes (in progress)
 - Scope management UI beyond create and list
-- Rolling summarization
 - Expanded retrieval eval harness
 - Optional MCP server after the core local UI product is complete
 
