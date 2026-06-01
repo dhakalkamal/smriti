@@ -46,7 +46,7 @@ describe("CreateScopeForm", () => {
 
     const firstCall = fetchMock.mock.calls[0];
 
-    expect(firstCall[0]).toEqual(new URL("http://127.0.0.1:8000/scopes"));
+    expect(firstCall[0]).toEqual(new URL("http://127.0.0.1:8100/scopes"));
     expect(firstCall[1]?.method).toBe("POST");
     expect(readJsonRequestBody(firstCall[1])).toEqual({
       name: "Research Notes",

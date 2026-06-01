@@ -734,7 +734,7 @@ If it does, that's a flag — investigate before proceeding.
 
 ## 14. Manual Verification
 
-With the backend running on `127.0.0.1:8000`, Postgres up, Ollama
+With the backend running on `127.0.0.1:8100`, Postgres up, Ollama
 available, and the frontend running on `127.0.0.1:5173`:
 
 1. Open `http://127.0.0.1:5173` in a browser.
@@ -777,7 +777,7 @@ available, and the frontend running on `127.0.0.1:5173`:
      failure) are gone before the retry stream begins
 8. Browser console throughout: no logged message content, memory ids,
    `chat_model`, `finish_reason`, or backend error code/message.
-9. Network tab throughout: only `127.0.0.1:8000` is contacted.
+9. Network tab throughout: only `127.0.0.1:8100` is contacted.
 10. Reload mid-stream: UI state resets; the persisted user message
     remains intact in the database (verifiable by reselecting the
     conversation after reload). Per §4.2 "Persistence semantics across

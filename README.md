@@ -57,7 +57,7 @@ assets, Google Fonts, or remote model providers. Runtime defaults bind services
 to localhost:
 
 - Postgres: `127.0.0.1:5432`
-- FastAPI: `127.0.0.1:8000`
+- FastAPI: `127.0.0.1:8100`
 - Vite: `127.0.0.1:5173`
 - Ollama: `127.0.0.1:11434`
 
@@ -73,7 +73,7 @@ to localhost:
 |      | HTTP and fetch-based SSE                                            |
 |      v                                                                     |
 |  FastAPI local API                                                         |
-|  127.0.0.1:8000                                                            |
+|  127.0.0.1:8100                                                            |
 |      |                                                                     |
 |      | calls service layer only                                            |
 |      v                                                                     |
@@ -164,6 +164,21 @@ Create a local environment file if you want to override defaults:
 cp .env.example .env
 ```
 
+For day-to-day local development, use the root Makefile:
+
+```bash
+make start
+make status
+make logs
+make restart
+make stop
+```
+
+`make start` repairs the known macOS editable-install hidden flag issue when
+needed, starts Postgres, applies migrations, verifies the required local Ollama
+models, starts the backend and frontend, waits for readiness, and opens the UI.
+It does not install dependencies or pull Ollama models automatically.
+
 Start Postgres and apply migrations:
 
 ```bash
@@ -184,7 +199,7 @@ ollama pull qwen3:14b
 Run the backend:
 
 ```bash
-uv run uvicorn smriti.api:create_app --factory --host 127.0.0.1 --port 8000
+uv run python -m uvicorn smriti.api:create_app --factory --host 127.0.0.1 --port 8100
 ```
 
 Install and run the frontend:

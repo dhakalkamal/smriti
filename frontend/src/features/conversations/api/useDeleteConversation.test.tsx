@@ -58,7 +58,7 @@ describe("useDeleteConversation", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      new URL("http://127.0.0.1:8000/conversations/conversation-1"),
+      new URL("http://127.0.0.1:8100/conversations/conversation-1"),
       {
         method: "DELETE",
         headers: new Headers(),

@@ -29,7 +29,7 @@ Stage 8 includes:
 - configure pnpm scripts for frontend validation
 - configure TypeScript with `"strict": true` and no relaxations
 - configure Vite to bind `127.0.0.1:5173`
-- default `VITE_API_BASE_URL` to `http://127.0.0.1:8000`
+- default `VITE_API_BASE_URL` to `http://127.0.0.1:8100`
 - configure Tailwind v3 base files and design-token conventions
 - configure ESLint, Prettier, Vitest, and React Testing Library
 - configure TanStack Query at the app boundary
@@ -142,7 +142,7 @@ for stale generated types.
 
 Fallback rule: if a future implementation discovers that `create_app().openapi()` begins requiring
 Postgres, Ollama, or any live service, Stage 8 must stop and either fall back to online generation
-from `http://127.0.0.1:8000/openapi.json` or defer offline generation until a backend contract
+from `http://127.0.0.1:8100/openapi.json` or defer offline generation until a backend contract
 adjusts startup/import boundaries. Stage 8 must not silently change backend startup behavior to make
 offline export work.
 
@@ -218,7 +218,7 @@ acceptable only when required by tooling or documented repo layout.
 Backend remains the local FastAPI service on:
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8100
 ```
 
 Frontend dev server runs on:
@@ -228,7 +228,7 @@ http://127.0.0.1:5173
 ```
 
 Vite must bind `127.0.0.1`, never `0.0.0.0`. The default frontend API base URL is
-`http://127.0.0.1:8000`. Any `VITE_API_BASE_URL` override must still be localhost.
+`http://127.0.0.1:8100`. Any `VITE_API_BASE_URL` override must still be localhost.
 
 The expected Stage 8 workflow is:
 

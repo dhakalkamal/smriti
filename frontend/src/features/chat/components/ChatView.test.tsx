@@ -134,7 +134,7 @@ describe("ChatView", () => {
 
     const postCalls = fetchMock.mock.calls.filter((call) => call[1]?.method === "POST");
     expect(postCalls[0]?.[0]).toEqual(
-      new URL("http://127.0.0.1:8000/conversations/conversation-1/messages"),
+      new URL("http://127.0.0.1:8100/conversations/conversation-1/messages"),
     );
     expect(readJsonRequestBody(postCalls[0]?.[1])).toEqual({
       role: "user",
@@ -143,7 +143,7 @@ describe("ChatView", () => {
     });
     expect(postCalls[1]?.[0]).toEqual(
       new URL(
-        "http://127.0.0.1:8000/conversations/conversation-1/assistant-response/stream",
+        "http://127.0.0.1:8100/conversations/conversation-1/assistant-response/stream",
       ),
     );
     expect(readJsonRequestBody(postCalls[1]?.[1])).toEqual({

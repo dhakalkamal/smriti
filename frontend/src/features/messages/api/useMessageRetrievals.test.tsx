@@ -44,7 +44,7 @@ describe("useMessageRetrievals", () => {
     expect(screen.getByTestId("total")).toHaveTextContent("1");
     expect(fetchMock).toHaveBeenCalledWith(
       new URL(
-        "http://127.0.0.1:8000/conversations/conversation%2F1/messages/message%201/retrievals",
+        "http://127.0.0.1:8100/conversations/conversation%2F1/messages/message%201/retrievals",
       ),
       {
         headers: new Headers(),

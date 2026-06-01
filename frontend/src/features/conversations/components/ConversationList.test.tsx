@@ -98,7 +98,7 @@ describe("ConversationList", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        new URL("http://127.0.0.1:8000/conversations/conversation-c"),
+        new URL("http://127.0.0.1:8100/conversations/conversation-c"),
         {
           method: "DELETE",
           headers: new Headers(),

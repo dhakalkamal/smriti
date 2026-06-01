@@ -1,6 +1,6 @@
 import type { paths } from "./types";
 
-const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_API_BASE_URL = "http://127.0.0.1:8100";
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 type ApiPath = keyof paths;

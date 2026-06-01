@@ -238,7 +238,7 @@ git diff --check
 
 ## 14. Manual Verification
 
-With the backend running on `127.0.0.1:8000`, Postgres up, Ollama available, and the frontend running on `127.0.0.1:5173`:
+With the backend running on `127.0.0.1:8100`, Postgres up, Ollama available, and the frontend running on `127.0.0.1:5173`:
 
 1. Open `http://127.0.0.1:5173` in a browser.
 2. If no scopes exist, create one via the UI (name + optional system prompt).
@@ -246,7 +246,7 @@ With the backend running on `127.0.0.1:8000`, Postgres up, Ollama available, and
 4. Send a message via the composer.
 5. Observe: composer disables, loading indicator appears, then both the user message and the assistant response appear in the message list.
 6. Browser console: no errors, no logged message/memory data.
-7. Network tab: only `127.0.0.1:8000` is contacted. No external hosts.
+7. Network tab: only `127.0.0.1:8100` is contacted. No external hosts.
 8. Reload: UI state resets (selected scope/conversation cleared). Persisted data (scopes, conversations, messages) remains intact server-side.
 
 ## 15. Exit Criteria

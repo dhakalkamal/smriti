@@ -10,11 +10,11 @@ afterEach(() => {
 
 describe("getApiBaseUrl", () => {
   it("defaults to the local FastAPI service", () => {
-    expect(getApiBaseUrl("")).toBe("http://127.0.0.1:8000");
+    expect(getApiBaseUrl("")).toBe("http://127.0.0.1:8100");
   });
 
   it("accepts localhost HTTP API URLs", () => {
-    expect(getApiBaseUrl("http://localhost:8000")).toBe("http://localhost:8000");
+    expect(getApiBaseUrl("http://localhost:8100")).toBe("http://localhost:8100");
   });
 
   it("rejects external API URLs", () => {
@@ -22,7 +22,7 @@ describe("getApiBaseUrl", () => {
   });
 
   it("rejects URL credentials", () => {
-    expect(() => getApiBaseUrl("http://user:pass@127.0.0.1:8000")).toThrow(/credentials/);
+    expect(() => getApiBaseUrl("http://user:pass@127.0.0.1:8100")).toThrow(/credentials/);
   });
 });
 
@@ -40,7 +40,7 @@ describe("apiFetch", () => {
       status: "ok",
       mode: "local",
     });
-    expect(fetchMock).toHaveBeenCalledWith(new URL("http://127.0.0.1:8000/health"), {
+    expect(fetchMock).toHaveBeenCalledWith(new URL("http://127.0.0.1:8100/health"), {
       headers: new Headers(),
       body: undefined,
     });
@@ -79,7 +79,7 @@ describe("postStream", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toEqual(
       new URL(
-        "http://127.0.0.1:8000/conversations/conversation-1/assistant-response/stream",
+        "http://127.0.0.1:8100/conversations/conversation-1/assistant-response/stream",
       ),
     );
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");

@@ -198,7 +198,7 @@ If you think another choice is better, explain it in the PR description. Do not 
 6. **Localhost only by default.**
 
    - Postgres: `127.0.0.1:5432`
-   - FastAPI: `127.0.0.1:8000`
+   - FastAPI: `127.0.0.1:8100`
    - Vite: `127.0.0.1:5173`
 
    Never expose services to `0.0.0.0` unless explicitly requested.

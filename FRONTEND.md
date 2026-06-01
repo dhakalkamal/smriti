@@ -180,7 +180,7 @@ type RequestState<T> =
 - Never hand-edit `src/api/types.ts`
 - `src/api/client.ts` is a thin fetch wrapper
 - Default API base URL:
-  `http://127.0.0.1:8000`
+  `http://127.0.0.1:8100`
 - No retries or caching inside the fetch wrapper
 - TanStack Query owns caching behavior
 - SSE uses:
@@ -203,7 +203,7 @@ type RequestState<T> =
 - Vite binds `127.0.0.1:5173`
 - Never bind `0.0.0.0`
 - `VITE_API_BASE_URL` defaults to
-  `http://127.0.0.1:8000`
+  `http://127.0.0.1:8100`
 - Frontend env vars must start with `VITE_`
 - No frontend env var may contain secrets
 

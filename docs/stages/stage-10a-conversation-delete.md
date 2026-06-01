@@ -692,7 +692,7 @@ With backend, Postgres, Ollama, and frontend running locally:
 8. reload the page
 9. confirm deleted conversations do not reappear
 10. verify browser console contains no logged message content
-11. verify network tab contacts only `127.0.0.1:8000`
+11. verify network tab contacts only `127.0.0.1:8100`
 12. create a new conversation; begin a Stage 9b stream in it
 13. confirm the active-conversation delete affordance is disabled during
     streaming
