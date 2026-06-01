@@ -1,4 +1,7 @@
-.PHONY: start stop restart logs status
+.PHONY: setup start stop restart logs status
+
+setup:
+	./scripts/setup.sh
 
 start:
 	./scripts/dev.sh start

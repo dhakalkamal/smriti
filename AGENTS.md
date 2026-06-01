@@ -39,12 +39,25 @@ Do not:
 - replace Hatchling editable installs
 - switch away from uv without explicit instruction
 
-Bootstrap:
+Bootstrap a fresh clone:
 
 ```bash
-uv sync --python 3.13 --extra dev
-chflags -R nouchg,nohidden .venv
+make setup
 ```
+
+Start the local runtime:
+
+```bash
+make start
+```
+
+`make setup` installs locked backend and frontend dependencies, creates `.env`
+only when it is missing, and repairs the known macOS editable-install hidden
+flag issue when needed. It does not start services or run migrations.
+
+`make start` starts Postgres, applies migrations, verifies local Ollama, and
+starts the backend and frontend. Ollama must be started manually outside
+Smriti.
 
 Verification:
 

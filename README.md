@@ -135,65 +135,90 @@ episodes are part of a later stage.
 
 ## Setup
 
-Requirements:
+### Prerequisites
 
-- Python 3.13.x
+- macOS or Linux
+- make and Bash
 - uv
-- Docker with Docker Compose
-- Ollama
-- Node.js with pnpm
+- Python 3.13.x
+- Docker with Compose v2
+- Node.js
+- pnpm 11.1.2
+- Ollama, installed and started manually outside Smriti
+- curl
 
-Install backend dependencies:
-
-```bash
-uv sync --python 3.13 --extra dev
-```
-
-On macOS, if editable imports fail with `ModuleNotFoundError: No module named
-'smriti'`, clear hidden flags on the virtual environment before changing
-packaging:
+Postgres runs through Docker Compose, so no local Postgres installation or
+`psql` client is required. Ollama must be running at `127.0.0.1:11434` before
+starting Smriti. Required Ollama models are:
 
 ```bash
-chflags -R nouchg,nohidden .venv
-uv run python -c "import smriti; print(smriti.__file__)"
+ollama pull nomic-embed-text
+ollama pull qwen2.5:7b
 ```
 
-Create a local environment file if you want to override defaults:
+`qwen2.5:7b` is the default chat model. If `SMRITI_OLLAMA_CHAT_MODEL` is
+overridden in `.env`, install that model instead.
+
+### First-Time Setup
+
+From a fresh clone, run:
 
 ```bash
-cp .env.example .env
+make setup
 ```
 
-For day-to-day local development, use the root Makefile:
+`make setup` installs locked backend and frontend dependencies, creates `.env`
+from `.env.example` only when it is missing, repairs the known macOS editable
+install hidden-flag issue when needed, verifies the editable Python import, and
+checks Ollama reachability and required models. It does not start services, run
+migrations, overwrite `.env`, or pull Ollama models automatically.
+
+### Daily Development
+
+Start Smriti:
 
 ```bash
 make start
-make status
-make logs
-make restart
-make stop
 ```
 
-`make start` repairs the known macOS editable-install hidden flag issue when
-needed, starts Postgres, applies migrations, verifies the required local Ollama
-models, starts the backend and frontend, waits for readiness, and opens the UI.
-It does not install dependencies or pull Ollama models automatically.
+`make start` starts Postgres through Docker Compose, applies migrations,
+verifies Ollama and the required models, starts the backend and frontend, waits
+for readiness, and opens the UI. Start Ollama manually outside Smriti before
+running it.
+
+Useful local development commands:
+
+```bash
+make status
+make logs
+make stop
+make restart
+```
+
+The UI runs at:
+
+```text
+http://127.0.0.1:5173
+```
+
+### Optional Manual Troubleshooting
+
+The Make targets are the canonical workflow. The equivalent lower-level
+commands are available when diagnosing a local setup problem.
+
+Install backend dependencies and repair macOS editable-install flags:
+
+```bash
+uv sync --python 3.13 --extra dev --locked
+./scripts/fix-venv.sh
+uv run python -c "import smriti; print(smriti.__file__)"
+```
 
 Start Postgres and apply migrations:
 
 ```bash
-docker compose up -d
+docker compose up -d --wait postgres
 uv run migrate up
-```
-
-Install Ollama models:
-## choose either of 7b model or 14b models
-## currently config has default qwen2.5:7b  but can be .env file overwrites it
-
-```bash
-ollama pull nomic-embed-text
-ollama pull qwen2.5:7b 
-ollama pull qwen3:14b
 ```
 
 Run the backend:
@@ -206,15 +231,12 @@ Install and run the frontend:
 
 ```bash
 cd frontend
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Open:
-
-```text
-http://127.0.0.1:5173
-```
+On macOS, if editable imports fail with `ModuleNotFoundError: No module named
+'smriti'`, run `./scripts/fix-venv.sh` before changing packaging.
 
 ## Frontend API Types
 
