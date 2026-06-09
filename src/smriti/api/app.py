@@ -88,6 +88,8 @@ def create_app(
         try:
             yield
         finally:
+            summary_episode_memory_scheduler.stop_accepting_tasks()
+            await summary_episode_memory_scheduler.drain()
             set_api_state(app=app, state=None)
             await close_pool()
 

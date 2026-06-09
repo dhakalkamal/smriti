@@ -381,6 +381,52 @@ async def test_summary_scheduler_retains_and_removes_background_tasks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_summary_scheduler_drain_timeout_cancels_and_logs_pending_tasks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    memory_service = _BlockingSummaryMemoryService()
+    scheduler = SummaryEpisodeMemoryScheduler(
+        memory_service=cast(MemoryService, memory_service),
+        chat_generator=FakeChatGenerator(),
+        enabled=True,
+        window_messages=12,
+    )
+    request = SummaryEpisodeMemoryScheduleRequest(
+        user_id=uuid4(),
+        scope_id=uuid4(),
+        conversation_id=uuid4(),
+    )
+
+    task = scheduler.schedule(request)
+
+    assert task is not None
+    await memory_service.started.wait()
+
+    with caplog.at_level(logging.ERROR, logger=summary_task_logger.name):
+        await scheduler.drain(timeout_seconds=0.01)
+
+    assert scheduler.pending_count == 0
+    assert task.cancelled()
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "summary_episode_memory_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.failure_step == "shutdown_drain_timeout"
+    assert record.user_id == request.user_id
+    assert record.scope_id == request.scope_id
+    assert record.conversation_id == request.conversation_id
+    assert record.range_start is None
+    assert record.range_end is None
+    assert record.message_count is None
+    assert record.embedding_model == "fake-embedder"
+    assert record.exception_type == "CancelledError"
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_sse_schedules_summary_work_after_done_event_is_yielded() -> None:
     conversation_id = uuid4()
     schedule_request = SummaryEpisodeMemoryScheduleRequest(
