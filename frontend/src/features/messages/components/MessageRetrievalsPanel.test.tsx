@@ -106,6 +106,27 @@ describe("MessageRetrievalsPanel", () => {
       await screen.findByText("Family Companion › Untitled conversation"),
     ).toBeInTheDocument();
   });
+
+  it("normalizes retrieval source kind labels to memory", async () => {
+    stubRetrievalsResponse(
+      retrievalsResponse({
+        retrievals: [retrievalEntry({ kind: "summary", rank: 1 })],
+      }),
+    );
+
+    renderWithQueryClient(
+      <MessageRetrievalsPanel
+        conversationId="conversation-1"
+        isOpen
+        messageId="assistant-1"
+      />,
+    );
+
+    const retrieval = await screen.findByLabelText("Retrieved memory rank 1");
+
+    expect(within(retrieval).getByText("memory")).toBeInTheDocument();
+    expect(within(retrieval).queryByText("summary")).not.toBeInTheDocument();
+  });
 });
 
 function stubRetrievalsResponse(response: MessageRetrievalsResponse) {
@@ -134,11 +155,13 @@ function retrievalsResponse({
 
 function retrievalEntry({
   content = "Remember the appointment.",
+  kind = "message",
   rank,
   sourceConversationTitle = "Source conversation",
   sourceScopeName = "Research Notes",
 }: {
   content?: string;
+  kind?: "message" | "summary";
   rank: number;
   sourceConversationTitle?: string | null;
   sourceScopeName?: string;
@@ -159,7 +182,7 @@ function retrievalEntry({
     },
     episode: {
       id: `episode-${rank.toString()}`,
-      kind: "message",
+      kind,
       content,
       source_conversation_id: "conversation-source",
       source_conversation_title: sourceConversationTitle,

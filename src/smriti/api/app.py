@@ -24,7 +24,7 @@ from smriti.chat import ChatGenerator, OllamaChatGenerator
 from smriti.config import Settings, get_settings
 from smriti.db.client import close_pool, get_pool
 from smriti.embeddings import Embedder, OllamaEmbedder
-from smriti.memory import MemoryService
+from smriti.memory import MemoryService, SummaryEpisodeMemoryScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,12 @@ def create_app(
             memory_service=memory_service,
             chat_generator=resolved_chat_generator,
         )
+        summary_episode_memory_scheduler = SummaryEpisodeMemoryScheduler(
+            memory_service=memory_service,
+            chat_generator=resolved_chat_generator,
+            enabled=resolved_settings.summary_episode_memory_enabled,
+            window_messages=resolved_settings.summary_episode_window_messages,
+        )
         local_user_id = await _ensure_local_user(pool, resolved_settings.local_user_id)
 
         set_api_state(
@@ -74,6 +80,7 @@ def create_app(
                 memory_service=memory_service,
                 chat_generator=resolved_chat_generator,
                 assistant_orchestrator=assistant_orchestrator,
+                summary_episode_memory_scheduler=summary_episode_memory_scheduler,
                 local_user_id=local_user_id,
             ),
         )

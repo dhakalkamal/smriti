@@ -20,7 +20,11 @@ from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
 from smriti.api import create_app
-from smriti.api.dependencies import get_assistant_orchestrator, get_current_local_user_id
+from smriti.api.dependencies import (
+    get_assistant_orchestrator,
+    get_current_local_user_id,
+    get_summary_episode_memory_scheduler,
+)
 from smriti.api.routes import assistant as assistant_routes
 from smriti.assistant import (
     AssistantGenerationFailedError,
@@ -816,6 +820,11 @@ class StreamingAssistantOrchestrator:
             yield event
 
 
+class _NoopSummaryEpisodeMemoryScheduler:
+    def schedule(self, request) -> None:
+        _ = request
+
+
 @dataclass
 class _DisconnectingRequest:
     disconnect_after_checks: int
@@ -978,6 +987,9 @@ def _client(
         orchestrator,
     )
     app.dependency_overrides[get_current_local_user_id] = lambda: LOCAL_USER_ID
+    app.dependency_overrides[get_summary_episode_memory_scheduler] = lambda: (
+        _NoopSummaryEpisodeMemoryScheduler()
+    )
     return TestClient(app, raise_server_exceptions=False)
 
 

@@ -96,6 +96,14 @@ class CreateMessageEpisodeRequest:
 
 
 @dataclass(frozen=True)
+class CreateSummaryEpisodeRequest:
+    user_id: UUID
+    scope_id: UUID
+    conversation_id: UUID
+    window_messages: int
+
+
+@dataclass(frozen=True)
 class ScopeRecord:
     id: UUID
     user_id: UUID
@@ -141,6 +149,18 @@ class EpisodeRecord:
 class MessageEpisodeRecord:
     message: MessageRecord
     episode: EpisodeRecord
+
+
+@dataclass(frozen=True)
+class SummaryEpisodeRecord:
+    id: UUID
+    conversation_id: UUID
+    scope_id: UUID
+    range_start: int
+    range_end: int
+    content: str
+    created_at: datetime
+    embedding_model_id: int
 
 
 @dataclass(frozen=True)

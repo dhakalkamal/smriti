@@ -122,7 +122,8 @@ Key tables:
 - `conversations`: chat threads that belong to one scope.
 - `messages`: immutable user and assistant turns.
 - `episodes`: retrieval units. Current UI-created user messages create
-  `kind = 'message'` episodes.
+  `kind = 'message'` episodes. When summary episode memory is enabled, complete
+  fixed-size conversation windows create immutable `kind = 'summary'` episodes.
 - `embedding_models`: local embedding model registry.
 - `embeddings_768`: pgvector embeddings for 768-dimensional episode vectors.
 - `message_retrievals`: provenance records for memories used in assistant
@@ -130,8 +131,9 @@ Key tables:
 - `eval_*`: early eval harness scaffolding.
 
 Generated assistant responses are persisted as messages with provenance, but
-they are not embedded as memory episodes in the current stage. Rolling summary
-episodes are part of a later stage.
+they are not embedded as raw message episodes. Stage 11 summary memory can add
+embedded summary episodes after the SSE `done` event for complete 12-message
+windows.
 
 ## Setup
 
@@ -158,6 +160,17 @@ ollama pull qwen2.5:7b
 
 `qwen2.5:7b` is the default chat model. If `SMRITI_OLLAMA_CHAT_MODEL` is
 overridden in `.env`, install that model instead.
+
+Summary episode memory is controlled by:
+
+```text
+SMRITI_SUMMARY_EPISODE_MEMORY_ENABLED=false
+SMRITI_SUMMARY_EPISODE_WINDOW_MESSAGES=12
+```
+
+The feature is disabled by default unless explicitly enabled in local config.
+Stage 11 only summarizes complete fixed-size windows such as `1..12` and
+`13..24`; it does not summarize partial tails.
 
 ### First-Time Setup
 
@@ -290,8 +303,9 @@ conversations in the same scope share the same retrieval pool.
 **Messages.** Messages are immutable conversation turns. User messages submitted
 through the normal message endpoint are also archived as retrieval episodes.
 
-**Episodes.** Episodes are the retrieval unit. The schema supports message and
-summary episodes, but summary creation is not implemented yet.
+**Episodes.** Episodes are the retrieval unit. Message episodes point to one
+message. Summary episodes cover one complete fixed-size message-position window
+inside a single conversation and are embedded into the same retrieval path.
 
 **Retrieval.** Retrieval embeds the query, searches only episodes in the active
 scope, scores candidates, updates access metadata for returned episodes, and
@@ -328,10 +342,10 @@ Completed:
 - Stage 10a: conversation deletion and cleanup UI
 - Stage 10b: read-only retrieval inspection panel
 - Stage 10c: explicit Ollama context window configuration
+- Stage 11: fixed-window summary episodes
 
 Next planned areas:
 
-- Stage 11: window summary episodes (in progress)
 - Scope management UI beyond create and list
 - Expanded retrieval eval harness
 - Optional MCP server after the core local UI product is complete

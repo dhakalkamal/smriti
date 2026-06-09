@@ -12,6 +12,7 @@ from smriti.memory.errors import (
     MemoryServiceError,
     ScopeAccessDeniedError,
     ScopeNotFoundError,
+    SummaryEpisodeMemoryError,
     VectorDimensionError,
 )
 from smriti.memory.eval import (
@@ -30,6 +31,7 @@ from smriti.memory.models import (
     CreateConversationRequest,
     CreateMessageEpisodeRequest,
     CreateScopeRequest,
+    CreateSummaryEpisodeRequest,
     DeleteConversationRequest,
     EpisodeKind,
     EpisodeRecord,
@@ -45,8 +47,13 @@ from smriti.memory.models import (
     RetrievalRecord,
     ScopeRecord,
     ScoredEpisode,
+    SummaryEpisodeRecord,
 )
 from smriti.memory.service import MemoryService
+from smriti.memory.summary_tasks import (
+    SummaryEpisodeMemoryScheduler,
+    SummaryEpisodeMemoryScheduleRequest,
+)
 
 __all__ = [
     "AppendAssistantResponseWithProvenanceRequest",
@@ -61,6 +68,7 @@ __all__ = [
     "CreateConversationRequest",
     "CreateMessageEpisodeRequest",
     "CreateScopeRequest",
+    "CreateSummaryEpisodeRequest",
     "DeleteConversationRequest",
     "EpisodeKind",
     "EmbeddingModelNotFoundError",
@@ -88,6 +96,10 @@ __all__ = [
     "ScopeAccessDeniedError",
     "ScopeNotFoundError",
     "ScopeRecord",
+    "SummaryEpisodeMemoryError",
+    "SummaryEpisodeMemoryScheduleRequest",
+    "SummaryEpisodeMemoryScheduler",
+    "SummaryEpisodeRecord",
     "VectorDimensionError",
     "run_retrieval_eval",
 ]

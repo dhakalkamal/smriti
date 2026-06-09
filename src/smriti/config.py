@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     ollama_chat_num_ctx: int = Field(default=8192, gt=0)
     ollama_embed_num_ctx: int = Field(default=8192, gt=0)
     ollama_chat_timeout_seconds: float = Field(default=60.0, gt=0)
+    summary_episode_memory_enabled: bool = Field(default=False)
+    summary_episode_window_messages: int = Field(default=12, ge=1)
 
     model_config = SettingsConfigDict(
         env_prefix="SMRITI_",

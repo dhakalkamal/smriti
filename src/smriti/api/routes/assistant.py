@@ -7,7 +7,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import StreamingResponse
 
-from smriti.api.dependencies import get_assistant_orchestrator, get_current_local_user_id
+from smriti.api.dependencies import (
+    get_assistant_orchestrator,
+    get_current_local_user_id,
+    get_summary_episode_memory_scheduler,
+)
 from smriti.api.schemas import (
     AssistantGenerationResponse,
     AssistantStreamDoneData,
@@ -26,6 +30,7 @@ from smriti.assistant import (
     AssistantStreamStart,
     AssistantStreamToken,
 )
+from smriti.memory import SummaryEpisodeMemoryScheduler, SummaryEpisodeMemoryScheduleRequest
 
 router = APIRouter(tags=["assistant"])
 
@@ -74,6 +79,10 @@ async def stream_assistant_response(
         AssistantOrchestrator,
         Depends(get_assistant_orchestrator),
     ],
+    summary_episode_memory_scheduler: Annotated[
+        SummaryEpisodeMemoryScheduler,
+        Depends(get_summary_episode_memory_scheduler),
+    ],
     local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
 ) -> StreamingResponse:
     """Stream and persist one assistant response for a local conversation."""
@@ -93,6 +102,12 @@ async def stream_assistant_response(
         _stream_sse_events(
             request=request,
             events=assistant_orchestrator.stream_prepared(prepared),
+            summary_episode_memory_scheduler=summary_episode_memory_scheduler,
+            summary_episode_memory_request=SummaryEpisodeMemoryScheduleRequest(
+                user_id=local_user_id,
+                scope_id=body.scope_id,
+                conversation_id=conversation_id,
+            ),
         ),
         media_type="text/event-stream",
     )
@@ -101,6 +116,8 @@ async def stream_assistant_response(
 async def _stream_sse_events(
     request: Request,
     events: AsyncIterator[AssistantStreamEvent],
+    summary_episode_memory_scheduler: SummaryEpisodeMemoryScheduler | None = None,
+    summary_episode_memory_request: SummaryEpisodeMemoryScheduleRequest | None = None,
 ) -> AsyncIterator[str]:
     try:
         while not await request.is_disconnected():
@@ -109,6 +126,12 @@ async def _stream_sse_events(
             except StopAsyncIteration:
                 break
             yield _encode_sse_event(event)
+            if (
+                isinstance(event, AssistantStreamDone)
+                and summary_episode_memory_scheduler is not None
+                and summary_episode_memory_request is not None
+            ):
+                summary_episode_memory_scheduler.schedule(summary_episode_memory_request)
     finally:
         close = getattr(events, "aclose", None)
         if close is not None:

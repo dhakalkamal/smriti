@@ -18,6 +18,7 @@ from smriti.api.dependencies import (
     get_chat_generator,
     get_current_local_user_id,
     get_memory_service,
+    get_summary_episode_memory_scheduler,
 )
 from smriti.assistant import AssistantOrchestrator
 from smriti.chat import ChatGenerator, FakeChatGenerator
@@ -30,6 +31,7 @@ from smriti.memory import (
     ConversationNotFoundError,
     InvalidProvenanceTargetError,
     MemoryService,
+    SummaryEpisodeMemoryScheduler,
 )
 
 LOCAL_USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -177,6 +179,10 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
                 AssistantOrchestrator,
                 Depends(get_assistant_orchestrator),
             ],
+            summary_episode_memory_scheduler: Annotated[
+                SummaryEpisodeMemoryScheduler,
+                Depends(get_summary_episode_memory_scheduler),
+            ],
             local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
         ) -> dict[str, str]:
             return {
@@ -184,6 +190,7 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
                 "memory_service": type(memory_service).__name__,
                 "chat_generator": type(chat_generator).__name__,
                 "assistant_orchestrator": type(assistant_orchestrator).__name__,
+                "summary_episode_memory_scheduler": type(summary_episode_memory_scheduler).__name__,
             }
 
         with TestClient(app) as client:
@@ -196,6 +203,10 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
             assert state.chat_generator is chat_generator
             assert state.assistant_orchestrator.memory_service is state.memory_service
             assert state.assistant_orchestrator.chat_generator is chat_generator
+            assert state.summary_episode_memory_scheduler.memory_service is state.memory_service
+            assert state.summary_episode_memory_scheduler.chat_generator is chat_generator
+            assert state.summary_episode_memory_scheduler.enabled is False
+            assert state.summary_episode_memory_scheduler.window_messages == 12
             assert state.local_user_id == LOCAL_USER_ID
 
             response = client.get("/_test/dependencies")
@@ -206,6 +217,7 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
             "memory_service": "MemoryService",
             "chat_generator": "FakeChatGenerator",
             "assistant_orchestrator": "AssistantOrchestrator",
+            "summary_episode_memory_scheduler": "SummaryEpisodeMemoryScheduler",
         }
         assert asyncio.run(_local_user_count(settings, LOCAL_USER_ID)) == 1
 

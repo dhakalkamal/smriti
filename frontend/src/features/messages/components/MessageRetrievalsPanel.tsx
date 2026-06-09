@@ -95,7 +95,7 @@ export function MessageRetrievalsPanel({
                   <span>Similarity {formatScore(retrieval.similarity)}</span>
                   <span>Score {formatScore(retrieval.score)}</span>
                   <span className="rounded border border-border px-1.5 py-0.5 uppercase tracking-normal text-foreground">
-                    {retrieval.episode.kind}
+                    memory
                   </span>
                 </div>
 

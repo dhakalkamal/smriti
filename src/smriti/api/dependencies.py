@@ -10,7 +10,7 @@ from smriti.assistant import AssistantOrchestrator
 from smriti.chat import ChatGenerator
 from smriti.config import Settings
 from smriti.embeddings import Embedder
-from smriti.memory import MemoryService
+from smriti.memory import MemoryService, SummaryEpisodeMemoryScheduler
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class ApiAppState:
     memory_service: MemoryService
     chat_generator: ChatGenerator
     assistant_orchestrator: AssistantOrchestrator
+    summary_episode_memory_scheduler: SummaryEpisodeMemoryScheduler
     local_user_id: UUID
 
 
@@ -75,6 +76,12 @@ def get_assistant_orchestrator(request: Request) -> AssistantOrchestrator:
     """Return the assistant orchestrator used by thin API routes."""
 
     return get_api_state(request).assistant_orchestrator
+
+
+def get_summary_episode_memory_scheduler(request: Request) -> SummaryEpisodeMemoryScheduler:
+    """Return the post-SSE summary memory scheduler."""
+
+    return get_api_state(request).summary_episode_memory_scheduler
 
 
 def get_current_local_user_id(request: Request) -> UUID:
