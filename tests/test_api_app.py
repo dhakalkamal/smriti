@@ -171,6 +171,7 @@ def test_lifespan_wires_dependencies_and_bootstraps_configured_user() -> None:
         settings = Settings(
             database_url=_to_asyncpg_dsn(postgres.get_connection_url()),
             local_user_id=LOCAL_USER_ID,
+            summary_episode_memory_enabled=False,
         )
         asyncio.run(apply_migrations(settings=settings, migrations_dir=settings.migrations_dir))
         embedder = FakeEmbedder(dimensions=768)

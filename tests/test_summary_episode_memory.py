@@ -252,20 +252,34 @@ async def test_summary_episode_memory_refuses_overlapping_summary_ranges() -> No
 
 
 @pytest.mark.parametrize(
-    ("failure_mode", "expected_step", "expected_exception_type", "expected_embedding_model"),
+    (
+        "failure_mode",
+        "expected_step",
+        "expected_exception_type",
+        "expected_embedding_model",
+        "expected_exception_message",
+    ),
     [
-        ("summary_generation", "summary_generation", "ChatResponseError", "nomic-embed-text"),
+        (
+            "summary_generation",
+            "summary_generation",
+            "ChatResponseError",
+            "nomic-embed-text",
+            "fake summary generation failure",
+        ),
         (
             "embedding_generation",
             "embedding_generation",
             "EmbeddingConfigurationError",
             "nomic-embed-text",
+            "fake embedding generation failure",
         ),
         (
             "summary_episode_write",
             "summary_episode_write",
             "EmbeddingModelNotFoundError",
             "missing-summary-model",
+            "Embedding model is not registered for 768d storage",
         ),
     ],
 )
@@ -275,6 +289,7 @@ async def test_summary_episode_background_failures_log_without_content_and_leave
     expected_step: str,
     expected_exception_type: str,
     expected_embedding_model: str,
+    expected_exception_message: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with PostgresContainer(
@@ -343,8 +358,19 @@ async def test_summary_episode_background_failures_log_without_content_and_leave
             assert record.embedding_model == expected_embedding_model
             assert not hasattr(record, "embedding_model_id")
             assert record.exception_type == expected_exception_type
+            assert record.exception_message == expected_exception_message
             assert record.exc_info is None
             rendered_log = record.getMessage()
+            assert rendered_log.startswith("summary_episode_memory_failed ")
+            assert f"failure_step={expected_step}" in rendered_log
+            assert f"conversation_id={conversation_id}" in rendered_log
+            assert "range_start=1" in rendered_log
+            assert "range_end=12" in rendered_log
+            assert "message_count=12" in rendered_log
+            assert "summary_model=fake-summary-model" in rendered_log
+            assert f"embedding_model={expected_embedding_model}" in rendered_log
+            assert f"exception_type={expected_exception_type}" in rendered_log
+            assert f"exception_message={expected_exception_message}" in rendered_log
             assert MESSAGE_CONTENT_SENTINEL not in rendered_log
             assert SUMMARY_CONTENT_SENTINEL not in rendered_log
             assert FAILURE_CONTENT_SENTINEL not in rendered_log
@@ -423,7 +449,19 @@ async def test_summary_scheduler_drain_timeout_cancels_and_logs_pending_tasks(
     assert record.message_count is None
     assert record.embedding_model == "fake-embedder"
     assert record.exception_type == "CancelledError"
+    assert record.exception_message == "summary task cancelled during shutdown drain"
     assert record.exc_info is None
+    rendered_log = record.getMessage()
+    assert rendered_log.startswith("summary_episode_memory_failed ")
+    assert "failure_step=shutdown_drain_timeout" in rendered_log
+    assert f"conversation_id={request.conversation_id}" in rendered_log
+    assert "range_start=null" in rendered_log
+    assert "range_end=null" in rendered_log
+    assert "message_count=null" in rendered_log
+    assert "summary_model=fake-chat-generator" in rendered_log
+    assert "embedding_model=fake-embedder" in rendered_log
+    assert "exception_type=CancelledError" in rendered_log
+    assert "exception_message=summary task cancelled during shutdown drain" in rendered_log
 
 
 @pytest.mark.asyncio
@@ -654,7 +692,12 @@ def _failure_service(pool: asyncpg.Pool, failure_mode: str) -> MemoryService:
 def _failure_chat_generator(failure_mode: str) -> FakeChatGenerator:
     if failure_mode == "summary_generation":
         return FakeChatGenerator(
-            error=ChatResponseError(FAILURE_CONTENT_SENTINEL),
+            response=ChatResponse(
+                content="unused summary",
+                model="fake-summary-model",
+                finish_reason="stop",
+            ),
+            error=ChatResponseError("fake summary generation failure"),
         )
     return FakeChatGenerator(
         response=ChatResponse(
@@ -669,11 +712,11 @@ def _failure_chat_generator(failure_mode: str) -> FakeChatGenerator:
 class _FailingEmbedder:
     async def embed_text(self, text: str) -> EmbeddingVector:
         _ = text
-        raise EmbeddingConfigurationError(FAILURE_CONTENT_SENTINEL)
+        raise EmbeddingConfigurationError("fake embedding generation failure")
 
     async def embed_texts(self, texts: Sequence[str]) -> list[EmbeddingVector]:
         _ = texts
-        raise EmbeddingConfigurationError(FAILURE_CONTENT_SENTINEL)
+        raise EmbeddingConfigurationError("fake embedding generation failure")
 
 
 @dataclass

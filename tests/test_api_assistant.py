@@ -53,6 +53,7 @@ from smriti.db.client import close_pool, get_pool
 from smriti.db.migrate import apply_migrations
 from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
+    AppendMessageRequest,
     AppendMessageWithEpisodeRequest,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
@@ -521,6 +522,109 @@ async def test_assistant_stream_route_disconnect_persists_no_rows_in_postgres() 
             conversation_id=UUID(conversation["id"]),
         )
         assert counts == {"assistant_messages": 0, "message_retrievals": 0}
+
+
+@pytest.mark.asyncio
+async def test_assistant_stream_route_schedules_summary_and_creates_summary_row() -> None:
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        settings = Settings(
+            database_url=_to_asyncpg_dsn(postgres.get_connection_url()),
+            local_user_id=LOCAL_USER_ID,
+            summary_episode_memory_enabled=True,
+        )
+        await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
+        chat_generator = FakeStreamingChatGenerator(
+            tokens=["runtime", " summary"],
+            final=ChatStreamFinal(model="fake-stream", finish_reason="stop"),
+        )
+        app = create_app(
+            settings=settings,
+            embedder=FakeEmbedder(dimensions=768),
+            chat_generator=chat_generator,
+        )
+
+        async with app.router.lifespan_context(app):
+            state = app.state.smriti
+            memory_service = cast(MemoryService, state.memory_service)
+            scope = await memory_service.create_scope(
+                CreateScopeRequest(
+                    user_id=LOCAL_USER_ID,
+                    name="Streaming summary scope",
+                    system_prompt="Keep streaming summary memory scoped.",
+                )
+            )
+            conversation = await memory_service.create_conversation(
+                CreateConversationRequest(
+                    user_id=LOCAL_USER_ID,
+                    scope_id=scope.id,
+                    title="Streaming summary conversation",
+                )
+            )
+            for index in range(11):
+                await memory_service.append_message_with_episode(
+                    AppendMessageWithEpisodeRequest(
+                        user_id=LOCAL_USER_ID,
+                        conversation_id=conversation.id,
+                        role="user",
+                        content=f"seed user memory {index}",
+                        token_count=4,
+                    )
+                )
+                await memory_service.append_message(
+                    AppendMessageRequest(
+                        user_id=LOCAL_USER_ID,
+                        scope_id=scope.id,
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        content=f"seed assistant response {index}",
+                        token_count=4,
+                    )
+                )
+            query_message = await memory_service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=LOCAL_USER_ID,
+                    conversation_id=conversation.id,
+                    role="user",
+                    content="Please answer and trigger summary memory.",
+                    token_count=6,
+                )
+            )
+
+            transport = _StreamingASGITransport(app)
+            async with (
+                httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client,
+                client.stream(
+                    "POST",
+                    f"/conversations/{conversation.id}/assistant-response/stream",
+                    json={
+                        "scope_id": str(scope.id),
+                        "query_message_id": str(query_message.message.id),
+                    },
+                ) as response,
+            ):
+                assert response.status_code == 200
+                body = "".join([chunk async for chunk in response.aiter_text()])
+
+            streamed = _parse_sse(body)
+            assert [event["event"] for event in streamed] == ["start", "token", "token", "done"]
+            await state.summary_episode_memory_scheduler.drain(timeout_seconds=5.0)
+
+            assert await _summary_episode_rows(settings, conversation.id) == [
+                {
+                    "range_start": 13,
+                    "range_end": 24,
+                    "embedding_count": 1,
+                }
+            ]
+            assert len(chat_generator.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -1062,6 +1166,45 @@ async def _assistant_stream_storage_counts(
         "assistant_messages": int(row["assistant_messages"]),
         "message_retrievals": int(row["message_retrievals"]),
     }
+
+
+async def _summary_episode_rows(
+    settings: Settings,
+    conversation_id: UUID,
+) -> list[dict[str, int]]:
+    connection = await asyncpg.connect(
+        dsn=settings.database_url,
+        timeout=settings.database_connect_timeout,
+        command_timeout=settings.database_command_timeout,
+    )
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT
+                episodes.range_start,
+                episodes.range_end,
+                COUNT(embeddings_768.episode_id) AS embedding_count
+            FROM episodes
+            LEFT JOIN embeddings_768
+                ON embeddings_768.episode_id = episodes.id
+            WHERE episodes.conversation_id = $1
+              AND episodes.kind = 'summary'
+            GROUP BY episodes.id
+            ORDER BY episodes.range_start ASC;
+            """,
+            conversation_id,
+        )
+    finally:
+        await connection.close()
+
+    return [
+        {
+            "range_start": int(row["range_start"]),
+            "range_end": int(row["range_end"]),
+            "embedding_count": int(row["embedding_count"]),
+        }
+        for row in rows
+    ]
 
 
 def _parse_sse(body: str) -> list[dict[str, object]]:

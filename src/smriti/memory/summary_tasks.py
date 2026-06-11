@@ -97,8 +97,19 @@ class SummaryEpisodeMemoryScheduler:
         except SummaryEpisodeMemoryError as exc:
             _log_summary_failure(exc)
         except Exception as exc:
+            exception_message = str(exc)
             logger.error(
-                "summary_episode_memory_failed",
+                _summary_failure_log_message(
+                    failure_step="unexpected",
+                    conversation_id=request.conversation_id,
+                    range_start=None,
+                    range_end=None,
+                    message_count=None,
+                    summary_model=_summary_model(self.chat_generator),
+                    embedding_model=self.memory_service.embedding_model_id,
+                    exception_type=type(exc).__name__,
+                    exception_message=exception_message,
+                ),
                 extra={
                     "event": "summary_episode_memory_failed",
                     "failure_step": "unexpected",
@@ -111,6 +122,7 @@ class SummaryEpisodeMemoryScheduler:
                     "summary_model": _summary_model(self.chat_generator),
                     "embedding_model": self.memory_service.embedding_model_id,
                     "exception_type": type(exc).__name__,
+                    "exception_message": exception_message,
                 },
             )
 
@@ -121,8 +133,19 @@ class SummaryEpisodeMemoryScheduler:
 
 
 def _log_summary_failure(exc: SummaryEpisodeMemoryError) -> None:
+    exception_message = _exception_message(exc)
     logger.error(
-        "summary_episode_memory_failed",
+        _summary_failure_log_message(
+            failure_step=exc.failure_step,
+            conversation_id=exc.conversation_id,
+            range_start=exc.range_start,
+            range_end=exc.range_end,
+            message_count=exc.message_count,
+            summary_model=exc.summary_model,
+            embedding_model=exc.embedding_model,
+            exception_type=exc.exception_type,
+            exception_message=exception_message,
+        ),
         extra={
             "event": "summary_episode_memory_failed",
             "failure_step": exc.failure_step,
@@ -135,6 +158,7 @@ def _log_summary_failure(exc: SummaryEpisodeMemoryError) -> None:
             "summary_model": exc.summary_model,
             "embedding_model": exc.embedding_model,
             "exception_type": exc.exception_type,
+            "exception_message": exception_message,
         },
     )
 
@@ -147,8 +171,19 @@ def _log_summary_task_failure(
     embedding_model: str | None,
     exception_type: str,
 ) -> None:
+    exception_message = "summary task cancelled during shutdown drain"
     logger.error(
-        "summary_episode_memory_failed",
+        _summary_failure_log_message(
+            failure_step=failure_step,
+            conversation_id=request.conversation_id,
+            range_start=None,
+            range_end=None,
+            message_count=None,
+            summary_model=summary_model,
+            embedding_model=embedding_model,
+            exception_type=exception_type,
+            exception_message=exception_message,
+        ),
         extra={
             "event": "summary_episode_memory_failed",
             "failure_step": failure_step,
@@ -161,6 +196,7 @@ def _log_summary_task_failure(
             "summary_model": summary_model,
             "embedding_model": embedding_model,
             "exception_type": exception_type,
+            "exception_message": exception_message,
         },
     )
 
@@ -170,3 +206,41 @@ def _summary_model(chat_generator: ChatGenerator) -> str | None:
         return chat_generator.model
     except Exception:
         return None
+
+
+def _exception_message(exc: SummaryEpisodeMemoryError) -> str:
+    if exc.__cause__ is not None:
+        return str(exc.__cause__)
+    return str(exc)
+
+
+def _summary_failure_log_message(
+    *,
+    failure_step: str,
+    conversation_id: UUID,
+    range_start: int | None,
+    range_end: int | None,
+    message_count: int | None,
+    summary_model: str | None,
+    embedding_model: str | None,
+    exception_type: str,
+    exception_message: str,
+) -> str:
+    return (
+        "summary_episode_memory_failed "
+        f"failure_step={failure_step} "
+        f"conversation_id={conversation_id} "
+        f"range_start={_log_value(range_start)} "
+        f"range_end={_log_value(range_end)} "
+        f"message_count={_log_value(message_count)} "
+        f"summary_model={_log_value(summary_model)} "
+        f"embedding_model={_log_value(embedding_model)} "
+        f"exception_type={exception_type} "
+        f"exception_message={_log_value(exception_message)}"
+    )
+
+
+def _log_value(value: object | None) -> str:
+    if value is None:
+        return "null"
+    return str(value)
