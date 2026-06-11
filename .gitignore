@@ -39,3 +39,9 @@ htmlcov/
 # Logs
 *.log
 .smriti-dev/
+
+# Local/manual eval notes and generated eval outputs
+docs/evals/local/
+docs/evals/runs/
+docs/evals/results/
+docs/evals/tmp/
