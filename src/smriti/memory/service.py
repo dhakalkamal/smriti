@@ -698,6 +698,7 @@ class MemoryService:
         query: str,
         top_k: int,
         *,
+        exclude_message_id: UUID | None = None,
         now: datetime | None = None,
     ) -> list[ScoredEpisode]:
         """Retrieve embedded episodes from exactly one user-owned scope."""
@@ -721,8 +722,23 @@ class MemoryService:
                 scope_id=scope_id,
             )
             embedding_model_pk = await self._embedding_model_pk(connection)
+            message_exclusion_predicate = (
+                "" if exclude_message_id is None else "AND episodes.message_id IS DISTINCT FROM $6"
+            )
+            retrieval_query_args: tuple[object, ...] = (
+                scope_id,
+                user_id,
+                list(query_vector),
+                embedding_model_pk,
+                candidate_limit,
+            )
+            if exclude_message_id is not None:
+                retrieval_query_args = (
+                    *retrieval_query_args,
+                    exclude_message_id,
+                )
             rows = await connection.fetch(
-                """
+                f"""
                 SELECT
                     episodes.id,
                     conversations.user_id,
@@ -755,14 +771,11 @@ class MemoryService:
                    AND messages.conversation_id = episodes.conversation_id
                 WHERE episodes.scope_id = $1
                   AND conversations.user_id = $2
+                  {message_exclusion_predicate}
                 ORDER BY similarity DESC, episodes.created_at DESC, episodes.id ASC
                 LIMIT $5;
                 """,
-                scope_id,
-                user_id,
-                list(query_vector),
-                embedding_model_pk,
-                candidate_limit,
+                *retrieval_query_args,
             )
 
             scored_candidates = [_scored_episode_candidate_from_row(row, scored_at) for row in rows]

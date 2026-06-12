@@ -17,6 +17,7 @@ from smriti.embeddings import FakeEmbedder
 from smriti.memory import (
     AppendAssistantResponseWithProvenanceRequest,
     AppendMessageRequest,
+    AppendMessageWithEpisodeRequest,
     AssistantMessageNotFoundError,
     ConversationAccessDeniedError,
     ConversationNotFoundError,
@@ -817,6 +818,156 @@ async def test_retrieve_scoped_episodes_returns_only_scope_and_embedded_rows() -
             assert 0.0 <= results[0].importance_score <= 1.0
             assert 0.0 <= results[0].frequency_score <= 1.0
             assert results[0].embedding_model_id == scoped_episode.embedding_model_id
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            content = "stage thirteen active query exclusion memory"
+            source_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content=content,
+            )
+            active_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            summary_episode_id = await _seed_embedded_summary_episode(
+                service=service,
+                pool=pool,
+                conversation_id=conversation_id,
+                scope_id=scope_id,
+                content=content,
+            )
+
+            other_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=user_id,
+                    name=f"Other Scope {uuid4()}",
+                    system_prompt="Keep this separate.",
+                )
+            )
+            other_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=user_id,
+                    scope_id=other_scope.id,
+                    title="Other scope",
+                )
+            )
+            other_scope_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=other_scope.id,
+                conversation_id=other_conversation.id,
+                content=content,
+            )
+            async with pool.acquire() as connection:
+                other_user_id = await connection.fetchval(
+                    "INSERT INTO users DEFAULT VALUES RETURNING id;"
+                )
+            other_user_scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=other_user_id,
+                    name=f"Other User Scope {uuid4()}",
+                    system_prompt="Private to another user.",
+                )
+            )
+            other_user_conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=other_user_id,
+                    scope_id=other_user_scope.id,
+                    title="Other user",
+                )
+            )
+            other_user_episode = await _append_embedded_message(
+                service=service,
+                user_id=other_user_id,
+                scope_id=other_user_scope.id,
+                conversation_id=other_user_conversation.id,
+                content=content,
+            )
+
+            unfiltered = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query=content,
+                top_k=10,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+            assert active_message_episode.episode.id in {episode.id for episode in unfiltered}
+
+            filtered = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query=content,
+                top_k=10,
+                exclude_message_id=active_message_episode.message.id,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+
+            filtered_ids = {episode.id for episode in filtered}
+            assert active_message_episode.episode.id not in filtered_ids
+            assert source_episode.id in filtered_ids
+            assert summary_episode_id in filtered_ids
+            assert other_scope_episode.id not in filtered_ids
+            assert other_user_episode.id not in filtered_ids
+            assert all(episode.user_id == user_id for episode in filtered)
+            assert all(episode.scope_id == scope_id for episode in filtered)
+            assert all(
+                episode.message_id != active_message_episode.message.id for episode in filtered
+            )
+            assert any(
+                episode.id == summary_episode_id
+                and episode.kind == "summary"
+                and episode.message_id is None
+                for episode in filtered
+            )
+
+            async with pool.acquire() as connection:
+                active_episode_count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM episodes WHERE message_id = $1;",
+                    active_message_episode.message.id,
+                )
+            assert active_episode_count == 1
+
+            with pytest.raises(ScopeAccessDeniedError):
+                await service.retrieve_scoped_episodes(
+                    user_id=other_user_id,
+                    scope_id=scope_id,
+                    query=content,
+                    top_k=10,
+                    exclude_message_id=active_message_episode.message.id,
+                    now=FIXED_RETRIEVAL_NOW,
+                )
         finally:
             await close_pool()
 
@@ -2949,6 +3100,54 @@ async def _append_embedded_message(
             message_id=message.id,
         )
     )
+
+
+async def _seed_embedded_summary_episode(
+    service: MemoryService,
+    pool,
+    conversation_id: UUID,
+    scope_id: UUID,
+    content: str,
+) -> UUID:
+    vector = await service.embedder.embed_text(content)
+    async with pool.acquire() as connection:
+        embedding_model_pk = await connection.fetchval(
+            """
+            SELECT id
+            FROM embedding_models
+            WHERE model_id = $1
+              AND dimensions = 768
+              AND is_active = TRUE;
+            """,
+            service.embedding_model_id,
+        )
+        episode_id = await connection.fetchval(
+            """
+            INSERT INTO episodes (
+                conversation_id,
+                scope_id,
+                kind,
+                range_start,
+                range_end,
+                content
+            )
+            VALUES ($1, $2, 'summary', 1, 2, $3)
+            RETURNING id;
+            """,
+            conversation_id,
+            scope_id,
+            content,
+        )
+        await connection.execute(
+            """
+            INSERT INTO embeddings_768 (episode_id, model_id, embedding)
+            VALUES ($1, $2, $3);
+            """,
+            episode_id,
+            embedding_model_pk,
+            list(vector),
+        )
+    return episode_id
 
 
 async def _append_message(

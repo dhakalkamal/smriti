@@ -176,6 +176,7 @@ class AssistantOrchestrator:
             scope_id=request.scope_id,
             query=context.query_message.content,
             top_k=request.top_k,
+            exclude_message_id=context.query_message.id,
         )
         return build_chat_request(
             request=PromptBuildRequest(

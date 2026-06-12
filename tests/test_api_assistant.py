@@ -628,6 +628,102 @@ async def test_assistant_stream_route_schedules_summary_and_creates_summary_row(
 
 
 @pytest.mark.asyncio
+async def test_assistant_generation_excludes_current_query_from_retrieval_provenance() -> None:
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        settings = Settings(
+            database_url=_to_asyncpg_dsn(postgres.get_connection_url()),
+            local_user_id=LOCAL_USER_ID,
+        )
+        await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            async with pool.acquire() as connection:
+                await connection.execute("INSERT INTO users (id) VALUES ($1);", LOCAL_USER_ID)
+            scope = await service.create_scope(
+                CreateScopeRequest(
+                    user_id=LOCAL_USER_ID,
+                    name="Current query exclusion scope",
+                    system_prompt="Use scoped memory only.",
+                )
+            )
+            conversation = await service.create_conversation(
+                CreateConversationRequest(
+                    user_id=LOCAL_USER_ID,
+                    scope_id=scope.id,
+                    title="Current query exclusion",
+                )
+            )
+            content = "Terrafold uses cerulean notebooks for deployment checks."
+            source_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=LOCAL_USER_ID,
+                    conversation_id=conversation.id,
+                    role="user",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            query_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=LOCAL_USER_ID,
+                    conversation_id=conversation.id,
+                    role="user",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            orchestrator = AssistantOrchestrator(
+                memory_service=service,
+                chat_generator=FakeStreamingChatGenerator(
+                    tokens=["Remembered."],
+                    final=ChatStreamFinal(model="fake-chat", finish_reason="stop"),
+                ),
+            )
+
+            result = await orchestrator.generate(
+                AssistantGenerationRequest(
+                    user_id=LOCAL_USER_ID,
+                    scope_id=scope.id,
+                    conversation_id=conversation.id,
+                    query_message_id=query_message_episode.message.id,
+                    top_k=5,
+                )
+            )
+
+            async with pool.acquire() as connection:
+                provenance_episode_ids = await connection.fetch(
+                    """
+                    SELECT episode_id
+                    FROM message_retrievals
+                    WHERE assistant_message_id = $1
+                    ORDER BY result_rank ASC;
+                    """,
+                    result.assistant_message.id,
+                )
+                active_episode_count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM episodes WHERE message_id = $1;",
+                    query_message_episode.message.id,
+                )
+
+            used_episode_ids = set(result.used_memory_episode_ids)
+            persisted_episode_ids = {row["episode_id"] for row in provenance_episode_ids}
+            assert source_message_episode.episode.id in used_episode_ids
+            assert query_message_episode.episode.id not in used_episode_ids
+            assert source_message_episode.episode.id in persisted_episode_ids
+            assert query_message_episode.episode.id not in persisted_episode_ids
+            assert active_episode_count == 1
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
 async def test_assistant_stream_persistence_failure_rolls_back_postgres_rows() -> None:
     with PostgresContainer(
         "pgvector/pgvector:pg16",
@@ -974,8 +1070,10 @@ class _PoisonedRetrievalMemoryService:
         scope_id: UUID,
         query: str,
         top_k: int,
+        *,
+        exclude_message_id: UUID | None = None,
     ) -> list[ScoredEpisode]:
-        _ = (user_id, scope_id, query, top_k)
+        _ = (user_id, scope_id, query, top_k, exclude_message_id)
         return list(self.poisoned_memories)
 
     async def append_assistant_response_with_provenance(self, request):

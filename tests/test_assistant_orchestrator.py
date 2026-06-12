@@ -89,6 +89,7 @@ async def test_assistant_orchestrator_generates_once_and_persists_selected_memor
 
     assert len(chat_generator.requests) == 1
     assert memory_service.retrieve_queries == ["find memory"]
+    assert memory_service.retrieve_exclude_message_ids == [query_message.id]
     assert memory_service.persist_requests[0].used == (high_memory,)
     assert memory_service.persist_requests[0].token_count == 7
     assert result.assistant_message == persisted_message
@@ -150,6 +151,7 @@ async def test_assistant_orchestrator_streams_tokens_then_persists_before_done()
     assert done.chat_model == "fake-stream"
     assert done.finish_reason == "stop"
     assert done.used_memory_episode_ids == (memory.id,)
+    assert memory_service.retrieve_exclude_message_ids == [query_message.id]
     assert memory_service.persist_requests[0].content == "hello world"
     assert memory_service.persist_requests[0].used == (memory,)
     assert memory_service.persist_requests[0].token_count == 2
@@ -490,6 +492,7 @@ class _FakeMemoryService:
     retrieved: list[ScoredEpisode]
     persisted: AssistantResponseRecord | None
     retrieve_queries: list[str] = field(default_factory=list)
+    retrieve_exclude_message_ids: list[UUID | None] = field(default_factory=list)
     persist_requests: list[AppendAssistantResponseWithProvenanceRequest] = field(
         default_factory=list
     )
@@ -507,9 +510,12 @@ class _FakeMemoryService:
         scope_id: UUID,
         query: str,
         top_k: int,
+        *,
+        exclude_message_id: UUID | None = None,
     ) -> list[ScoredEpisode]:
         _ = (user_id, scope_id, top_k)
         self.retrieve_queries.append(query)
+        self.retrieve_exclude_message_ids.append(exclude_message_id)
         return self.retrieved
 
     async def append_assistant_response_with_provenance(
