@@ -1,153 +1,611 @@
-# Stage 12 - Retrieval Eval Harness Findings
+# Stage 12 - Retrieval Eval Harness Contract
 
-## 1. Stage Metadata
+## Status
 
-- VERIFIED - Stage name: Stage 12 - Retrieval Eval Harness.
-- VERIFIED - Branch inspected: `stage-11-summary-episode-memory` from `git branch --show-current`.
-- VERIFIED - Date of inspection: 2026-06-11 from the session context.
-- VERIFIED - Status: inspection only.
-- VERIFIED - Project instructions require retrieval to remain scoped by `scope_id` and treat scopes as the user-controlled privacy boundary (`AGENTS.md:105-124`).
-- VERIFIED - Project instructions identify `eval_*` as eval harness scaffolding and say the eval harness should tune the starting retrieval weights (`AGENTS.md:242-277`).
-- VERIFIED - Frontend rules were read because repo instructions require `FRONTEND.md` for frontend-related work, but this Stage 12 inspection did not identify frontend implementation work in scope (`AGENTS.md:406-415`, `FRONTEND.md:225-239`).
-- VERIFIED - Stage 11 explicitly kept retrieval SQL and scoring/ranking unchanged, while documenting that summary and raw message episodes share the existing retrieval mix (`docs/stages/stage-11-summary-episode-memory.md:384-408`).
-- UNKNOWN - `docs/stages/stage-12-retrieval-eval-harness.md` was not present in the initial `rg --files` output. Absence has no file path/line range; this file is newly created for findings only.
+- Branch: `stage-12-retrieval-eval-harness`.
+- Date drafted: 2026-06-11.
+- Mode: contract and design only.
+- Implementation status: not implemented by this document.
 
-## 2. Repo Findings
+Stage 12 defines how Smriti will measure retrieval quality before changing any
+retrieval behavior. The contract is intentionally split into Stage 12a and
+Stage 12b so the measuring instrument exists before any weight tuning begins.
 
-### A. Existing Eval Harness
+## Problem Statement
 
-- VERIFIED - The existing eval harness implementation lives in `src/smriti/memory/eval.py` and imports the memory service rather than owning a separate runner or CLI (`src/smriti/memory/eval.py:1-9`).
-- VERIFIED - The harness input is `RetrievalEvalCase` with `name`, `user_id`, `scope_id`, `query`, `expected_episode_ids`, and `top_k` (`src/smriti/memory/eval.py:12-20`).
-- VERIFIED - The harness result and summary models include hit@k, precision@k, recall@k, and reciprocal rank / mean reciprocal rank fields (`src/smriti/memory/eval.py:22-40`).
-- VERIFIED - The harness is invoked by calling `run_retrieval_eval(service, cases, now=...)`; it calls `service.retrieve_scoped_episodes(...)` for each case and returns in-memory results plus a summary (`src/smriti/memory/eval.py:42-69`).
+Stage 11 added summary episode memory:
 
-Relevant excerpt:
+- Summary windows contain 12 persisted messages.
+- Summary episodes use `episodes.kind = 'summary'`.
+- Summary episodes are embedded into `embeddings_768`.
+- Retrieval SQL and Python scoring were intentionally left unchanged.
+- Raw message episodes and summary episodes compete in the same retrieval pool.
 
-> `retrieved = await service.retrieve_scoped_episodes(`  
-> `user_id=case.user_id,`  
-> `scope_id=case.scope_id,`  
-> `query=case.query,`  
-> `top_k=case.top_k,`
+Manual Stage 11 runtime verification succeeded for summary episode creation:
 
-Source: `src/smriti/memory/eval.py:53-60`.
+- Conversation `e778fc27-54dd-42a3-8878-7cfacfb8ab55`.
+- Summary window `13..24` existed with `embedding_rows = 1`.
+- Summary window `25..36` existed with `embedding_rows = 1`.
+- UI-triggered automatic summary creation worked for `25..36`.
+- A previous timeout was caused by `qwen3:14b` exceeding 60 seconds; the local
+  mitigation was `SMRITI_OLLAMA_CHAT_TIMEOUT_SECONDS=180`.
 
-- VERIFIED - Precision@k, recall@k, and reciprocal rank are computed from retrieved episode IDs versus expected episode IDs (`src/smriti/memory/eval.py:79-106`).
-- VERIFIED - Summary metrics are total cases, hit rate@k, mean precision@k, mean recall@k, and mean reciprocal rank (`src/smriti/memory/eval.py:109-126`).
-- VERIFIED - `RetrievalEvalCase`, result types, and `run_retrieval_eval` are exported from the memory package (`src/smriti/memory/__init__.py:18-23`, `src/smriti/memory/__init__.py:90-104`).
-- VERIFIED - There is no project script entry for the eval harness; the only `[project.scripts]` entry is `migrate` (`pyproject.toml:30-31`).
-- VERIFIED - The Makefile exposes setup/start/stop/restart/logs/status targets and does not show an eval target (`Makefile:1-19`).
-- VERIFIED - Current eval test invocation is direct Python test code: `tests/test_memory_eval.py` imports `run_retrieval_eval`, creates cases inline, and awaits the helper (`tests/test_memory_eval.py:14-26`, `tests/test_memory_eval.py:110-131`).
-- VERIFIED - Current eval fixture data is synthetic: it creates messages named `eval memory {index}` and a wrong-scope message named `eval memory from the wrong scope` (`tests/test_memory_eval.py:71-87`).
-- VERIFIED - Current eval test uses `FakeEmbedder(dimensions=768)` when constructing the `MemoryService` (`tests/test_memory_eval.py:49-50`).
-- VERIFIED - Current eval test manufactures retrieval geometry by embedding `"eval query"` and updating seeded episode embeddings to that vector (`tests/test_memory_eval.py:89-100`, `tests/test_memory_eval.py:321-335`).
-- VERIFIED - Current eval test also directly sets scoring fields such as `created_at`, `last_accessed_at`, `importance`, and `access_count` (`tests/test_memory_eval.py:90-108`, `tests/test_memory_eval.py:295-318`).
-- VERIFIED - `FakeEmbedder` is documented as a deterministic, local-only embedder for tests and eval fixtures (`src/smriti/embeddings/fake.py:15-17`).
+Manual retrieval observation with a planted Tunde/Terrafold conversation showed
+that answer quality is not a reliable proxy for retrieval quality. Answers were
+mostly correct, but the retrieval panel often ranked the current user query at
+rank 1 with similarity `1.000`, recent recap questions crowded out original
+source memories, and embedded summary episodes were not obviously visible in the
+top 5 results. Stage 12 must therefore measure retrieved episodes directly, not
+grade assistant answers.
 
-Relevant excerpt:
+## Source Context From Inspection
 
-> `class FakeEmbedder:`  
-> `"""Deterministic, local-only embedder for tests and eval fixtures."""`
+These findings describe the current repository behavior that the future harness
+must account for. They are source context, not Stage 12 completion claims.
 
-Source: `src/smriti/embeddings/fake.py:15-17`.
+- The existing helper is `src/smriti/memory/eval.py`.
+- The current input model is `RetrievalEvalCase` with `name`, `user_id`,
+  `scope_id`, `query`, `expected_episode_ids`, and `top_k`.
+- The current helper calls `MemoryService.retrieve_scoped_episodes(...)` and
+  returns in-memory results and summary metrics.
+- Current metrics include hit@k, precision@k, recall@k, reciprocal rank, and
+  aggregate mean reciprocal rank.
+- Current tests use synthetic fixture data, `FakeEmbedder(dimensions=768)`, and
+  direct embedding/scoring-field manipulation to force deterministic ranking.
+- The live app wires `OllamaEmbedder` by default, using the same `Embedder`
+  protocol accepted by `MemoryService`.
+- `MemoryService` defaults the embedding model registry key to
+  `nomic-embed-text`.
+- The default migration registers active 768-dimensional `nomic-embed-text`
+  embeddings and stores vectors in `embeddings_768`.
+- Message episode creation, stored-message episode creation, summary episode
+  creation, and retrieval all use the injected embedder.
+- Retrieval first embeds the query, fetches a bounded similarity-first candidate
+  pool from SQL, and reranks that pool in Python.
+- Current Python-side scoring weights are:
+  - similarity: `0.55`
+  - recency: `0.20`
+  - access reinforcement: `0.10`
+  - importance: `0.10`
+  - frequency: `0.05`
+- Retrieval SQL filters by `scope_id` and `user_id`, joins `embeddings_768`, and
+  does not filter by episode kind.
+- Returned `ScoredEpisode` records include IDs, kind, optional message position,
+  optional summary range, score, similarity, and score components.
+- Retrieval currently mutates returned rows by updating `access_count` and
+  `last_accessed_at`.
+- The schema includes `eval_scenarios`, `eval_runs`, and `eval_run_results`, but
+  the current Python helper does not write to those tables.
+- No final hand-labeled corpus schema, runner CLI, Makefile eval target, or
+  committed baseline output pattern is established yet.
 
-### B. Real Embedder
+## Non-Scope
 
-- VERIFIED - The embedder boundary is an async `Embedder` protocol with `dimensions`, `embed_text`, and `embed_texts` (`src/smriti/embeddings/base.py:9-20`).
-- VERIFIED - `OllamaEmbedder` is the real local embedder; it defaults to model `nomic-embed-text`, base URL `http://127.0.0.1:11434`, optional dimensions, and `num_ctx=8192` (`src/smriti/embeddings/ollama.py:21-30`).
-- VERIFIED - `OllamaEmbedder.embed_text()` delegates to `embed_texts([text])`; `embed_texts()` posts `model`, `input`, and `options.num_ctx` to Ollama (`src/smriti/embeddings/ollama.py:44-67`).
-- VERIFIED - `OllamaEmbedder` enforces localhost-only HTTP base URLs and rejects non-localhost hostnames, credentials, query strings, and fragments (`src/smriti/embeddings/ollama.py:96-106`).
-- VERIFIED - The request URL is the configured localhost base path plus `/api/embed` (`src/smriti/embeddings/ollama.py:108-112`).
-- VERIFIED - The live FastAPI app wires `OllamaEmbedder` by default unless an embedder is injected, passing `ollama_embed_num_ctx` from settings (`src/smriti/api/app.py:34-55`).
-- VERIFIED - Runtime settings define local Ollama base URL, chat model, chat context, embedding context, and chat timeout fields (`src/smriti/config.py:26-30`).
-- VERIFIED - `.env.example` exposes `SMRITI_OLLAMA_BASE_URL`, `SMRITI_OLLAMA_CHAT_MODEL`, `SMRITI_OLLAMA_CHAT_NUM_CTX`, and `SMRITI_OLLAMA_EMBED_NUM_CTX` (`.env.example:9-13`).
-- VERIFIED - The project README lists Ollama as localhost-only at `127.0.0.1:11434` (`README.md:55-62`).
-- VERIFIED - The memory service stores the embedder as an injected dependency and defaults the embedding model registry key to `nomic-embed-text` (`src/smriti/memory/service.py:130-135`).
-- VERIFIED - The default database migration registers active 768-dimensional `nomic-embed-text` embeddings in `embedding_models` and stores vectors in `embeddings_768` (`src/smriti/db/migrations/001_init.sql:81-96`).
-- VERIFIED - The memory service resolves the active embedding model primary key by model ID, 768 dimensions, and `is_active = TRUE` (`src/smriti/memory/service.py:1513-1527`).
-- VERIFIED - The live message episode path calls `self.embedder.embed_text(request.content)`, validates the vector, inserts a `kind='message'` episode, and inserts into `embeddings_768` (`src/smriti/memory/service.py:500-574`).
-- VERIFIED - The separate stored-message episode path calls `self.embedder.embed_text(message.content)`, validates the vector, inserts a `kind='message'` episode, and inserts into `embeddings_768` (`src/smriti/memory/service.py:576-619`).
-- VERIFIED - The Stage 11 summary path calls `self.embedder.embed_text(summary_text)`, validates the vector, inserts a `kind='summary'` episode, and inserts into `embeddings_768` (`src/smriti/memory/service.py:621-680`, `src/smriti/memory/service.py:968-1049`).
-- VERIFIED - The live retrieval path embeds the query through the same injected embedder before SQL retrieval (`src/smriti/memory/service.py:694-711`).
-- ASSUMED - Making the existing harness use the real embedder looks mostly like service wiring because `run_retrieval_eval` receives a `MemoryService`, `MemoryService` receives any `Embedder`, and the live app already wires `OllamaEmbedder` through that same protocol (`src/smriti/memory/eval.py:42-60`, `src/smriti/memory/service.py:130-135`, `src/smriti/api/app.py:51-55`).
-- VERIFIED - The current eval test fixture is structurally tied to fake/synthetic behavior even if the harness function is not: it creates `FakeEmbedder(dimensions=768)` and overwrites stored embeddings with the query vector (`tests/test_memory_eval.py:49-50`, `tests/test_memory_eval.py:89-100`, `tests/test_memory_eval.py:321-335`).
+Stage 12 must not introduce:
 
-### C. Scoring / Ranking Weights
+- Hybrid retrieval.
+- Hierarchical retrieval.
+- Summary-first retrieval.
+- Parent-child summary expansion.
+- Kind-aware SQL retrieval filtering.
+- SQL candidate structure changes.
+- Frontend changes.
+- Answer-quality grading.
+- Production auto-tuning.
+- Schema or migration changes.
+- Application-code implementation as part of this documentation task.
 
-- VERIFIED - Retrieval weights live as module-level constants in `src/smriti/memory/service.py`: similarity `0.55`, recency `0.20`, access `0.10`, importance `0.10`, frequency `0.05` (`src/smriti/memory/service.py:55-67`).
+## Stage 12a - Retrieval Eval Harness Contract + Real Baseline Design
 
-Relevant excerpt:
+### Purpose
 
-> `SIMILARITY_WEIGHT = 0.55`  
-> `RECENCY_WEIGHT = 0.20`  
-> `ACCESS_WEIGHT = 0.10`  
-> `IMPORTANCE_WEIGHT = 0.10`  
-> `FREQUENCY_WEIGHT = 0.05`
+Stage 12a defines the measuring instrument and the real baseline format. It must
+evaluate current retrieval behavior against labeled cases without tuning weights
+or changing retrieval behavior.
 
-Source: `src/smriti/memory/service.py:61-65`.
+Stage 12a must answer:
 
-- VERIFIED - Retrieval first fetches a bounded similarity-first candidate pool from SQL, then reranks in Python (`src/smriti/memory/service.py:712-715`, `src/smriti/memory/service.py:724-775`).
-- VERIFIED - SQL converts pgvector cosine distance to similarity, orders the candidate pool by similarity descending, created time descending, and episode ID ascending, then applies `LIMIT` (`src/smriti/memory/service.py:741-759`).
-- VERIFIED - Final weighted score is computed in Python from similarity, recency score, access score, importance score, and frequency score (`src/smriti/memory/service.py:1681-1711`).
+- Which expected memory episodes were retrieved?
+- Whether the retrieved evidence came from raw source messages or summary
+  episodes.
+- Whether current-query self-retrieval distorted official metrics.
+- Whether recap questions or assistant answer echoes polluted the top results.
+- Which failures are retrieval failures rather than answer-generation failures.
 
-Relevant excerpt:
+### Labeled Eval Corpus Format
 
-> `score = (`  
-> `SIMILARITY_WEIGHT * similarity`  
-> `+ RECENCY_WEIGHT * recency_score`  
-> `+ ACCESS_WEIGHT * access_score`  
-> `+ IMPORTANCE_WEIGHT * importance_score`  
-> `+ FREQUENCY_WEIGHT * frequency_score`
+The Stage 12a corpus should be machine-readable and hand-reviewable. JSONL is the
+preferred initial format because one labeled example can be added, reviewed, and
+diffed independently. A single JSON document is also acceptable if it preserves
+the same fields and includes corpus metadata.
 
-Source: `src/smriti/memory/service.py:1705-1711`.
+Each corpus file should include:
 
-- VERIFIED - Final ordering uses score descending, then created time descending, then episode ID ascending (`src/smriti/memory/service.py:1768-1773`).
-- VERIFIED - The code comments call the candidate set an accepted Stage 5.2 heuristic and say lower-similarity episodes with high recency/importance may be missed until eval tuning improves it (`src/smriti/memory/service.py:712-715`).
-- VERIFIED - AGENTS.md describes the same numeric weights as "Starting weights" and says, "These are starting guesses. The eval harness should be used to tune them." (`AGENTS.md:257-277`).
-- VERIFIED - Stage 5 docs recommend module-level constants and say runtime configuration should wait until the eval harness can justify tuning (`docs/stages/stage-05-retrieval-and-eval.md:66-79`).
-- VERIFIED - Stage 5 docs also describe `candidate_limit = max(top_k * 5, 25)` as a "similarity-first candidate heuristic" that may miss some lower-similarity but high-recency/high-importance episodes until eval tuning improves candidate selection (`docs/stages/stage-05-retrieval-and-eval.md:80-85`).
-- VERIFIED - Stage 11 explicitly scoped out retrieval SQL changes and scoring/ranking changes (`docs/stages/stage-11-summary-episode-memory.md:384-408`).
+- `corpus_id`: stable corpus name, for example `terrafold-planted-facts-v1`.
+- `corpus_version`: monotonically increasing version string.
+- `fixture_strategy`: how the eval data is loaded or rebuilt.
+- `embedding_model`: expected embedding model, initially `nomic-embed-text`.
+- `notes`: optional reviewer notes that do not affect scoring.
+- `examples`: the labeled eval examples, or one example per JSONL line.
 
-### D. Retrieval Function(s) Under Test
+The corpus must be scoped. Every example must identify the intended `user_id` and
+`scope_id`, or identify a named fixture that deterministically resolves them.
+Cross-scope retrieval must not be part of the default Stage 12 corpus.
 
-- VERIFIED - The direct retrieval function under test is `MemoryService.retrieve_scoped_episodes` (`src/smriti/memory/service.py:694-703`).
-- VERIFIED - Its signature takes `user_id`, `scope_id`, `query`, `top_k`, and optional keyword-only `now` (`src/smriti/memory/service.py:694-702`).
-- VERIFIED - It returns `list[ScoredEpisode]` and rejects non-positive `top_k` before embedding (`src/smriti/memory/service.py:694-711`).
-- VERIFIED - Retrieval SQL selects episode ID, user ID, scope ID, conversation ID, kind, message ID, message position, range start/end, content, timestamps, importance, access count, embedding model ID, and similarity (`src/smriti/memory/service.py:724-759`).
-- VERIFIED - Retrieval filters by `episodes.scope_id = $1` and `conversations.user_id = $2`, with a conversation join requiring matching conversation and scope IDs (`src/smriti/memory/service.py:746-759`).
-- VERIFIED - Retrieval does not filter by episode kind; `episodes.kind` is selected, but no `kind` predicate appears in the WHERE clause (`src/smriti/memory/service.py:724-759`).
-- VERIFIED - Retrieval uses an `INNER JOIN embeddings_768` for the active embedding model and a `LEFT JOIN messages` for message metadata, so embedded summaries are eligible for retrieval without a message row (`src/smriti/memory/service.py:746-759`).
-- VERIFIED - Returned episodes are reranked by `_scored_episode_sort_key`, truncated to `top_k`, and then access metadata is updated for returned rows (`src/smriti/memory/service.py:768-785`).
-- VERIFIED - The returned `ScoredEpisode` model contains rank, IDs, kind, optional message and range fields, content, created time, importance/access metadata, embedding model ID, score components, and final score (`src/smriti/memory/models.py:174-197`).
-- VERIFIED - The HTTP retrieval endpoint delegates to `MemoryService.retrieve_scoped_episodes` and returns `ScoredEpisodeResponse` objects (`src/smriti/api/routes/retrieval.py:15-29`).
-- VERIFIED - The HTTP search body is `scope_id`, non-empty `query`, and `top_k`; the response model mirrors the scored episode fields without exposing vectors (`src/smriti/api/schemas.py:301-362`).
-- VERIFIED - Based on the current `RetrievalEvalCase`, one existing labeled eval example contains the query text, user ID, scope ID, expected episode IDs, and top_k (`src/smriti/memory/eval.py:12-20`).
-- VERIFIED - Based on the current test fixture, setup outside the eval case currently creates a user, scope, conversation, message episodes, expected episode IDs, and controlled embeddings/scoring fields (`tests/test_memory_eval.py:52-108`, `tests/test_memory_eval.py:226-335`).
-- UNKNOWN - The repo does not define a final hand-labeled eval example schema beyond `RetrievalEvalCase`. The existing input model is line-cited above; no separate corpus/schema file was identified during inspection.
+### Labeled Eval Example Contract
 
-### E. Eval Data
+Each labeled example should contain:
 
-- VERIFIED - The current eval data is created inline in `tests/test_memory_eval.py` by appending synthetic messages and constructing `RetrievalEvalCase` objects in test code (`tests/test_memory_eval.py:71-87`, `tests/test_memory_eval.py:110-128`).
-- VERIFIED - The synthetic data uses `FakeEmbedder`, then overwrites embeddings and scoring fields to force deterministic ranking (`tests/test_memory_eval.py:49-50`, `tests/test_memory_eval.py:89-108`, `tests/test_memory_eval.py:295-335`).
-- VERIFIED - The repository README describes the implemented eval capability as a "Minimal retrieval eval helper" and later lists "Expanded retrieval eval harness" as a next planned area (`README.md:11-31`, `README.md:347-351`).
-- VERIFIED - The database schema includes `eval_scenarios`, `eval_runs`, and `eval_run_results` tables (`src/smriti/db/migrations/001_init.sql:104-132`).
-- VERIFIED - DB tests assert the `eval_scenarios`, `eval_runs`, and `eval_run_results` tables exist, but the inspected eval helper does not insert into them (`tests/test_db.py:72-85`, `src/smriti/memory/eval.py:42-69`).
-- UNKNOWN - No hand-labeled retrieval corpus file was identified during read-only search. Absence has no file path/line range; the closest inspected data source is the inline synthetic fixture cited above.
-- ASSUMED - A plausible repo convention for a future real labeled set is not established by current code. The only explicit instruction-like convention says eval harness work belongs in `tests/eval/`, but current repo files use `src/smriti/memory/eval.py` and `tests/test_memory_eval.py` (`AGENTS.md:310-317`, `src/smriti/memory/eval.py:1-9`, `tests/test_memory_eval.py:1-26`).
+- `example_id`: stable ID unique within the corpus.
+- `scenario_id`: stable ID for the planted conversation or fixture scenario.
+- `query`: the retrieval query text.
+- `top_k`: requested retrieval depth.
+- `question_type`: a controlled label such as `direct_fact`, `constraint`,
+  `relationship`, `broad_recap`, `summary_seeking`, or `negative_control`.
+- `fact_ids`: planted fact IDs tested by the query.
+- `preferred_layer`: `raw`, `summary`, or `either`.
+- `raw_expected_episode_ids`: raw message source episodes that should satisfy
+  the query.
+- `summary_expected_episode_ids`: summary episodes that should satisfy the query.
+- `acceptable_episode_ids`: any episode IDs that should count as acceptable
+  supporting evidence even if they are not preferred.
+- `current_query_episode_ids`: persisted current-query episodes to exclude from
+  official scoring when present.
+- `episode_labels`: labels for source, summary, recap, echo, and distractor
+  episodes that may appear in retrieval results.
+- `notes`: optional human explanation of why the expected IDs are valid.
 
-### F. Baseline Recording
+Expected IDs should be episode IDs, not message IDs, because retrieval returns
+episodes. When a label originates from a message, the label may also record the
+message ID and message position for review.
 
-- VERIFIED - The schema has tables capable of recording eval scenarios, runs, and run result metrics (`src/smriti/db/migrations/001_init.sql:104-132`).
-- VERIFIED - The current Python eval helper returns results and summary in memory; it does not write eval run rows or files (`src/smriti/memory/eval.py:42-69`, `src/smriti/memory/eval.py:109-126`).
-- VERIFIED - The current eval test asserts `message_retrievals` stays empty after eval, so the eval helper does not record used-memory provenance (`tests/test_memory_eval.py:158-173`).
-- VERIFIED - The retrieval service path used by the eval helper updates `access_count` and `last_accessed_at` for retrieved episodes (`src/smriti/memory/service.py:776-783`).
-- VERIFIED - The eval test confirms that access metadata changes during eval: in-scope retrieved episodes get incremented access counts and `last_accessed_at`, while the wrong-scope episode remains unchanged (`tests/test_memory_eval.py:172-181`).
-- VERIFIED - No project script or Makefile target currently records a re-runnable retrieval baseline (`pyproject.toml:30-31`, `Makefile:1-19`).
-- UNKNOWN - No committed eval result file pattern was identified during read-only search. Absence has no file path/line range; the closest committed eval structures are the database tables and in-memory result dataclasses cited above.
-- ASSUMED - Based on existing repo conventions only, a re-runnable baseline has no established storage location today. The repo has stage docs under `docs/stages/`, eval DB tables in migrations, and no committed eval-results directory or file pattern in inspected files (`docs/stages/stage-05-retrieval-and-eval.md:1-13`, `src/smriti/db/migrations/001_init.sql:104-132`, `README.md:347-351`).
+### Episode Label Roles
 
-## 3. Conflicts / Scope Issues
+Stage 12a must distinguish the following roles:
 
-- VERIFIED - AGENTS.md says, "Eval harness lives in `tests/eval/` and runs on demand, not by default in CI," but the current helper implementation lives in `src/smriti/memory/eval.py` and its test lives at `tests/test_memory_eval.py` (`AGENTS.md:310-317`, `src/smriti/memory/eval.py:1-9`, `tests/test_memory_eval.py:1-26`).
-- VERIFIED - The current harness uses the real retrieval service path, and that path mutates episode access metadata for returned rows. If a later baseline pass requires no database mutation at all, the current path has a scope issue to resolve before design (`src/smriti/memory/service.py:776-783`, `tests/test_memory_eval.py:172-181`).
-- VERIFIED - Existing scoring weights are Python constants, but the SQL candidate pool is similarity-first and bounded before Python reranking. Tuning only the existing weights can stay outside SQL structure; changing candidate selection would touch a documented Stage 5 heuristic and Stage 11 non-goal area (`src/smriti/memory/service.py:712-715`, `src/smriti/memory/service.py:724-775`, `docs/stages/stage-11-summary-episode-memory.md:384-408`).
-- UNKNOWN - No hand-labeled corpus or committed baseline result pattern was identified. This is a findings limitation, not a design proposal.
+- `raw_source`: Layer 1 raw message source episodes. These are
+  `episodes.kind = 'message'` records that contain the original planted fact or
+  the original user/assistant turn that established it.
+- `summary_source`: Layer 2 summary episodes. These are
+  `episodes.kind = 'summary'` records whose `range_start` and `range_end`
+  include the relevant planted fact.
+- `recap_question`: user question episodes that ask about a previously planted
+  fact but are not the original source of the fact.
+- `assistant_answer_echo`: assistant answer episodes that repeat or restate the
+  planted fact after retrieval.
+- `distractor`: in-scope episodes that are irrelevant, partially overlapping, or
+  semantically tempting but should not count as supporting evidence.
+- `current_query`: a persisted copy of the active user query when it appears as
+  a retrievable episode.
+
+The label should also record:
+
+- `episode_kind`: `message` or `summary`.
+- `layer`: `raw`, `summary`, or `diagnostic`.
+- `fact_ids`: planted facts supported or mentioned by the episode.
+- `message_position`: for message episodes when available.
+- `range_start` and `range_end`: for summary episodes when available.
+- `is_expected`: whether the episode belongs to any expected set.
+- `is_acceptable`: whether the episode may count for acceptable-hit metrics.
+
+### Expected Raw vs Summary Retrieval
+
+The corpus must allow raw and summary expectations to be represented separately.
+
+Direct fact questions should usually prefer `raw` because the ideal evidence is
+the original memory that established the fact. Broad recap or summary-seeking
+questions should usually prefer `summary` because the ideal evidence may be a
+compressed episode covering several facts. Some examples may use `either` when
+both raw and summary evidence are equally valid.
+
+The scoring contract must treat these sets distinctly:
+
+- `raw_expected_episode_ids` drive `raw_hit@k`.
+- `summary_expected_episode_ids` drive `summary_hit@k`.
+- `acceptable_episode_ids` drive `acceptable_hit@k`.
+- `preferred_layer` determines whether layer-specific misses should be reported
+  as failures even when an acceptable episode was retrieved.
+
+### Current-Query Self-Retrieval
+
+Current-query self-retrieval must be excluded from official scoring and recorded
+as a diagnostic.
+
+If a retrieved episode is labeled `current_query`, Stage 12a must:
+
+- Preserve its original rank, score, similarity, and score components in output.
+- Mark `is_current_query = true`.
+- Exclude it from hit@k, MRR, precision@k, recall@k, raw_hit@k,
+  summary_hit@k, and acceptable_hit@k.
+- Recompute official ranks after exclusion so official metrics are based on the
+  evidence-bearing result order.
+- Record `self_query_hit = true`, `self_query_rank`, and
+  `self_query_similarity` as diagnostics.
+
+The harness must not change production retrieval behavior to solve this artifact
+in Stage 12a.
+
+### Recap-Question Pollution
+
+Recap-question pollution must be explicitly labeled and measured. A recap
+question can be semantically similar to the query while still being poor evidence
+for the original fact.
+
+Stage 12a must:
+
+- Label recap question episodes as `recap_question`.
+- Label answer echo episodes separately as `assistant_answer_echo`.
+- Exclude only `current_query` episodes from official scoring by default.
+- Count recap-question appearances in the official top-k after current-query
+  exclusion.
+- Report `recap_pollution@k` for each case and in aggregate.
+
+Assistant answer echoes should be preserved in output with their own label role.
+They may count as acceptable only when the corpus author explicitly includes
+them in `acceptable_episode_ids`; otherwise they are diagnostics or distractors.
+
+### Metrics
+
+Stage 12a must report these metrics per case and in aggregate:
+
+- `hit@k`: whether any preferred expected episode appears in the official top-k.
+- `mrr` / `reciprocal_rank`: reciprocal rank of the first preferred expected
+  episode in the official result order.
+- `precision@k`: preferred expected hits divided by official retrieved count up
+  to k.
+- `recall@k`: preferred expected hits divided by preferred expected count.
+- `raw_hit@k`: whether any `raw_expected_episode_ids` appear in the official
+  top-k.
+- `summary_hit@k`: whether any `summary_expected_episode_ids` appear in the
+  official top-k.
+- `acceptable_hit@k`: whether any `acceptable_episode_ids` appear in the
+  official top-k.
+- `kind_mix@k`: counts and ratios of `message` versus `summary` episodes in the
+  official top-k.
+- `self_query_hit_rate`: aggregate rate at which current-query episodes appeared
+  in retrieved results before exclusion.
+- `recap_pollution@k`: count and ratio of `recap_question` episodes in the
+  official top-k.
+
+For examples with `preferred_layer = raw`, preferred expected episodes are the
+raw expected IDs. For `preferred_layer = summary`, preferred expected episodes
+are the summary expected IDs. For `preferred_layer = either`, preferred expected
+episodes are the union of raw and summary expected IDs.
+
+### Baseline Output Proposal
+
+Stage 12a must produce both machine-readable output and a human-readable report.
+
+Machine-readable output should be JSON or JSONL and include run metadata:
+
+- `run_id`.
+- `corpus_id` and `corpus_version`.
+- Git commit SHA and branch when available.
+- Runtime timestamp.
+- Database or fixture identifier with credentials redacted.
+- Embedding model and dimensions.
+- Retrieval `top_k`.
+- Scoring version and Python-side scoring weights.
+- Candidate-pool constants such as candidate multiplier and minimum candidates.
+- Isolation strategy used for the run.
+
+Each per-example result should include:
+
+- Example identity and labels: `example_id`, `scenario_id`, `question_type`,
+  `fact_ids`, and `preferred_layer`.
+- Expected sets: raw expected IDs, summary expected IDs, acceptable IDs, and
+  current-query IDs.
+- Official metrics and diagnostics.
+- Retrieved episodes in original order and official order.
+- For each retrieved episode: episode ID, kind, original rank, official rank,
+  conversation ID, scope ID, message ID, message position, range start, range
+  end, score, similarity, recency score, access score, importance score,
+  frequency score, expected flags, acceptable flag, current-query flag, and
+  label roles.
+
+The human-readable report should include:
+
+- Aggregate metric table.
+- Metric table grouped by `question_type`.
+- Metric table grouped by `preferred_layer`.
+- Top failure cases with expected IDs and retrieved IDs.
+- Cases with current-query self-retrieval.
+- Cases with high recap pollution.
+- Kind mix summary showing how often summary episodes appear in top-k.
+- Notes about any fixture or runtime anomaly.
+
+### Avoiding Misleading Mutation
+
+Current retrieval mutates `access_count` and `last_accessed_at` for returned
+episodes. Stage 12a must avoid baselines that change as a side effect of earlier
+eval cases.
+
+The official baseline must declare and use one explicit isolation strategy:
+
+- Preferred: disposable eval database rebuilt from a fixture before every run.
+- Acceptable: disposable eval scope and conversations rebuilt before every run.
+- Acceptable for narrow debugging: snapshot and restore access metadata for all
+  fixture episodes before each case or before each run.
+
+The isolation strategy must not require retrieval SQL changes. If the harness
+uses the production retrieval service, it may accept the mutation only inside
+disposable or resettable fixture state.
+
+### Stage 12a Acceptance Criteria
+
+Stage 12a is acceptable when:
+
+- A labeled corpus contract exists and can represent raw source episodes,
+  summary source episodes, recap questions, assistant answer echoes, distractors,
+  and current-query episodes.
+- Expected raw IDs, expected summary IDs, acceptable IDs, preferred layer,
+  question type, and fact IDs are represented per example.
+- Official metrics exclude current-query self-retrieval and diagnostics record
+  the artifact.
+- Recap-question pollution is labeled and reported.
+- Baseline output includes retrieved episode IDs, kind, rank, score, similarity,
+  score components, expected flags, and label roles.
+- The baseline run uses an explicit disposable or resettable isolation strategy.
+- The baseline measures retrieval quality only, not assistant answer quality.
+- Retrieval behavior, retrieval SQL, schema, config, frontend, and scoring
+  weights remain unchanged during Stage 12a.
+
+## Stage 12b - Baseline Analysis + Controlled Weight Experiment Design
+
+### Purpose
+
+Stage 12b analyzes Stage 12a baseline failures and defines controlled
+experiments for existing Python-side weights only. Stage 12b must not begin until
+the Stage 12a baseline exists.
+
+Stage 12b is still retrieval-eval work. It must not introduce hybrid retrieval,
+hierarchical retrieval, summary-first retrieval, kind-aware SQL filtering, or SQL
+candidate structure changes.
+
+### Failure Classes
+
+Stage 12b analysis must assign failed or suspicious cases to one or more failure
+classes:
+
+- `source_fact_not_in_candidate_pool`: the labeled source episode does not enter
+  the bounded similarity-first candidate pool.
+- `source_fact_reranked_too_low`: the labeled source episode is available to
+  Python reranking but falls below the requested top-k.
+- `summary_exists_but_does_not_rank`: a relevant summary episode exists and is
+  embedded but does not appear in top-k.
+- `recap_questions_outrank_sources`: recap question episodes rank above raw or
+  summary source evidence.
+- `current_query_self_retrieval_artifact`: the active query episode appears in
+  retrieved results and would distort official metrics without exclusion.
+- `direct_fact_prefers_non_raw`: a direct fact question retrieves acceptable
+  non-raw evidence while missing the preferred raw source.
+- `broad_question_misses_summary`: a broad or summary-seeking question misses
+  relevant summary episodes.
+- `distractor_outranks_expected`: labeled distractors outrank preferred expected
+  evidence.
+
+If candidate-pool visibility is needed for classification, the diagnostic must
+mirror the current SQL candidate behavior without changing production retrieval
+SQL. Any diagnostic candidate-pool query must be clearly marked as eval-only.
+
+### Controlled Weight Experiments
+
+Stage 12b experiments may vary only the existing Python-side scoring weights:
+
+- similarity
+- recency
+- access reinforcement
+- importance
+- frequency
+
+The baseline weight profile is:
+
+- similarity: `0.55`
+- recency: `0.20`
+- access reinforcement: `0.10`
+- importance: `0.10`
+- frequency: `0.05`
+
+Each experiment must declare:
+
+- `weight_profile_id`.
+- Full numeric weight values.
+- Whether weights are normalized and how.
+- Expected improvement hypothesis.
+- Failure classes the profile is intended to address.
+- Baseline run ID used for comparison.
+- Corpus version and fixture isolation strategy.
+
+Experiments must not:
+
+- Change retrieval SQL.
+- Change SQL candidate ordering or limit.
+- Add hybrid retrieval.
+- Add hierarchical retrieval.
+- Add summary-first retrieval.
+- Add kind-aware SQL filtering.
+- Change schema or migrations.
+- Change frontend behavior.
+- Tune weights automatically in production.
+
+### Before/After Comparison Format
+
+Every Stage 12b experiment must compare against the Stage 12a baseline using the
+same corpus version and equivalent fixture state.
+
+The comparison output should include:
+
+- Baseline run ID and experiment run ID.
+- Baseline and experiment weight profiles.
+- Aggregate metric deltas.
+- Metric deltas by `question_type`.
+- Metric deltas by `preferred_layer`.
+- Raw-hit and summary-hit deltas.
+- Acceptable-hit deltas.
+- Kind-mix deltas.
+- Self-query diagnostics, expected to remain diagnostic rather than optimized.
+- Recap-pollution deltas.
+- Per-case rank movement for expected raw and summary episodes.
+- New regressions where a previously passing case fails.
+- Newly passing cases with their assigned failure classes.
+
+The human-readable comparison should end with a recommendation to adopt, reject,
+or continue investigating the tested weight profile. Adoption must be justified
+by retrieval metrics, not answer quality.
+
+### Stage 12b Acceptance Criteria
+
+Stage 12b is acceptable when:
+
+- A Stage 12a baseline exists for the same corpus version.
+- Failed and suspicious cases are assigned to documented failure classes.
+- Controlled experiments vary only existing Python-side scoring weights.
+- Before/after output shows aggregate and per-case deltas.
+- Regressions are visible and reviewed.
+- Direct fact cases can be evaluated separately from broad summary-seeking cases.
+- Raw and summary retrieval quality are reported separately.
+- No retrieval SQL, schema, migration, frontend, hybrid retrieval, hierarchical
+  retrieval, or production auto-tuning changes are introduced.
+
+## Eval Corpus Proposal
+
+The first real corpus should be based on the Tunde/Terrafold planted-fact
+conversation because it already exposed the retrieval-quality questions Stage 12
+needs to answer.
+
+Planted facts:
+
+- F1: studio name is Terrafold, rejected alternative Kilnhouse.
+- F2: landlord is Mr. Obafemi; lease signing is Friday, July 31, in person.
+- F3: kiln budget hard cap is `$3,650`.
+- F4: severe latex allergy; all gloves must be nitrile.
+- F5: cousin Dele is silent partner handling bookkeeping.
+- F6: class size is capped at 9 because there are exactly 9 pottery wheels.
+
+The corpus should include at least:
+
+- Direct fact questions for each planted fact.
+- Broad recap questions that should make summary episodes competitive.
+- Distractor questions that are semantically close but unsupported.
+- Cases where raw source evidence is preferred.
+- Cases where summary source evidence is preferred.
+- Cases where raw or summary evidence is acceptable.
+- Cases where recap questions and assistant answer echoes are labeled but should
+  not silently inflate quality metrics.
+
+The corpus should preserve enough fixture metadata to map planted facts to
+episode IDs after rebuilding a disposable eval database or scope.
+
+## Metrics Proposal Summary
+
+The official Stage 12 metrics are:
+
+- `hit@k`
+- `mrr` / `reciprocal_rank`
+- `precision@k`
+- `recall@k`
+- `raw_hit@k`
+- `summary_hit@k`
+- `acceptable_hit@k`
+- `kind_mix@k`
+- `self_query_hit_rate`
+- `recap_pollution@k`
+
+The reporting layer may add supporting diagnostics, but these metrics are the
+minimum contract for Stage 12a and the required comparison set for Stage 12b.
+
+## Implementation Sequencing
+
+No implementation is performed by this document. Future implementation should
+proceed in this order:
+
+1. Finalize the labeled corpus schema and fixture isolation strategy.
+2. Add or adapt an on-demand eval runner that uses the existing memory service
+   retrieval path.
+3. Add corpus loading and label validation.
+4. Add current-query exclusion for official scoring while preserving diagnostics.
+5. Add recap-pollution and kind-mix reporting.
+6. Add JSON/JSONL baseline output and a human-readable summary report.
+7. Run the real Stage 12a baseline on disposable or resettable eval state.
+8. Analyze Stage 12a failures into the Stage 12b failure classes.
+9. Run controlled Python-side weight experiments only after the baseline exists.
+10. Compare before/after results and decide whether any weight profile is worth
+    adopting in a later implementation stage.
+
+## Completion Boundary For This Draft
+
+This document is complete when it functions as the Stage 12 contract: it defines
+what the harness must measure, how labeled retrieval cases should be represented,
+how baseline output should look, how mutation must be isolated, what is out of
+scope, and how Stage 12b may analyze and compare controlled weight experiments.
+
+## Stage 12 Findings and Closeout
+
+Stage 12 is complete through Stage 12a, Stage 12b-1, and Stage 12b-2. It added a
+labeled Terrafold retrieval corpus, app-realistic and clean-memory eval modes,
+fake and Ollama baseline runs, official current-query exclusion, raw/summary/
+acceptable hit metrics, recap-pollution and kind-mix metrics, diagnostic top-k
+visibility, failure classes, and offline diagnostic weight-sweep tooling.
+
+### Baseline Findings
+
+- In `app_realistic` mode, current-query self-retrieval is systematic:
+  `self_query_hit_rate = 1.0000`, with current-query episodes ranking first at
+  similarity `1.0000`.
+- This is an app timing artifact, not a normal scoring-weight problem.
+- `clean_memory` is the better mode for evaluating memory retrieval quality
+  without current-query contamination.
+- Direct fact retrieval is mostly strong for cases such as the Terrafold studio
+  name, the 9-wheel class-size limit, and several raw source facts.
+- Broad or summary-oriented questions remain weak, especially broad operational
+  constraints and opening/classes questions. Relevant summaries appear, but
+  usually below official top-k.
+
+### Diagnostic-Top-K Findings
+
+Stage 12b-1 showed that positive expected evidence was not absent from the
+diagnostic candidate view: all positive expected evidence appeared somewhere
+within diagnostic top-25 in the latest diagnostic runs. For this corpus, the
+observed failures are therefore mostly shallow top-k ranking and ordering
+problems rather than hard candidate-pool misses.
+
+The diagnostic labels also confirmed that recap questions and assistant answer
+echoes can appear above the first acceptable evidence. These episodes should
+remain visible in reports because they explain noisy rankings, but Stage 12 did
+not change retrieval behavior to suppress them.
+
+### Weight-Sweep Findings
+
+Stage 12b-2 replayed fixed Python-side scoring profiles from emitted diagnostic
+records. On the latest Ollama diagnostic records, the fixed profiles produced
+identical official top-k metrics. This supports the diagnostic suspicion that
+the non-similarity score components were too flat in these cases to move failing
+evidence upward.
+
+The result is not a universal claim that weight tuning cannot help retrieval. It
+means that changing only the current five Python-side weights was insufficient
+for this corpus and these latest Ollama diagnostic records.
+
+### Explicit Non-Changes
+
+Stage 12 does not adopt production weight changes. It does not change retrieval
+SQL, schema or migrations, production scoring constants, frontend behavior,
+candidate-pool structure, or retrieval architecture. It also does not introduce
+hybrid retrieval, hierarchical retrieval, summary-first retrieval, parent-child
+summary expansion, answer-quality grading, or production auto-tuning.
+
+### Recommended Stage 13 Follow-Up Areas
+
+- App-flow or timing fixes for current-query self-retrieval.
+- Role-aware handling of recap questions and assistant answer echoes.
+- Hybrid lexical plus vector retrieval for exact names and relationships such
+  as Dele/bookkeeping.
+- Summary-aware or hierarchical retrieval for broad recap and summary-seeking
+  questions.
+
+### Final Status
+
+Stage 12 successfully measured retrieval behavior and produced evidence about
+where the current retrieval path struggles. Retrieval is not fixed by Stage 12,
+and Stage 12 should close without production behavior changes. The next work
+belongs in Stage 13 retrieval architecture and app-flow improvements.
