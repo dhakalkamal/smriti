@@ -12,12 +12,14 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from scripts.run_retrieval_baseline import main as run_retrieval_baseline
+from scripts.run_retrieval_weight_sweep import main as run_retrieval_weight_sweep
 from smriti.config import Settings
 from smriti.db.migrate import apply_migrations
 from smriti.memory import EpisodeKind, InvalidRetrievalRequestError, ScoredEpisode
 from smriti.memory.eval import (
     EpisodeLabelRole,
     PreferredLayer,
+    QuestionType,
     Stage12Corpus,
     Stage12CorpusCase,
     Stage12CorpusEpisodeLabel,
@@ -25,7 +27,13 @@ from smriti.memory.eval import (
     Stage12ExpectedRefs,
     Stage12ResolvedEpisodeLabel,
     Stage12ResolvedEvalCase,
+    Stage12WeightProfile,
+    replay_stage12_weight_profile_case,
+    run_stage12_weight_sweep,
     score_stage12_retrieval_case,
+    score_stage12_weight_profile_record,
+    stage12_case_result_from_dict,
+    stage12_case_result_to_dict,
     validate_stage12_corpus,
 )
 
@@ -330,6 +338,228 @@ def test_stage12_failure_class_negative_control() -> None:
     assert result.diagnostics.failure_class == ("negative_control",)
 
 
+def test_stage12_weight_profile_score_recomputation() -> None:
+    episode_id = UUID("00000000-0000-4000-8000-000000000341")
+    case = _case(
+        raw=(episode_id,),
+        labels=(_label(episode_id, "raw_source", is_expected=True),),
+    )
+    result = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(
+                episode_id,
+                rank=1,
+                similarity=0.40,
+                recency_score=0.20,
+                access_score=0.10,
+                importance_score=0.30,
+                frequency_score=0.50,
+            ),
+        ),
+    )
+    profile = Stage12WeightProfile(
+        name="custom",
+        similarity=0.50,
+        recency=0.20,
+        access=0.10,
+        importance=0.15,
+        frequency=0.05,
+    )
+
+    assert score_stage12_weight_profile_record(result.retrieved[0], profile) == pytest.approx(
+        0.50 * 0.40 + 0.20 * 0.20 + 0.10 * 0.10 + 0.15 * 0.30 + 0.05 * 0.50
+    )
+
+
+def test_stage12_weight_profile_replay_sorts_and_preserves_current_query_exclusion() -> None:
+    current_id = UUID("00000000-0000-4000-8000-000000000351")
+    expected_id = UUID("00000000-0000-4000-8000-000000000352")
+    other_id = UUID("00000000-0000-4000-8000-000000000353")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        current_query=(current_id,),
+        top_k=1,
+        labels=(
+            _label(current_id, "current_query"),
+            _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+        ),
+    )
+    baseline = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(current_id, rank=1, similarity=1.0, importance_score=0.90),
+            _episode(other_id, rank=2, similarity=0.9, importance_score=0.10),
+            _episode(expected_id, rank=3, similarity=0.8, importance_score=0.80),
+        ),
+        timing_mode="app_realistic",
+        diagnostic_top_k=3,
+    )
+    profile = Stage12WeightProfile(
+        name="importance_only",
+        similarity=0.0,
+        recency=0.0,
+        access=0.0,
+        importance=1.0,
+        frequency=0.0,
+    )
+
+    replayed = replay_stage12_weight_profile_case(baseline, profile)
+
+    replayed_rank_tuples = [
+        (record.episode_id, record.rank, record.official_rank) for record in replayed.retrieved
+    ]
+    assert replayed_rank_tuples == [
+        (current_id, 1, None),
+        (expected_id, 2, 1),
+        (other_id, 3, 2),
+    ]
+    assert replayed.metrics.acceptable_hit_at_k is True
+    assert replayed.metrics.reciprocal_rank == pytest.approx(1.0)
+    assert replayed.metrics.self_query_hit is True
+
+
+def test_stage12_weight_sweep_detects_regressions_and_keeps_negative_control() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-000000000361")
+    distractor_id = UUID("00000000-0000-4000-8000-000000000362")
+    direct_fact = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+        ),
+        (
+            _episode(expected_id, rank=1, similarity=1.0, recency_score=0.0),
+            _episode(distractor_id, rank=2, similarity=0.1, recency_score=1.0),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+    negative_control = score_stage12_retrieval_case(
+        _case(top_k=1, question_type="negative_control"),
+        (_episode(distractor_id, rank=1, similarity=0.1, recency_score=1.0),),
+        timing_mode="clean_memory",
+        diagnostic_top_k=1,
+    )
+    payload = run_stage12_weight_sweep(
+        input_metadata={
+            "run_id": "stage12-synthetic",
+            "timing_mode": "clean_memory",
+            "embedder_mode": "ollama",
+            "embedding_model": "nomic-embed-text",
+        },
+        cases=(direct_fact, negative_control),
+        profiles=(
+            Stage12WeightProfile(
+                name="baseline",
+                similarity=0.55,
+                recency=0.20,
+                access=0.10,
+                importance=0.10,
+                frequency=0.05,
+            ),
+            Stage12WeightProfile(
+                name="recency_bad",
+                similarity=0.0,
+                recency=1.0,
+                access=0.0,
+                importance=0.0,
+                frequency=0.0,
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    regression_gates = cast(dict[str, object], payload["regression_gates"])
+    bad_gates = cast(dict[str, object], regression_gates["recency_bad"])
+    aggregate = cast(dict[str, object], payload["aggregate_metrics_by_profile"])
+    bad_aggregate = cast(dict[str, object], aggregate["recency_bad"])
+
+    assert "direct_fact_regression" in bad_gates["failed_gates"]
+    assert "raw_hit_not_dropped" in bad_gates["failed_gates"]
+    assert bad_aggregate["negative_control_no_hit_retained"] is True
+    assert cast(dict[str, object], payload["recommendation"])["decision"] == "no_change_recommended"
+
+
+def test_stage12_weight_sweep_rejects_missing_score_components() -> None:
+    episode_id = UUID("00000000-0000-4000-8000-000000000371")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(episode_id,),
+            labels=(_label(episode_id, "raw_source", is_expected=True),),
+        ),
+        (_episode(episode_id, rank=1),),
+    )
+    record = stage12_case_result_to_dict(result)
+    retrieved = cast(list[dict[str, object]], record["retrieved"])
+    score_components = cast(dict[str, object], retrieved[0]["score_components"])
+    del score_components["recency"]
+
+    with pytest.raises(InvalidRetrievalRequestError, match="missing score component: recency"):
+        stage12_case_result_from_dict(record)
+
+
+def test_stage12_weight_sweep_runner_smoke_writes_json_and_markdown(tmp_path: Path) -> None:
+    episode_id = UUID("00000000-0000-4000-8000-000000000381")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(episode_id,),
+            acceptable=(episode_id,),
+            labels=(_label(episode_id, "raw_source", is_expected=True, is_acceptable=True),),
+        ),
+        (_episode(episode_id, rank=1),),
+        timing_mode="clean_memory",
+    )
+    input_run = tmp_path / "input-run"
+    input_run.mkdir()
+    (input_run / "run.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "run_id": "stage12-synthetic",
+                    "timing_mode": "clean_memory",
+                    "embedder_mode": "fake",
+                    "embedding_model": "nomic-embed-text",
+                    "git_branch": "stage-12-retrieval-eval-harness",
+                    "git_sha": "synthetic",
+                },
+                "aggregate_metrics": {},
+                "cases": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_run / "cases.jsonl").write_text(
+        json.dumps(stage12_case_result_to_dict(result), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = run_retrieval_weight_sweep(
+        [
+            "--input-run",
+            str(input_run),
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--report-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+
+    assert exit_code == 0
+    weight_sweep_path = tmp_path / "runs" / "stage12-synthetic" / "weight_sweep.json"
+    report_path = tmp_path / "results" / "stage12-synthetic-weight-sweep.md"
+    assert weight_sweep_path.exists()
+    assert report_path.exists()
+    payload = json.loads(weight_sweep_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["input_run_id"] == "stage12-synthetic"
+    assert payload["metadata"]["profile_definitions"][0]["name"] == "baseline"
+    assert "Stage 12b-2 Weight Sweep" in report_path.read_text(encoding="utf-8")
+
+
 def test_stage12_corpus_validation_rejects_unknown_refs_and_roles() -> None:
     valid_label = Stage12CorpusEpisodeLabel(
         semantic_ref="known",
@@ -440,6 +670,8 @@ def _case(
     acceptable: tuple[UUID, ...] = (),
     current_query: tuple[UUID, ...] = (),
     preferred_layer: str = "raw",
+    question_type: str = "direct_fact",
+    top_k: int = 5,
     labels: tuple[Stage12ResolvedEpisodeLabel, ...] = (),
 ) -> Stage12ResolvedEvalCase:
     return Stage12ResolvedEvalCase(
@@ -448,8 +680,8 @@ def _case(
         user_id=USER_ID,
         scope_id=SCOPE_ID,
         query="query",
-        top_k=5,
-        question_type="direct_fact",
+        top_k=top_k,
+        question_type=cast(QuestionType, question_type),
         fact_ids=("F1",),
         preferred_layer=cast(PreferredLayer, preferred_layer),
         expected_ids=Stage12ExpectedIds(
@@ -488,6 +720,10 @@ def _episode(
     rank: int,
     kind: str = "message",
     similarity: float = 0.75,
+    recency_score: float = 0.0,
+    access_score: float = 0.0,
+    importance_score: float = 0.0,
+    frequency_score: float = 0.0,
 ) -> ScoredEpisode:
     return ScoredEpisode(
         result_rank=rank,
@@ -507,10 +743,10 @@ def _episode(
         last_accessed_at=None,
         embedding_model_id=1,
         similarity=similarity,
-        recency_score=0.0,
-        access_score=0.0,
-        importance_score=0.0,
-        frequency_score=0.0,
+        recency_score=recency_score,
+        access_score=access_score,
+        importance_score=importance_score,
+        frequency_score=frequency_score,
         score=similarity,
     )
 
