@@ -203,6 +203,133 @@ def test_stage12_kind_mix_counts_official_message_and_summary_results() -> None:
     assert result.metrics.kind_mix_at_k.summary_ratio == pytest.approx(0.5)
 
 
+def test_stage12_diagnostic_top_k_finds_expected_below_official_window() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-000000000261")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+    retrieved = tuple(
+        _episode(UUID(f"00000000-0000-4000-8000-00000000027{rank}"), rank=rank)
+        for rank in range(1, 6)
+    ) + (_episode(expected_id, rank=6),)
+
+    result = score_stage12_retrieval_case(case, retrieved, diagnostic_top_k=6)
+
+    assert result.metrics.acceptable_hit_at_k is False
+    assert result.diagnostics.diagnostic_top_k == 6
+    assert result.diagnostics.acceptable_in_diagnostic_top_k is True
+    assert result.diagnostics.first_acceptable_diagnostic_rank == 6
+    assert "rerank_below_official_k" in result.diagnostics.failure_class
+    assert "raw_visible_but_low" in result.diagnostics.failure_class
+
+
+def test_stage12_diagnostic_top_k_defaults_to_case_top_k() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-000000000281")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+    retrieved = tuple(
+        _episode(UUID(f"00000000-0000-4000-8000-00000000029{rank}"), rank=rank)
+        for rank in range(1, 6)
+    ) + (_episode(expected_id, rank=6),)
+
+    result = score_stage12_retrieval_case(case, retrieved)
+
+    assert len(result.retrieved) == case.top_k
+    assert result.diagnostics.diagnostic_top_k == case.top_k
+    assert result.diagnostics.acceptable_in_diagnostic_top_k is False
+    assert result.diagnostics.failure_class == ("absent_from_diagnostic_top_k",)
+
+
+def test_stage12_diagnostic_ranks_exclude_current_query_in_app_realistic() -> None:
+    current_id = UUID("00000000-0000-4000-8000-000000000301")
+    expected_id = UUID("00000000-0000-4000-8000-000000000302")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        current_query=(current_id,),
+        labels=(
+            _label(current_id, "current_query"),
+            _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+        ),
+    )
+    retrieved = (
+        _episode(current_id, rank=1, similarity=1.0),
+        _episode(UUID("00000000-0000-4000-8000-000000000303"), rank=2),
+        _episode(UUID("00000000-0000-4000-8000-000000000304"), rank=3),
+        _episode(UUID("00000000-0000-4000-8000-000000000305"), rank=4),
+        _episode(UUID("00000000-0000-4000-8000-000000000306"), rank=5),
+        _episode(expected_id, rank=6),
+    )
+
+    result = score_stage12_retrieval_case(
+        case,
+        retrieved,
+        timing_mode="app_realistic",
+        diagnostic_top_k=6,
+    )
+
+    assert result.metrics.acceptable_hit_at_k is False
+    assert result.metrics.self_query_hit is True
+    assert result.diagnostics.first_acceptable_diagnostic_rank == 5
+    assert "self_query_artifact" in result.diagnostics.failure_class
+    assert "hit_at_official_k" in result.diagnostics.failure_class
+
+
+def test_stage12_failure_class_absent_from_diagnostic_top_k() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-000000000311")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+
+    result = score_stage12_retrieval_case(
+        case,
+        (_episode(UUID("00000000-0000-4000-8000-000000000312"), rank=1),),
+        diagnostic_top_k=6,
+    )
+
+    assert result.diagnostics.acceptable_in_diagnostic_top_k is False
+    assert result.diagnostics.failure_class == ("absent_from_diagnostic_top_k",)
+
+
+def test_stage12_failure_class_recap_or_echo_pollution() -> None:
+    echo_id = UUID("00000000-0000-4000-8000-000000000321")
+    expected_id = UUID("00000000-0000-4000-8000-000000000322")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        labels=(
+            _label(echo_id, "assistant_answer_echo"),
+            _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+        ),
+    )
+
+    result = score_stage12_retrieval_case(
+        case,
+        (_episode(echo_id, rank=1), _episode(expected_id, rank=2)),
+    )
+
+    assert result.metrics.acceptable_hit_at_k is True
+    assert "hit_at_official_k" in result.diagnostics.failure_class
+    assert "recap_or_echo_pollution" in result.diagnostics.failure_class
+
+
+def test_stage12_failure_class_negative_control() -> None:
+    result = score_stage12_retrieval_case(
+        _case(),
+        (_episode(UUID("00000000-0000-4000-8000-000000000331"), rank=1),),
+    )
+
+    assert result.diagnostics.acceptable_in_diagnostic_top_k is False
+    assert result.diagnostics.failure_class == ("negative_control",)
+
+
 def test_stage12_corpus_validation_rejects_unknown_refs_and_roles() -> None:
     valid_label = Stage12CorpusEpisodeLabel(
         semantic_ref="known",
@@ -284,6 +411,8 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
                 str(tmp_path),
                 "--run-id",
                 "stage12-smoke",
+                "--diagnostic-top-k",
+                "25",
             ]
         )
 
@@ -297,8 +426,12 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
     payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert payload["metadata"]["timing_mode"] == "app_realistic"
     assert payload["metadata"]["embedder_mode"] == "fake"
+    assert payload["metadata"]["diagnostic_top_k"] == 25
     assert len(payload["cases"]) == 9
+    assert payload["cases"][0]["diagnostic_top_k"] == 25
+    assert "failure_class" in payload["cases"][0]
     assert "Stage 12a Retrieval Baseline" in report_path.read_text(encoding="utf-8")
+    assert "Diagnostic Classification" in report_path.read_text(encoding="utf-8")
 
 
 def _case(

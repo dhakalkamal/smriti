@@ -58,7 +58,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"Output root containing runs/ and results/. Defaults to {DEFAULT_OUTPUT_ROOT}.",
     )
     parser.add_argument("--run-id", default=None, help="Stable run ID for reproducible tests.")
+    parser.add_argument(
+        "--diagnostic-top-k",
+        type=int,
+        default=None,
+        help="Optional wider retrieval depth for diagnostic visibility.",
+    )
     args = parser.parse_args(argv)
+    if args.diagnostic_top_k is not None and args.diagnostic_top_k <= 0:
+        parser.error("--diagnostic-top-k must be greater than zero")
     return asyncio.run(_run(args))
 
 
@@ -112,14 +120,22 @@ async def _run(args: argparse.Namespace) -> int:
         results = []
         for case in cases:
             await reset_fixture_access_metadata(pool, fixture.episode_ids)
+            retrieval_top_k = max(case.top_k, args.diagnostic_top_k or case.top_k)
             retrieved = await service.retrieve_scoped_episodes(
                 user_id=case.user_id,
                 scope_id=case.scope_id,
                 query=case.query,
-                top_k=case.top_k,
+                top_k=retrieval_top_k,
                 now=created_at,
             )
-            results.append(score_stage12_retrieval_case(case, retrieved, args.mode))
+            results.append(
+                score_stage12_retrieval_case(
+                    case,
+                    retrieved,
+                    args.mode,
+                    diagnostic_top_k=retrieval_top_k,
+                )
+            )
 
         await reset_fixture_access_metadata(pool, fixture.episode_ids)
         aggregate_metrics = summarize_stage12_results(results)
@@ -137,6 +153,7 @@ async def _run(args: argparse.Namespace) -> int:
             database_identifier=_redact_database_url(settings.database_url),
             git_branch=_git_output(("rev-parse", "--abbrev-ref", "HEAD")),
             git_sha=_git_output(("rev-parse", "HEAD")),
+            diagnostic_top_k=args.diagnostic_top_k,
         )
 
         _write_outputs(
@@ -199,6 +216,7 @@ def _markdown_report(
         f"- Timing mode: {metadata['timing_mode']}",
         f"- Embedder: {metadata['embedder_mode']} ({metadata['embedding_model']})",
         f"- Isolation: {metadata['isolation_strategy']}",
+        f"- Diagnostic top-k: {metadata['diagnostic_top_k']}",
         f"- Git branch: {metadata['git_branch']}",
         f"- Git SHA: {metadata['git_sha']}",
         "",
@@ -260,6 +278,42 @@ def _markdown_report(
             f"{metrics['self_query_hit']} | {_format_metric(recap['ratio'])} |"
         )
 
+    lines.extend(
+        [
+            "",
+            "## Diagnostic Classification",
+            "",
+            (
+                "| Example | Diagnostic K | Expected | Raw | Summary | Acceptable | "
+                "First Expected | First Raw | First Summary | First Acceptable | "
+                "Diag Summary Ratio | Diag Recap Ratio | Failure Class |"
+            ),
+            (
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+                "---: | ---: | ---: | --- |"
+            ),
+        ]
+    )
+    for case in case_records:
+        diagnostic_kind_mix = case["diagnostic_kind_mix"]
+        diagnostic_recap = case["diagnostic_recap_pollution"]
+        if not isinstance(diagnostic_kind_mix, dict) or not isinstance(diagnostic_recap, dict):
+            continue
+        lines.append(
+            f"| {case['example_id']} | {case['diagnostic_top_k']} | "
+            f"{case['expected_in_diagnostic_top_k']} | "
+            f"{case['raw_expected_in_diagnostic_top_k']} | "
+            f"{case['summary_expected_in_diagnostic_top_k']} | "
+            f"{case['acceptable_in_diagnostic_top_k']} | "
+            f"{_format_metric(case['first_expected_diagnostic_rank'])} | "
+            f"{_format_metric(case['first_raw_diagnostic_rank'])} | "
+            f"{_format_metric(case['first_summary_diagnostic_rank'])} | "
+            f"{_format_metric(case['first_acceptable_diagnostic_rank'])} | "
+            f"{_format_metric(diagnostic_kind_mix['summary_ratio'])} | "
+            f"{_format_metric(diagnostic_recap['ratio'])} | "
+            f"{_format_failure_class(case['failure_class'])} |"
+        )
+
     failures = [
         case
         for case in case_records
@@ -276,7 +330,10 @@ def _markdown_report(
                 for item in retrieved:
                     if isinstance(item, dict):
                         retrieved_ids.append(str(item["episode_id"]))
-            lines.append(f"- {case['example_id']}: retrieved {', '.join(retrieved_ids)}")
+            lines.append(
+                f"- {case['example_id']}: {_format_failure_class(case['failure_class'])}; "
+                f"retrieved {', '.join(retrieved_ids)}"
+            )
 
     self_query_cases = [
         case
@@ -326,6 +383,12 @@ def _format_metric(value: object) -> str:
         return "null"
     if isinstance(value, float):
         return f"{value:.4f}"
+    return str(value)
+
+
+def _format_failure_class(value: object) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
     return str(value)
 
 

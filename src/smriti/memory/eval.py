@@ -41,6 +41,17 @@ QuestionType = Literal[
     "negative_control",
 ]
 TimingMode = Literal["app_realistic", "clean_memory"]
+Stage12FailureClass = Literal[
+    "self_query_artifact",
+    "hit_at_official_k",
+    "rerank_below_official_k",
+    "absent_from_diagnostic_top_k",
+    "recap_or_echo_pollution",
+    "summary_visible_but_low",
+    "raw_visible_but_low",
+    "negative_control",
+    "unclassified",
+]
 
 _VALID_EPISODE_LABEL_ROLES = frozenset(
     {
@@ -242,6 +253,22 @@ class Stage12CaseMetrics:
 
 
 @dataclass(frozen=True)
+class Stage12DiagnosticMetrics:
+    diagnostic_top_k: int
+    expected_in_diagnostic_top_k: bool
+    raw_expected_in_diagnostic_top_k: bool
+    summary_expected_in_diagnostic_top_k: bool
+    acceptable_in_diagnostic_top_k: bool
+    first_expected_diagnostic_rank: int | None
+    first_raw_diagnostic_rank: int | None
+    first_summary_diagnostic_rank: int | None
+    first_acceptable_diagnostic_rank: int | None
+    diagnostic_kind_mix: Stage12KindMixMetrics
+    diagnostic_recap_pollution: Stage12RecapPollutionMetrics
+    failure_class: tuple[Stage12FailureClass, ...]
+
+
+@dataclass(frozen=True)
 class Stage12CaseResult:
     example_id: str
     scenario_id: str
@@ -252,6 +279,7 @@ class Stage12CaseResult:
     expected_ids: Stage12ExpectedIds
     retrieved: tuple[Stage12RetrievedEpisodeRecord, ...]
     metrics: Stage12CaseMetrics
+    diagnostics: Stage12DiagnosticMetrics
     notes: str | None = None
 
 
@@ -288,6 +316,7 @@ class Stage12BaselineRunMetadata:
     scoring_weights: Mapping[str, float] = field(default_factory=lambda: stage12_scoring_weights())
     retrieval_candidate_multiplier: int = RETRIEVAL_CANDIDATE_MULTIPLIER
     min_retrieval_candidates: int = MIN_RETRIEVAL_CANDIDATES
+    diagnostic_top_k: int | None = None
 
 
 async def run_retrieval_eval(
@@ -325,6 +354,7 @@ async def run_stage12_retrieval_eval(
     cases: Sequence[Stage12ResolvedEvalCase],
     timing_mode: TimingMode = "app_realistic",
     now: datetime | None = None,
+    diagnostic_top_k: int | None = None,
 ) -> tuple[list[Stage12CaseResult], Stage12AggregateMetrics]:
     """Evaluate Stage 12a retrieval cases through the current memory service path."""
 
@@ -334,14 +364,25 @@ async def run_stage12_retrieval_eval(
 
     results: list[Stage12CaseResult] = []
     for case in cases:
+        case_diagnostic_top_k = _resolve_diagnostic_top_k(
+            top_k=case.top_k,
+            diagnostic_top_k=diagnostic_top_k,
+        )
         retrieved = await service.retrieve_scoped_episodes(
             user_id=case.user_id,
             scope_id=case.scope_id,
             query=case.query,
-            top_k=case.top_k,
+            top_k=case_diagnostic_top_k,
             now=now,
         )
-        results.append(score_stage12_retrieval_case(case, retrieved, timing_mode))
+        results.append(
+            score_stage12_retrieval_case(
+                case,
+                retrieved,
+                timing_mode,
+                diagnostic_top_k=case_diagnostic_top_k,
+            )
+        )
 
     return results, summarize_stage12_results(results)
 
@@ -350,13 +391,19 @@ def score_stage12_retrieval_case(
     case: Stage12ResolvedEvalCase,
     retrieved: Sequence[ScoredEpisode],
     timing_mode: TimingMode = "app_realistic",
+    *,
+    diagnostic_top_k: int | None = None,
 ) -> Stage12CaseResult:
     """Score one Stage 12a case without changing retrieval behavior."""
 
     validate_stage12_eval_case(case)
     _validate_timing_mode(timing_mode)
 
-    limited_retrieved = tuple(retrieved[: case.top_k])
+    case_diagnostic_top_k = _resolve_diagnostic_top_k(
+        top_k=case.top_k,
+        diagnostic_top_k=diagnostic_top_k,
+    )
+    diagnostic_retrieved = tuple(retrieved[:case_diagnostic_top_k])
     label_by_episode_id = {label.episode_id: label for label in case.episode_labels}
     raw_expected_ids = set(case.expected_ids.raw)
     summary_expected_ids = set(case.expected_ids.summary)
@@ -364,9 +411,9 @@ def score_stage12_retrieval_case(
     current_query_ids = set(case.expected_ids.current_query)
     preferred_ids = _preferred_expected_id_set(case.expected_ids, case.preferred_layer)
 
-    official_episodes = tuple(
+    diagnostic_official_episodes = tuple(
         episode
-        for episode in limited_retrieved
+        for episode in diagnostic_retrieved
         if not _is_current_query_episode(
             episode=episode,
             label=label_by_episode_id.get(episode.id),
@@ -376,7 +423,7 @@ def score_stage12_retrieval_case(
     )
     official_rank_by_episode_id = {
         episode.id: official_rank
-        for official_rank, episode in enumerate(official_episodes, start=1)
+        for official_rank, episode in enumerate(diagnostic_official_episodes, start=1)
     }
     retrieved_records = tuple(
         _stage12_retrieved_record(
@@ -390,10 +437,15 @@ def score_stage12_retrieval_case(
             preferred_ids=preferred_ids,
             timing_mode=timing_mode,
         )
-        for episode in limited_retrieved
+        for episode in diagnostic_retrieved
     )
 
     official_records = tuple(
+        record
+        for record in retrieved_records
+        if record.rank <= case.top_k and record.official_rank is not None
+    )
+    diagnostic_official_records = tuple(
         record for record in retrieved_records if record.official_rank is not None
     )
     official_episode_ids = tuple(record.episode_id for record in official_records)
@@ -409,10 +461,43 @@ def score_stage12_retrieval_case(
         None,
     )
     self_query_record = next(
-        (record for record in retrieved_records if record.is_current_query),
+        (
+            record
+            for record in retrieved_records
+            if record.rank <= case.top_k and record.is_current_query
+        ),
         None,
     )
     recap_pollution = _recap_pollution_metrics(official_records)
+    metrics = Stage12CaseMetrics(
+        hit_at_k=bool(preferred_hits),
+        reciprocal_rank=0.0 if first_preferred_rank is None else 1.0 / first_preferred_rank,
+        precision_at_k=0.0
+        if not official_records
+        else len(set(preferred_hits)) / len(official_records),
+        recall_at_k=0.0 if not preferred_ids else len(set(preferred_hits)) / len(preferred_ids),
+        raw_hit_at_k=any(episode_id in raw_expected_ids for episode_id in official_episode_ids),
+        summary_hit_at_k=any(
+            episode_id in summary_expected_ids for episode_id in official_episode_ids
+        ),
+        acceptable_hit_at_k=any(
+            episode_id in acceptable_ids for episode_id in official_episode_ids
+        ),
+        kind_mix_at_k=_kind_mix_metrics(official_records),
+        self_query_hit=self_query_record is not None,
+        self_query_rank=None if self_query_record is None else self_query_record.rank,
+        self_query_similarity=None if self_query_record is None else self_query_record.similarity,
+        recap_pollution_at_k=recap_pollution,
+    )
+    diagnostics = _stage12_diagnostic_metrics(
+        top_k=case.top_k,
+        diagnostic_top_k=case_diagnostic_top_k,
+        timing_mode=timing_mode,
+        expected_ids=case.expected_ids,
+        preferred_ids=preferred_ids,
+        records=retrieved_records,
+        diagnostic_official_records=diagnostic_official_records,
+    )
 
     return Stage12CaseResult(
         example_id=case.example_id,
@@ -423,28 +508,8 @@ def score_stage12_retrieval_case(
         top_k=case.top_k,
         expected_ids=case.expected_ids,
         retrieved=retrieved_records,
-        metrics=Stage12CaseMetrics(
-            hit_at_k=bool(preferred_hits),
-            reciprocal_rank=0.0 if first_preferred_rank is None else 1.0 / first_preferred_rank,
-            precision_at_k=0.0
-            if not official_records
-            else len(set(preferred_hits)) / len(official_records),
-            recall_at_k=0.0 if not preferred_ids else len(set(preferred_hits)) / len(preferred_ids),
-            raw_hit_at_k=any(episode_id in raw_expected_ids for episode_id in official_episode_ids),
-            summary_hit_at_k=any(
-                episode_id in summary_expected_ids for episode_id in official_episode_ids
-            ),
-            acceptable_hit_at_k=any(
-                episode_id in acceptable_ids for episode_id in official_episode_ids
-            ),
-            kind_mix_at_k=_kind_mix_metrics(official_records),
-            self_query_hit=self_query_record is not None,
-            self_query_rank=None if self_query_record is None else self_query_record.rank,
-            self_query_similarity=None
-            if self_query_record is None
-            else self_query_record.similarity,
-            recap_pollution_at_k=recap_pollution,
-        ),
+        metrics=metrics,
+        diagnostics=diagnostics,
         notes=case.notes,
     )
 
@@ -709,6 +774,7 @@ def stage12_baseline_metadata_to_dict(metadata: Stage12BaselineRunMetadata) -> d
         "scoring_weights": dict(metadata.scoring_weights),
         "retrieval_candidate_multiplier": metadata.retrieval_candidate_multiplier,
         "min_retrieval_candidates": metadata.min_retrieval_candidates,
+        "diagnostic_top_k": metadata.diagnostic_top_k,
     }
 
 
@@ -725,6 +791,22 @@ def stage12_case_result_to_dict(result: Stage12CaseResult) -> dict[str, object]:
         "expected_ids": _expected_ids_to_dict(result.expected_ids),
         "retrieved": [_retrieved_record_to_dict(record) for record in result.retrieved],
         "metrics": _case_metrics_to_dict(result.metrics),
+        "diagnostic_top_k": result.diagnostics.diagnostic_top_k,
+        "expected_in_diagnostic_top_k": result.diagnostics.expected_in_diagnostic_top_k,
+        "raw_expected_in_diagnostic_top_k": (result.diagnostics.raw_expected_in_diagnostic_top_k),
+        "summary_expected_in_diagnostic_top_k": (
+            result.diagnostics.summary_expected_in_diagnostic_top_k
+        ),
+        "acceptable_in_diagnostic_top_k": (result.diagnostics.acceptable_in_diagnostic_top_k),
+        "first_expected_diagnostic_rank": result.diagnostics.first_expected_diagnostic_rank,
+        "first_raw_diagnostic_rank": result.diagnostics.first_raw_diagnostic_rank,
+        "first_summary_diagnostic_rank": result.diagnostics.first_summary_diagnostic_rank,
+        "first_acceptable_diagnostic_rank": (result.diagnostics.first_acceptable_diagnostic_rank),
+        "diagnostic_kind_mix": _kind_mix_to_dict(result.diagnostics.diagnostic_kind_mix),
+        "diagnostic_recap_pollution": _recap_pollution_to_dict(
+            result.diagnostics.diagnostic_recap_pollution
+        ),
+        "failure_class": list(result.diagnostics.failure_class),
         "notes": result.notes,
     }
 
@@ -898,6 +980,149 @@ def _recap_pollution_metrics(
         count=count,
         ratio=0.0 if total_count == 0 else count / total_count,
     )
+
+
+def _resolve_diagnostic_top_k(top_k: int, diagnostic_top_k: int | None) -> int:
+    if diagnostic_top_k is None:
+        return top_k
+    if diagnostic_top_k <= 0:
+        raise InvalidRetrievalRequestError("Stage 12 diagnostic_top_k must be greater than zero")
+    return max(top_k, diagnostic_top_k)
+
+
+def _stage12_diagnostic_metrics(
+    *,
+    top_k: int,
+    diagnostic_top_k: int,
+    timing_mode: TimingMode,
+    expected_ids: Stage12ExpectedIds,
+    preferred_ids: set[UUID],
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+    diagnostic_official_records: Sequence[Stage12RetrievedEpisodeRecord],
+) -> Stage12DiagnosticMetrics:
+    raw_expected_ids = set(expected_ids.raw)
+    summary_expected_ids = set(expected_ids.summary)
+    acceptable_ids = set(expected_ids.acceptable)
+
+    first_expected_rank = _first_diagnostic_rank(diagnostic_official_records, preferred_ids)
+    first_raw_rank = _first_diagnostic_rank(diagnostic_official_records, raw_expected_ids)
+    first_summary_rank = _first_diagnostic_rank(diagnostic_official_records, summary_expected_ids)
+    first_acceptable_rank = _first_diagnostic_rank(diagnostic_official_records, acceptable_ids)
+    failure_class = _stage12_failure_classes(
+        top_k=top_k,
+        timing_mode=timing_mode,
+        expected_ids=expected_ids,
+        records=records,
+        diagnostic_official_records=diagnostic_official_records,
+        first_acceptable_diagnostic_rank=first_acceptable_rank,
+        first_raw_diagnostic_rank=first_raw_rank,
+        first_summary_diagnostic_rank=first_summary_rank,
+    )
+
+    return Stage12DiagnosticMetrics(
+        diagnostic_top_k=diagnostic_top_k,
+        expected_in_diagnostic_top_k=first_expected_rank is not None,
+        raw_expected_in_diagnostic_top_k=first_raw_rank is not None,
+        summary_expected_in_diagnostic_top_k=first_summary_rank is not None,
+        acceptable_in_diagnostic_top_k=first_acceptable_rank is not None,
+        first_expected_diagnostic_rank=first_expected_rank,
+        first_raw_diagnostic_rank=first_raw_rank,
+        first_summary_diagnostic_rank=first_summary_rank,
+        first_acceptable_diagnostic_rank=first_acceptable_rank,
+        diagnostic_kind_mix=_kind_mix_metrics(diagnostic_official_records),
+        diagnostic_recap_pollution=_recap_pollution_metrics(diagnostic_official_records),
+        failure_class=failure_class,
+    )
+
+
+def _first_diagnostic_rank(
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+    episode_ids: set[UUID],
+) -> int | None:
+    if not episode_ids:
+        return None
+    return next(
+        (
+            record.official_rank
+            for record in records
+            if record.episode_id in episode_ids and record.official_rank is not None
+        ),
+        None,
+    )
+
+
+def _stage12_failure_classes(
+    *,
+    top_k: int,
+    timing_mode: TimingMode,
+    expected_ids: Stage12ExpectedIds,
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+    diagnostic_official_records: Sequence[Stage12RetrievedEpisodeRecord],
+    first_acceptable_diagnostic_rank: int | None,
+    first_raw_diagnostic_rank: int | None,
+    first_summary_diagnostic_rank: int | None,
+) -> tuple[Stage12FailureClass, ...]:
+    classes: list[Stage12FailureClass] = []
+    has_expected_ids = bool(expected_ids.raw or expected_ids.summary or expected_ids.acceptable)
+
+    if timing_mode == "app_realistic" and any(record.is_current_query for record in records):
+        classes.append("self_query_artifact")
+
+    if not has_expected_ids:
+        classes.append("negative_control")
+        return tuple(classes) if classes else ("unclassified",)
+
+    if _is_visible_within_official_window(first_acceptable_diagnostic_rank, top_k=top_k):
+        classes.append("hit_at_official_k")
+    elif first_acceptable_diagnostic_rank is None:
+        classes.append("absent_from_diagnostic_top_k")
+    else:
+        classes.append("rerank_below_official_k")
+
+    if _has_recap_or_echo_before_acceptable(
+        diagnostic_official_records=diagnostic_official_records,
+        first_acceptable_diagnostic_rank=first_acceptable_diagnostic_rank,
+    ):
+        classes.append("recap_or_echo_pollution")
+
+    if _is_visible_below_official_window(
+        first_raw_diagnostic_rank,
+        top_k=top_k,
+    ):
+        classes.append("raw_visible_but_low")
+
+    if _is_visible_below_official_window(
+        first_summary_diagnostic_rank,
+        top_k=top_k,
+    ):
+        classes.append("summary_visible_but_low")
+
+    return tuple(classes) if classes else ("unclassified",)
+
+
+def _has_recap_or_echo_before_acceptable(
+    *,
+    diagnostic_official_records: Sequence[Stage12RetrievedEpisodeRecord],
+    first_acceptable_diagnostic_rank: int | None,
+) -> bool:
+    for record in diagnostic_official_records:
+        if not {"recap_question", "assistant_answer_echo"}.intersection(record.label_roles):
+            continue
+        if record.official_rank is None:
+            continue
+        if first_acceptable_diagnostic_rank is None:
+            return True
+        if record.official_rank < first_acceptable_diagnostic_rank:
+            return True
+    return False
+
+
+def _is_visible_within_official_window(rank: int | None, *, top_k: int) -> bool:
+    return rank is not None and rank <= top_k
+
+
+def _is_visible_below_official_window(rank: int | None, *, top_k: int) -> bool:
+    return rank is not None and rank > top_k
 
 
 def _parse_stage12_jsonl_records(records: Sequence[str]) -> Stage12Corpus:
