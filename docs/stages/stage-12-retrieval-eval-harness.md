@@ -538,3 +538,74 @@ This document is complete when it functions as the Stage 12 contract: it defines
 what the harness must measure, how labeled retrieval cases should be represented,
 how baseline output should look, how mutation must be isolated, what is out of
 scope, and how Stage 12b may analyze and compare controlled weight experiments.
+
+## Stage 12 Findings and Closeout
+
+Stage 12 is complete through Stage 12a, Stage 12b-1, and Stage 12b-2. It added a
+labeled Terrafold retrieval corpus, app-realistic and clean-memory eval modes,
+fake and Ollama baseline runs, official current-query exclusion, raw/summary/
+acceptable hit metrics, recap-pollution and kind-mix metrics, diagnostic top-k
+visibility, failure classes, and offline diagnostic weight-sweep tooling.
+
+### Baseline Findings
+
+- In `app_realistic` mode, current-query self-retrieval is systematic:
+  `self_query_hit_rate = 1.0000`, with current-query episodes ranking first at
+  similarity `1.0000`.
+- This is an app timing artifact, not a normal scoring-weight problem.
+- `clean_memory` is the better mode for evaluating memory retrieval quality
+  without current-query contamination.
+- Direct fact retrieval is mostly strong for cases such as the Terrafold studio
+  name, the 9-wheel class-size limit, and several raw source facts.
+- Broad or summary-oriented questions remain weak, especially broad operational
+  constraints and opening/classes questions. Relevant summaries appear, but
+  usually below official top-k.
+
+### Diagnostic-Top-K Findings
+
+Stage 12b-1 showed that positive expected evidence was not absent from the
+diagnostic candidate view: all positive expected evidence appeared somewhere
+within diagnostic top-25 in the latest diagnostic runs. For this corpus, the
+observed failures are therefore mostly shallow top-k ranking and ordering
+problems rather than hard candidate-pool misses.
+
+The diagnostic labels also confirmed that recap questions and assistant answer
+echoes can appear above the first acceptable evidence. These episodes should
+remain visible in reports because they explain noisy rankings, but Stage 12 did
+not change retrieval behavior to suppress them.
+
+### Weight-Sweep Findings
+
+Stage 12b-2 replayed fixed Python-side scoring profiles from emitted diagnostic
+records. On the latest Ollama diagnostic records, the fixed profiles produced
+identical official top-k metrics. This supports the diagnostic suspicion that
+the non-similarity score components were too flat in these cases to move failing
+evidence upward.
+
+The result is not a universal claim that weight tuning cannot help retrieval. It
+means that changing only the current five Python-side weights was insufficient
+for this corpus and these latest Ollama diagnostic records.
+
+### Explicit Non-Changes
+
+Stage 12 does not adopt production weight changes. It does not change retrieval
+SQL, schema or migrations, production scoring constants, frontend behavior,
+candidate-pool structure, or retrieval architecture. It also does not introduce
+hybrid retrieval, hierarchical retrieval, summary-first retrieval, parent-child
+summary expansion, answer-quality grading, or production auto-tuning.
+
+### Recommended Stage 13 Follow-Up Areas
+
+- App-flow or timing fixes for current-query self-retrieval.
+- Role-aware handling of recap questions and assistant answer echoes.
+- Hybrid lexical plus vector retrieval for exact names and relationships such
+  as Dele/bookkeeping.
+- Summary-aware or hierarchical retrieval for broad recap and summary-seeking
+  questions.
+
+### Final Status
+
+Stage 12 successfully measured retrieval behavior and produced evidence about
+where the current retrieval path struggles. Retrieval is not fixed by Stage 12,
+and Stage 12 should close without production behavior changes. The next work
+belongs in Stage 13 retrieval architecture and app-flow improvements.
