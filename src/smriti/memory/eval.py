@@ -71,6 +71,7 @@ Stage13LexicalReplayRecommendation = Literal[
     "lexical_rerank_candidate",
     "lexical_replay_insufficient",
     "candidate_generation_needed_later",
+    "summary_only_gain_more_data_needed",
 ]
 
 _VALID_EPISODE_LABEL_ROLES = frozenset(
@@ -131,6 +132,11 @@ STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS: Mapping[str, str] = {
 }
 _MATERIAL_MRR_DROP = 0.01
 _METRIC_EPSILON = 1e-9
+_STAGE13_LEXICAL_RECOMMENDATION_TIE_BREAK_RULE = (
+    "Choose the highest acceptable@K, hit@K, raw@K, then MRR; "
+    "for exact metric ties prefer fewer non-zero lexical feature weights, "
+    "then profile declaration order."
+)
 _LEXICAL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9']*|\$?\d[\d,]*(?:\.\d+)?")
 _LEXICAL_STOPWORDS = frozenset(
     {
@@ -1467,7 +1473,7 @@ def run_stage13_lexical_replay(
         )
         for profile in profile_grid
     }
-    rank_movement = _stage12_weight_sweep_rank_movement(results_by_profile)
+    rank_movement = _stage13_lexical_rank_movement(results_by_profile)
 
     return {
         "metadata": {
@@ -1488,6 +1494,7 @@ def run_stage13_lexical_replay(
             ],
             "target_cases": list(STAGE13_LEXICAL_TARGET_CASES),
             "diagnostic_anchors": list(STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS.values()),
+            "recommendation_tie_break_rule": (_STAGE13_LEXICAL_RECOMMENDATION_TIE_BREAK_RULE),
         },
         "input_run_metadata": dict(input_metadata),
         "aggregate_metrics_by_profile": aggregate_by_profile,
@@ -1501,6 +1508,7 @@ def run_stage13_lexical_replay(
             baseline_results=baseline_results,
             aggregate_by_profile=aggregate_by_profile,
             regression_gates=regression_gates,
+            profiles=profile_grid,
         ),
     }
 
@@ -1562,6 +1570,7 @@ def stage13_lexical_replay_report_to_markdown(payload: Mapping[str, object]) -> 
         ),
         f"- Official top-k override: {metadata.get('official_top_k_override')}",
         f"- Diagnostic top-k override: {metadata.get('diagnostic_top_k_override')}",
+        f"- Recommendation tie-break: {metadata.get('recommendation_tie_break_rule')}",
         f"- Git SHA: {metadata.get('input_git_sha')}",
         "",
         "## Lexical Feature Definitions",
@@ -1617,6 +1626,28 @@ def stage13_lexical_replay_report_to_markdown(payload: Mapping[str, object]) -> 
             f"{aggregate['direct_fact_regression_count']} | "
             f"{aggregate['negative_control_no_hit_retained']} | "
             f"{aggregate['missing_lexical_feature_count']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Raw Evidence Rank Movement",
+            "",
+            (
+                "| Profile | Raw@K | Raw Rank Degradations | Summary At Raw Expense | "
+                "Affected Cases | Worst Raw Delta |"
+            ),
+            "| --- | ---: | ---: | ---: | --- | ---: |",
+        ]
+    )
+    for profile_name, aggregate_value in aggregates.items():
+        aggregate = _as_mapping(aggregate_value)
+        lines.append(
+            f"| {profile_name} | {_format_metric(aggregate['raw_hit_rate_at_k'])} | "
+            f"{aggregate['raw_rank_degradation_count']} | "
+            f"{aggregate['summary_gain_at_raw_rank_expense_count']} | "
+            f"{_format_case_list(aggregate['raw_rank_degradation_cases'])} | "
+            f"{_format_metric(aggregate['worst_raw_rank_delta'])} |"
         )
 
     lines.extend(
@@ -1703,9 +1734,11 @@ def stage13_lexical_replay_report_to_markdown(payload: Mapping[str, object]) -> 
             f"- Decision: {recommendation['decision']}",
             f"- Profile: {recommendation.get('profile')}",
             f"- Explanation: {recommendation['explanation']}",
-            "",
         ]
     )
+    if "blocked_profiles" in recommendation:
+        lines.append(f"- Blocked profiles: {_format_case_list(recommendation['blocked_profiles'])}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -2532,6 +2565,133 @@ def _stage13_missing_lexical_feature_count(cases: Sequence[Stage12CaseResult]) -
     return sum(1 for case in cases for record in case.retrieved if record.lexical_features is None)
 
 
+def _stage13_lexical_rank_movement(
+    results_by_profile: Mapping[str, Sequence[Stage12CaseResult]],
+) -> list[dict[str, object]]:
+    movement = _stage12_weight_sweep_rank_movement(results_by_profile)
+    baseline_results = results_by_profile["baseline"]
+    augmented: list[dict[str, object]] = []
+    for item in movement:
+        example_id = _required_str(item, "example_id")
+        baseline_case = _find_profile_case(baseline_results, example_id)
+        profiles: dict[str, object] = {}
+        for profile_name, profile_value in _required_mapping(item, "profiles").items():
+            profile_fields = dict(_as_mapping(profile_value))
+            profile_case = _find_profile_case(results_by_profile[profile_name], example_id)
+            profile_fields.update(
+                _stage13_lexical_raw_rank_case_movement(
+                    baseline=baseline_case,
+                    profile=profile_case,
+                )
+            )
+            profiles[profile_name] = profile_fields
+        augmented_item = dict(item)
+        augmented_item["profiles"] = profiles
+        augmented.append(augmented_item)
+    return augmented
+
+
+def _stage13_lexical_raw_rank_summary(
+    *,
+    baseline_results: Sequence[Stage12CaseResult],
+    profile_results: Sequence[Stage12CaseResult],
+) -> dict[str, object]:
+    case_movements = tuple(
+        _stage13_lexical_raw_rank_case_movement(baseline=baseline, profile=profile)
+        for baseline, profile in zip(baseline_results, profile_results, strict=True)
+    )
+    raw_rank_degradation_cases = [
+        _required_str(movement, "example_id")
+        for movement in case_movements
+        if _required_bool(movement, "raw_rank_worsened")
+    ]
+    summary_gain_at_raw_rank_expense_cases = [
+        _required_str(movement, "example_id")
+        for movement in case_movements
+        if _required_bool(movement, "summary_gain_at_raw_rank_expense")
+    ]
+    finite_raw_degradation_deltas = [
+        delta
+        for movement in case_movements
+        if _required_bool(movement, "raw_rank_worsened")
+        for delta in (_optional_int(movement, "raw_rank_delta"),)
+        if delta is not None
+    ]
+
+    return {
+        "raw_rank_degradation_count": len(raw_rank_degradation_cases),
+        "raw_rank_degradation_cases": raw_rank_degradation_cases,
+        "raw_rank_degradation_with_summary_gain_count": len(summary_gain_at_raw_rank_expense_cases),
+        "summary_gain_at_raw_rank_expense_count": len(summary_gain_at_raw_rank_expense_cases),
+        "summary_gain_at_raw_rank_expense_cases": summary_gain_at_raw_rank_expense_cases,
+        "worst_raw_rank_delta": (
+            max(finite_raw_degradation_deltas) if finite_raw_degradation_deltas else None
+        ),
+    }
+
+
+def _stage13_lexical_raw_rank_case_movement(
+    *,
+    baseline: Stage12CaseResult,
+    profile: Stage12CaseResult,
+) -> dict[str, object]:
+    raw_rank_delta = _rank_delta(
+        profile.diagnostics.first_raw_diagnostic_rank,
+        baseline.diagnostics.first_raw_diagnostic_rank,
+    )
+    raw_rank_worsened = _rank_worsened(
+        profile.diagnostics.first_raw_diagnostic_rank,
+        baseline.diagnostics.first_raw_diagnostic_rank,
+    )
+    acceptable_rank_or_hit_improved = _hit_or_rank_improved(
+        baseline_hit=baseline.metrics.acceptable_hit_at_k,
+        profile_hit=profile.metrics.acceptable_hit_at_k,
+        baseline_rank=baseline.diagnostics.first_acceptable_diagnostic_rank,
+        profile_rank=profile.diagnostics.first_acceptable_diagnostic_rank,
+    )
+    summary_rank_or_hit_improved = _hit_or_rank_improved(
+        baseline_hit=baseline.metrics.summary_hit_at_k,
+        profile_hit=profile.metrics.summary_hit_at_k,
+        baseline_rank=baseline.diagnostics.first_summary_diagnostic_rank,
+        profile_rank=profile.diagnostics.first_summary_diagnostic_rank,
+    )
+    summary_gain_at_raw_rank_expense = raw_rank_worsened and (
+        acceptable_rank_or_hit_improved or summary_rank_or_hit_improved
+    )
+
+    return {
+        "example_id": baseline.example_id,
+        "baseline_first_raw_rank": baseline.diagnostics.first_raw_diagnostic_rank,
+        "profile_first_raw_rank": profile.diagnostics.first_raw_diagnostic_rank,
+        "raw_rank_delta": raw_rank_delta,
+        "raw_hit_preserved": (not baseline.metrics.raw_hit_at_k or profile.metrics.raw_hit_at_k),
+        "raw_rank_worsened": raw_rank_worsened,
+        "acceptable_rank_or_hit_improved": acceptable_rank_or_hit_improved,
+        "summary_rank_or_hit_improved": summary_rank_or_hit_improved,
+        "summary_gain_at_raw_rank_expense": summary_gain_at_raw_rank_expense,
+    }
+
+
+def _rank_worsened(rank: int | None, baseline_rank: int | None) -> bool:
+    if baseline_rank is None:
+        return False
+    if rank is None:
+        return True
+    return rank > baseline_rank
+
+
+def _hit_or_rank_improved(
+    *,
+    baseline_hit: bool,
+    profile_hit: bool,
+    baseline_rank: int | None,
+    profile_rank: int | None,
+) -> bool:
+    if profile_hit and not baseline_hit:
+        return True
+    return _rank_is_better(profile_rank, baseline_rank)
+
+
 def _stage13_lexical_aggregate_to_dict(
     *,
     baseline_results: Sequence[Stage12CaseResult],
@@ -2539,6 +2699,10 @@ def _stage13_lexical_aggregate_to_dict(
     missing_feature_count: int,
 ) -> dict[str, object]:
     aggregate = stage12_aggregate_metrics_to_dict(summarize_stage12_results(profile_results))
+    raw_rank_summary = _stage13_lexical_raw_rank_summary(
+        baseline_results=baseline_results,
+        profile_results=profile_results,
+    )
     aggregate.update(
         {
             "direct_fact_regression_count": _stage13_direct_fact_regression_count(
@@ -2548,6 +2712,7 @@ def _stage13_lexical_aggregate_to_dict(
             "negative_control_no_hit_retained": _negative_control_no_hit_retained(profile_results),
             "missing_lexical_feature_count": missing_feature_count,
             "candidate_count": sum(len(result.retrieved) for result in profile_results),
+            **raw_rank_summary,
         }
     )
     return aggregate
@@ -2566,6 +2731,24 @@ def _stage13_lexical_regression_gates(
         policy_cases=profile_results,
     )
     negative_control_no_hit_retained = _negative_control_no_hit_retained(profile_results)
+    raw_rank_summary = _stage13_lexical_raw_rank_summary(
+        baseline_results=baseline_results,
+        profile_results=profile_results,
+    )
+    summary_gain_at_raw_rank_expense_count = _required_int(
+        raw_rank_summary,
+        "summary_gain_at_raw_rank_expense_count",
+    )
+    summary_or_acceptable_hit_improved = (
+        profile_aggregate.summary_hit_rate_at_k
+        > baseline_aggregate.summary_hit_rate_at_k + _METRIC_EPSILON
+        or profile_aggregate.acceptable_hit_rate_at_k
+        > baseline_aggregate.acceptable_hit_rate_at_k + _METRIC_EPSILON
+    )
+    raw_hit_not_improved = (
+        profile_aggregate.raw_hit_rate_at_k
+        <= baseline_aggregate.raw_hit_rate_at_k + _METRIC_EPSILON
+    )
     gates = [
         _gate_record(
             "acceptable_hit_not_dropped",
@@ -2602,12 +2785,15 @@ def _stage13_lexical_regression_gates(
         ),
         _gate_record(
             "summary_gain_not_at_raw_expense",
-            failed=profile_aggregate.summary_hit_rate_at_k
-            > baseline_aggregate.summary_hit_rate_at_k + _METRIC_EPSILON
-            and profile_aggregate.raw_hit_rate_at_k
-            < baseline_aggregate.raw_hit_rate_at_k - _METRIC_EPSILON,
-            value=profile_aggregate.summary_hit_rate_at_k,
+            failed=summary_or_acceptable_hit_improved
+            and raw_hit_not_improved
+            and summary_gain_at_raw_rank_expense_count > 0,
+            value=summary_gain_at_raw_rank_expense_count,
             baseline=baseline_aggregate.summary_hit_rate_at_k,
+            detail=(
+                "summary/acceptable gains must not depend on worsening raw evidence ranks "
+                "when raw@K does not improve"
+            ),
         ),
         _gate_record(
             "lexical_features_available",
@@ -2634,23 +2820,33 @@ def _stage13_lexical_recommendation(
     baseline_results: Sequence[Stage12CaseResult],
     aggregate_by_profile: Mapping[str, Mapping[str, object]],
     regression_gates: Mapping[str, Mapping[str, object]],
+    profiles: Sequence[Stage13LexicalProfile],
 ) -> dict[str, object]:
     baseline = aggregate_by_profile["baseline"]
-    candidates: list[tuple[tuple[float, float, float], str]] = []
+    profile_by_name = {profile.name: profile for profile in profiles}
+    profile_order = {profile.name: index for index, profile in enumerate(profiles)}
+    candidates: list[tuple[tuple[float, float, float, float, int, int], str]] = []
+    summary_only_raw_expense_profiles: list[str] = []
     for profile_name, aggregate in aggregate_by_profile.items():
         if profile_name == "baseline":
             continue
+        if _stage13_lexical_summary_only_gain_at_raw_expense(
+            profile=aggregate,
+            baseline=baseline,
+        ):
+            summary_only_raw_expense_profiles.append(profile_name)
         gates = regression_gates[profile_name]
         if not gates.get("recommended"):
             continue
         if not _stage13_lexical_profile_improves(profile=aggregate, baseline=baseline):
             continue
+        profile = profile_by_name[profile_name]
         candidates.append(
             (
-                (
-                    _required_float(aggregate, "acceptable_hit_rate_at_k"),
-                    _required_float(aggregate, "hit_rate_at_k"),
-                    _required_float(aggregate, "mean_reciprocal_rank"),
+                _stage13_lexical_recommendation_sort_key(
+                    aggregate=aggregate,
+                    profile=profile,
+                    declaration_order=profile_order[profile_name],
                 ),
                 profile_name,
             )
@@ -2665,6 +2861,17 @@ def _stage13_lexical_recommendation(
                 "A lexical profile improved retrieval metrics without tripping "
                 "the Stage 13c-1 regression gates."
             ),
+        }
+    if summary_only_raw_expense_profiles:
+        return {
+            "decision": "summary_only_gain_more_data_needed",
+            "profile": None,
+            "explanation": (
+                "Lexical profiles improved summary/acceptable metrics while raw@K did not "
+                "improve and at least one case worsened raw evidence rank. Keep this "
+                "eval-only and gather more evidence before planning a lexical reranker."
+            ),
+            "blocked_profiles": summary_only_raw_expense_profiles,
         }
     if any(_positive_case_absent_from_diagnostic_top_k(result) for result in baseline_results):
         return {
@@ -2708,6 +2915,58 @@ def _stage13_lexical_profile_improves(
         or _required_float(profile, "mean_reciprocal_rank")
         > _required_float(baseline, "mean_reciprocal_rank") + _MATERIAL_MRR_DROP
     )
+
+
+def _stage13_lexical_summary_only_gain_at_raw_expense(
+    *,
+    profile: Mapping[str, object],
+    baseline: Mapping[str, object],
+) -> bool:
+    summary_or_acceptable_hit_improved = (
+        _required_float(profile, "summary_hit_rate_at_k")
+        > _required_float(baseline, "summary_hit_rate_at_k") + _METRIC_EPSILON
+        or _required_float(profile, "acceptable_hit_rate_at_k")
+        > _required_float(baseline, "acceptable_hit_rate_at_k") + _METRIC_EPSILON
+    )
+    raw_hit_not_improved = (
+        _required_float(profile, "raw_hit_rate_at_k")
+        <= _required_float(baseline, "raw_hit_rate_at_k") + _METRIC_EPSILON
+    )
+    return (
+        summary_or_acceptable_hit_improved
+        and raw_hit_not_improved
+        and _required_int(profile, "summary_gain_at_raw_rank_expense_count") > 0
+    )
+
+
+def _stage13_lexical_recommendation_sort_key(
+    *,
+    aggregate: Mapping[str, object],
+    profile: Stage13LexicalProfile,
+    declaration_order: int,
+) -> tuple[float, float, float, float, int, int]:
+    """Return the explicit Stage 13c-1 recommendation ordering key."""
+
+    return (
+        _required_float(aggregate, "acceptable_hit_rate_at_k"),
+        _required_float(aggregate, "hit_rate_at_k"),
+        _required_float(aggregate, "raw_hit_rate_at_k"),
+        _required_float(aggregate, "mean_reciprocal_rank"),
+        -_stage13_lexical_profile_complexity(profile),
+        -declaration_order,
+    )
+
+
+def _stage13_lexical_profile_complexity(profile: Stage13LexicalProfile) -> int:
+    lexical_weights = (
+        profile.token_overlap,
+        profile.query_token_coverage,
+        profile.rare_token_overlap,
+        profile.proper_name_overlap,
+        profile.number_currency_overlap,
+        profile.relationship_anchor_overlap,
+    )
+    return sum(1 for weight in lexical_weights if abs(weight) > _METRIC_EPSILON)
 
 
 def _positive_case_absent_from_diagnostic_top_k(result: Stage12CaseResult) -> bool:
@@ -3260,6 +3519,12 @@ def _format_metric(value: object) -> str:
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
+
+
+def _format_case_list(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        return "none"
+    return ", ".join(str(item) for item in value)
 
 
 def _format_role_list(value: object) -> str:

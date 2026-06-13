@@ -1090,10 +1090,228 @@ def test_stage13_lexical_replay_recommends_safe_candidate_and_keeps_negative_con
     assert recommendation["profile"] == "proper_name_only"
     assert profile_aggregate["negative_control_no_hit_retained"] is True
     assert profile_aggregate["missing_lexical_feature_count"] == 0
+    assert profile_aggregate["raw_rank_degradation_count"] == 0
+    assert profile_aggregate["summary_gain_at_raw_rank_expense_count"] == 0
+
+
+def test_stage13_lexical_replay_preserves_current_query_exclusion() -> None:
+    current_id = UUID("00000000-0000-4000-8000-0000000003d1")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003d2")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        current_query=(current_id,),
+        top_k=1,
+        query="What does Dele handle?",
+        labels=(
+            _label(current_id, "current_query"),
+            _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+        ),
+    )
+    baseline = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(
+                current_id,
+                rank=1,
+                similarity=0.99,
+                content="What does Dele handle?",
+            ),
+            _episode(
+                expected_id,
+                rank=2,
+                similarity=0.8,
+                content="The silent partner handles bookkeeping.",
+            ),
+        ),
+        timing_mode="app_realistic",
+        diagnostic_top_k=2,
+    )
+    profile = Stage13LexicalProfile(
+        name="proper_name_only",
+        description="Synthetic current-query test profile.",
+        original_score=0.0,
+        proper_name_overlap=1.0,
+    )
+
+    replayed = replay_stage13_lexical_profile_case(baseline, profile)
+    current_record = next(
+        record for record in replayed.retrieved if record.episode_id == current_id
+    )
+    expected_record = next(
+        record for record in replayed.retrieved if record.episode_id == expected_id
+    )
+
+    assert current_record.rank == 1
+    assert current_record.official_rank is None
+    assert expected_record.official_rank == 1
+    assert replayed.metrics.raw_hit_at_k is True
+
+
+def test_stage13_lexical_replay_blocks_summary_gain_at_raw_rank_expense() -> None:
+    raw_id = UUID("00000000-0000-4000-8000-0000000003e1")
+    summary_id = UUID("00000000-0000-4000-8000-0000000003e2")
+    distractor_id = UUID("00000000-0000-4000-8000-0000000003e3")
+    case = _case(
+        raw=(raw_id,),
+        summary=(summary_id,),
+        acceptable=(summary_id,),
+        preferred_layer="summary",
+        question_type="broad_recap",
+        top_k=2,
+        query="What does Dele handle for the studio?",
+        labels=(
+            _label(raw_id, "raw_source", is_expected=True),
+            _label(
+                summary_id,
+                "summary_source",
+                kind="summary",
+                is_expected=True,
+                is_acceptable=True,
+            ),
+        ),
+    )
+    baseline = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(
+                raw_id,
+                rank=1,
+                similarity=0.9,
+                content="Original operational note without the named summary anchor.",
+            ),
+            _episode(
+                distractor_id,
+                rank=2,
+                similarity=0.85,
+                content="A scheduling note about the studio opening.",
+            ),
+            _episode(
+                summary_id,
+                rank=3,
+                kind="summary",
+                similarity=0.8,
+                content="Dele handles bookkeeping for the studio.",
+            ),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=3,
+    )
+
+    payload = run_stage13_lexical_replay(
+        input_metadata={"run_id": "stage13-summary-raw-expense"},
+        cases=(baseline,),
+        profiles=(
+            Stage13LexicalProfile(
+                name="baseline",
+                description="Preserve baseline.",
+                original_score=1.0,
+            ),
+            Stage13LexicalProfile(
+                name="proper_name_only",
+                description="Synthetic summary profile.",
+                original_score=0.0,
+                proper_name_overlap=1.0,
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    aggregates = cast(dict[str, object], payload["aggregate_metrics_by_profile"])
+    profile_aggregate = cast(dict[str, object], aggregates["proper_name_only"])
+    gates = cast(dict[str, object], payload["regression_gates"])
+    profile_gates = cast(dict[str, object], gates["proper_name_only"])
+    recommendation = cast(dict[str, object], payload["recommendation"])
+    rank_movement = cast(list[dict[str, object]], payload["per_case_rank_movement"])
+    profile_movement = cast(
+        dict[str, object],
+        cast(dict[str, object], rank_movement[0]["profiles"])["proper_name_only"],
+    )
+
+    assert profile_aggregate["raw_hit_rate_at_k"] == pytest.approx(1.0)
+    assert profile_aggregate["summary_hit_rate_at_k"] == pytest.approx(1.0)
+    assert profile_aggregate["raw_rank_degradation_count"] == 1
+    assert profile_aggregate["raw_rank_degradation_cases"] == ["case"]
+    assert profile_aggregate["raw_rank_degradation_with_summary_gain_count"] == 1
+    assert profile_aggregate["summary_gain_at_raw_rank_expense_count"] == 1
+    assert profile_aggregate["worst_raw_rank_delta"] == 1
+    assert profile_movement["raw_hit_preserved"] is True
+    assert profile_movement["raw_rank_worsened"] is True
+    assert profile_movement["summary_gain_at_raw_rank_expense"] is True
+    assert "summary_gain_not_at_raw_expense" in profile_gates["failed_gates"]
+    assert recommendation["decision"] == "summary_only_gain_more_data_needed"
+    assert recommendation["profile"] is None
+
+
+def test_stage13_lexical_replay_prefers_simpler_profile_on_metric_tie() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-0000000003f1")
+    distractor_id = UUID("00000000-0000-4000-8000-0000000003f2")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        top_k=1,
+        query="What role does Dele have?",
+        labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+    baseline = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(
+                distractor_id,
+                rank=1,
+                similarity=0.9,
+                content="Lease timing is still being planned.",
+            ),
+            _episode(
+                expected_id,
+                rank=2,
+                similarity=0.8,
+                content="Dele handles bookkeeping.",
+            ),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+
+    payload = run_stage13_lexical_replay(
+        input_metadata={"run_id": "stage13-tie-break"},
+        cases=(baseline,),
+        profiles=(
+            Stage13LexicalProfile(
+                name="baseline",
+                description="Preserve baseline.",
+                original_score=1.0,
+            ),
+            Stage13LexicalProfile(
+                name="combined_first",
+                description="Synthetic combined profile.",
+                original_score=0.0,
+                rare_token_overlap=1.0,
+                proper_name_overlap=1.0,
+            ),
+            Stage13LexicalProfile(
+                name="simple_later",
+                description="Synthetic simpler profile.",
+                original_score=0.0,
+                proper_name_overlap=1.0,
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    recommendation = cast(dict[str, object], payload["recommendation"])
+    metadata = cast(dict[str, object], payload["metadata"])
+
+    assert recommendation["decision"] == "lexical_rerank_candidate"
+    assert recommendation["profile"] == "simple_later"
+    assert "fewer non-zero lexical feature weights" in cast(
+        str,
+        metadata["recommendation_tie_break_rule"],
+    )
 
 
 def test_stage13_lexical_replay_rejects_missing_features() -> None:
-    expected_id = UUID("00000000-0000-4000-8000-0000000003d1")
+    expected_id = UUID("00000000-0000-4000-8000-000000000401")
     result = score_stage12_retrieval_case(
         _case(
             raw=(expected_id,),
@@ -1183,6 +1401,7 @@ def test_stage13_lexical_replay_runner_smoke_writes_json_and_markdown(
     assert "lexical_combined" in payload["aggregate_metrics_by_profile"]
     assert "Stage 13c-1 Lexical Replay" in report_path.read_text(encoding="utf-8")
     assert "Exact-Name And Anchor Diagnostics" in stage13_lexical_replay_report_to_markdown(payload)
+    assert "Raw Evidence Rank Movement" in stage13_lexical_replay_report_to_markdown(payload)
 
 
 def test_stage13_role_policy_replay_runner_smoke_writes_json_and_markdown(
@@ -1395,6 +1614,7 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
     lexical_payload = json.loads(lexical_replay_path.read_text(encoding="utf-8"))
     assert lexical_payload["metadata"]["input_run_id"] == "stage12-smoke"
     assert "lexical_combined" in lexical_payload["aggregate_metrics_by_profile"]
+    assert "Raw Evidence Rank Movement" in lexical_report_path.read_text(encoding="utf-8")
 
 
 def _case(
