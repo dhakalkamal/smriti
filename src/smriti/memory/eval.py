@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -65,6 +66,12 @@ Stage13RolePolicyRecommendation = Literal[
     "recap_policy_requires_metadata",
     "role_policy_insufficient",
 ]
+Stage13LexicalReplayRecommendation = Literal[
+    "no_lexical_change_recommended",
+    "lexical_rerank_candidate",
+    "lexical_replay_insufficient",
+    "candidate_generation_needed_later",
+]
 
 _VALID_EPISODE_LABEL_ROLES = frozenset(
     {
@@ -110,8 +117,142 @@ STAGE12_WEIGHT_SWEEP_TARGET_CASES = (
     "terrafold_f4_latex_allergy",
 )
 STAGE13_ROLE_POLICY_TARGET_CASES = STAGE12_WEIGHT_SWEEP_TARGET_CASES
+STAGE13_LEXICAL_TARGET_CASES = STAGE12_WEIGHT_SWEEP_TARGET_CASES
+STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS: Mapping[str, str] = {
+    "dele": "Dele",
+    "bookkeeping": "bookkeeping",
+    "obafemi": "Obafemi",
+    "terrafold": "Terrafold",
+    "kilnhouse": "Kilnhouse",
+    "nitrile": "nitrile",
+    "latex": "latex",
+    "wheels": "wheels",
+    "3650": "$3,650",
+}
 _MATERIAL_MRR_DROP = 0.01
 _METRIC_EPSILON = 1e-9
+_LEXICAL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9']*|\$?\d[\d,]*(?:\.\d+)?")
+_LEXICAL_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "before",
+        "by",
+        "can",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "give",
+        "have",
+        "he",
+        "her",
+        "his",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "later",
+        "main",
+        "me",
+        "needs",
+        "of",
+        "on",
+        "or",
+        "remember",
+        "should",
+        "the",
+        "there",
+        "to",
+        "was",
+        "what",
+        "when",
+        "which",
+        "who",
+        "why",
+        "with",
+    }
+)
+_PROPER_NAME_STOPWORDS = frozenset(
+    {
+        "Can",
+        "Do",
+        "Does",
+        "Give",
+        "How",
+        "In",
+        "The",
+        "What",
+        "When",
+        "Which",
+        "Who",
+        "Why",
+    }
+)
+_RELATIONSHIP_ANCHOR_TOKENS = frozenset(
+    {
+        "allergy",
+        "alternative",
+        "bookkeeping",
+        "budget",
+        "cap",
+        "capped",
+        "class",
+        "classes",
+        "constraints",
+        "cousin",
+        "glove",
+        "gloves",
+        "handling",
+        "landlord",
+        "latex",
+        "lease",
+        "name",
+        "nitrile",
+        "opening",
+        "operational",
+        "partner",
+        "rejected",
+        "role",
+        "safety",
+        "signing",
+        "silent",
+        "studio",
+        "wheel",
+        "wheels",
+    }
+)
+_DATE_ANCHOR_TOKENS = frozenset(
+    {
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -245,6 +386,17 @@ class Stage12RecapPollutionMetrics:
 
 
 @dataclass(frozen=True)
+class Stage13LexicalFeatures:
+    token_overlap: float
+    query_token_coverage: float
+    rare_token_overlap: float
+    proper_name_overlap: float
+    number_currency_overlap: float
+    relationship_anchor_overlap: float
+    diagnostic_anchor_hits: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Stage12RetrievedEpisodeRecord:
     episode_id: UUID
     kind: EpisodeKind
@@ -269,6 +421,7 @@ class Stage12RetrievedEpisodeRecord:
     is_preferred_expected: bool
     is_acceptable: bool
     is_current_query: bool
+    lexical_features: Stage13LexicalFeatures | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +515,19 @@ class Stage12WeightProfile:
     access: float
     importance: float
     frequency: float
+
+
+@dataclass(frozen=True)
+class Stage13LexicalProfile:
+    name: str
+    description: str
+    original_score: float
+    token_overlap: float = 0.0
+    query_token_coverage: float = 0.0
+    rare_token_overlap: float = 0.0
+    proper_name_overlap: float = 0.0
+    number_currency_overlap: float = 0.0
+    relationship_anchor_overlap: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -511,6 +677,7 @@ def score_stage12_retrieval_case(
             current_query_ids=current_query_ids,
             preferred_ids=preferred_ids,
             timing_mode=timing_mode,
+            query=case.query,
         )
         for episode in diagnostic_retrieved
     )
@@ -661,6 +828,141 @@ def stage12_scoring_weights() -> dict[str, float]:
         "importance": IMPORTANCE_WEIGHT,
         "frequency": FREQUENCY_WEIGHT,
     }
+
+
+def stage13_lexical_tokens(text: str) -> tuple[str, ...]:
+    """Return deterministic lowercase lexical tokens for eval-only diagnostics."""
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for match in _LEXICAL_TOKEN_RE.finditer(text):
+        token = _normalize_lexical_token(match.group(0))
+        if not token or token in _LEXICAL_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tuple(tokens)
+
+
+def stage13_lexical_features(query: str, content: str) -> Stage13LexicalFeatures:
+    """Compute transparent eval-only lexical features for one query/candidate pair."""
+
+    query_tokens = set(stage13_lexical_tokens(query))
+    content_tokens = set(stage13_lexical_tokens(content))
+    query_rare_tokens = _rare_lexical_tokens(query)
+    query_proper_names = _proper_name_tokens(query)
+    query_number_terms = _number_currency_terms(query)
+    query_relationship_terms = query_tokens.intersection(_RELATIONSHIP_ANCHOR_TOKENS)
+
+    return Stage13LexicalFeatures(
+        token_overlap=_jaccard_score(query_tokens, content_tokens),
+        query_token_coverage=_coverage_score(query_tokens, content_tokens),
+        rare_token_overlap=_coverage_score(query_rare_tokens, content_tokens),
+        proper_name_overlap=_coverage_score(query_proper_names, content_tokens),
+        number_currency_overlap=_coverage_score(
+            query_number_terms, _number_currency_terms(content)
+        ),
+        relationship_anchor_overlap=_coverage_score(query_relationship_terms, content_tokens),
+        diagnostic_anchor_hits=_diagnostic_anchor_hits(
+            content_tokens, _number_currency_terms(content)
+        ),
+    )
+
+
+def stage13_lexical_profiles() -> tuple[Stage13LexicalProfile, ...]:
+    """Return fixed eval-only Stage 13c-1 lexical replay profiles."""
+
+    return (
+        Stage13LexicalProfile(
+            name="baseline",
+            description="Preserve the emitted diagnostic ordering.",
+            original_score=1.0,
+        ),
+        Stage13LexicalProfile(
+            name="token_overlap_blend",
+            description="Blend original score with simple token overlap and query coverage.",
+            original_score=0.95,
+            token_overlap=0.03,
+            query_token_coverage=0.02,
+        ),
+        Stage13LexicalProfile(
+            name="rare_anchor_boost",
+            description="Boost longer query anchors and proper-name overlap.",
+            original_score=0.93,
+            rare_token_overlap=0.03,
+            proper_name_overlap=0.04,
+        ),
+        Stage13LexicalProfile(
+            name="relationship_anchor_boost",
+            description="Boost relationship/action anchors such as cousin, partner, and lease.",
+            original_score=0.93,
+            rare_token_overlap=0.01,
+            proper_name_overlap=0.02,
+            relationship_anchor_overlap=0.04,
+        ),
+        Stage13LexicalProfile(
+            name="number_exact_boost",
+            description="Boost exact numeric, currency, and simple date-token overlap.",
+            original_score=0.93,
+            token_overlap=0.01,
+            number_currency_overlap=0.06,
+        ),
+        Stage13LexicalProfile(
+            name="lexical_combined",
+            description=(
+                "Conservative blend of token, rare, name, number, and relationship signals."
+            ),
+            original_score=0.90,
+            token_overlap=0.02,
+            query_token_coverage=0.02,
+            rare_token_overlap=0.02,
+            proper_name_overlap=0.02,
+            number_currency_overlap=0.01,
+            relationship_anchor_overlap=0.01,
+        ),
+    )
+
+
+def stage13_lexical_profile_to_dict(profile: Stage13LexicalProfile) -> dict[str, object]:
+    """Convert a Stage 13c-1 lexical profile to JSON-safe values."""
+
+    return {
+        "name": profile.name,
+        "description": profile.description,
+        "weights": {
+            "original_score": profile.original_score,
+            "token_overlap": profile.token_overlap,
+            "query_token_coverage": profile.query_token_coverage,
+            "rare_token_overlap": profile.rare_token_overlap,
+            "proper_name_overlap": profile.proper_name_overlap,
+            "number_currency_overlap": profile.number_currency_overlap,
+            "relationship_anchor_overlap": profile.relationship_anchor_overlap,
+        },
+    }
+
+
+def score_stage13_lexical_profile_record(
+    record: Stage12RetrievedEpisodeRecord,
+    profile: Stage13LexicalProfile,
+) -> float:
+    """Replay one candidate score under an eval-only lexical profile."""
+
+    if profile.name == "baseline":
+        return record.score
+    if record.lexical_features is None:
+        raise InvalidRetrievalRequestError(
+            "Stage 13 lexical replay requires lexical_features on diagnostic records"
+        )
+    features = record.lexical_features
+    return (
+        profile.original_score * record.score
+        + profile.token_overlap * features.token_overlap
+        + profile.query_token_coverage * features.query_token_coverage
+        + profile.rare_token_overlap * features.rare_token_overlap
+        + profile.proper_name_overlap * features.proper_name_overlap
+        + profile.number_currency_overlap * features.number_currency_overlap
+        + profile.relationship_anchor_overlap * features.relationship_anchor_overlap
+    )
 
 
 def stage12_weight_sweep_profiles() -> tuple[Stage12WeightProfile, ...]:
@@ -1012,6 +1314,370 @@ def stage12_weight_sweep_report_to_markdown(payload: Mapping[str, object]) -> st
             f"{_format_metric(movement['baseline_first_acceptable_rank'])} | "
             f"{_format_metric(movement['best_first_acceptable_rank'])} | "
             f"{movement['best_first_acceptable_profile']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Regression Gates",
+            "",
+            "| Profile | Recommended | Failed Gates |",
+            "| --- | ---: | --- |",
+        ]
+    )
+    for profile_name, gate_value in gates.items():
+        gate_record = _as_mapping(gate_value)
+        failed = gate_record["failed_gates"]
+        failed_text = ", ".join(str(item) for item in failed) if isinstance(failed, list) else ""
+        lines.append(f"| {profile_name} | {gate_record['recommended']} | {failed_text or 'none'} |")
+
+    lines.extend(
+        [
+            "",
+            "## Recommendation",
+            "",
+            f"- Decision: {recommendation['decision']}",
+            f"- Profile: {recommendation.get('profile')}",
+            f"- Explanation: {recommendation['explanation']}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def replay_stage13_lexical_profile_case(
+    case: Stage12CaseResult,
+    profile: Stage13LexicalProfile,
+    *,
+    official_top_k: int | None = None,
+    diagnostic_top_k: int | None = None,
+) -> Stage12CaseResult:
+    """Replay one emitted diagnostic case under an eval-only lexical profile."""
+
+    top_k = _resolve_stage12_weight_sweep_top_k(case.top_k, official_top_k)
+    case_diagnostic_top_k = _resolve_diagnostic_top_k(
+        top_k=top_k,
+        diagnostic_top_k=diagnostic_top_k
+        if diagnostic_top_k is not None
+        else case.diagnostics.diagnostic_top_k,
+    )
+    candidates = tuple(sorted(case.retrieved, key=lambda record: record.rank))[
+        :case_diagnostic_top_k
+    ]
+    if profile.name == "baseline":
+        ordered_candidates = candidates
+    else:
+        scored_candidates = tuple(
+            (
+                score_stage13_lexical_profile_record(record, profile),
+                record.rank,
+                record,
+            )
+            for record in candidates
+        )
+        ordered_candidates = tuple(
+            item[2] for item in sorted(scored_candidates, key=lambda item: (-item[0], item[1]))
+        )
+
+    official_rank = 0
+    replayed_records: list[Stage12RetrievedEpisodeRecord] = []
+    for replay_rank, record in enumerate(ordered_candidates, start=1):
+        profile_score = score_stage13_lexical_profile_record(record, profile)
+        if record.is_current_query:
+            new_official_rank: int | None = None
+        else:
+            official_rank += 1
+            new_official_rank = official_rank
+        replayed_records.append(
+            replace(
+                record,
+                rank=replay_rank,
+                official_rank=new_official_rank,
+                score=profile_score,
+            )
+        )
+
+    return _stage12_case_result_from_records(
+        source=case,
+        records=tuple(replayed_records),
+        top_k=top_k,
+        diagnostic_top_k=case_diagnostic_top_k,
+    )
+
+
+def run_stage13_lexical_replay(
+    *,
+    input_metadata: Mapping[str, object],
+    cases: Sequence[Stage12CaseResult],
+    input_run_path: str | None = None,
+    official_top_k: int | None = None,
+    diagnostic_top_k: int | None = None,
+    profiles: Sequence[Stage13LexicalProfile] | None = None,
+    created_at: datetime | None = None,
+) -> dict[str, object]:
+    """Replay Stage 12 diagnostic records under eval-only lexical profiles."""
+
+    profile_grid = tuple(profiles) if profiles is not None else stage13_lexical_profiles()
+    if not profile_grid:
+        raise InvalidRetrievalRequestError("Stage 13 lexical replay requires at least one profile")
+    profile_names = [profile.name for profile in profile_grid]
+    if len(set(profile_names)) != len(profile_names):
+        raise InvalidRetrievalRequestError("Stage 13 lexical replay profile names must be unique")
+    if "baseline" not in set(profile_names):
+        raise InvalidRetrievalRequestError("Stage 13 lexical replay requires a baseline profile")
+
+    missing_feature_count = _stage13_missing_lexical_feature_count(cases)
+    if missing_feature_count and any(profile.name != "baseline" for profile in profile_grid):
+        raise InvalidRetrievalRequestError(
+            "Stage 13 lexical replay requires lexical_features on diagnostic records; "
+            f"{missing_feature_count} candidate record(s) are missing them. Re-run the "
+            "Stage 12 baseline after Stage 13c-1 so numeric lexical features are emitted, "
+            "or use a fixture-backed input. Older cases.jsonl files do not contain full "
+            "candidate content or lexical features."
+        )
+
+    input_run_id = _required_str(input_metadata, "run_id")
+    created = datetime.now(UTC) if created_at is None else created_at
+    results_by_profile = {
+        profile.name: tuple(
+            replay_stage13_lexical_profile_case(
+                case,
+                profile,
+                official_top_k=official_top_k,
+                diagnostic_top_k=diagnostic_top_k,
+            )
+            for case in cases
+        )
+        for profile in profile_grid
+    }
+    baseline_results = results_by_profile["baseline"]
+    aggregate_by_profile = {
+        profile.name: _stage13_lexical_aggregate_to_dict(
+            baseline_results=baseline_results,
+            profile_results=results_by_profile[profile.name],
+            missing_feature_count=missing_feature_count,
+        )
+        for profile in profile_grid
+    }
+    regression_gates = {
+        profile.name: _stage13_lexical_regression_gates(
+            baseline_results=baseline_results,
+            profile_results=results_by_profile[profile.name],
+            missing_feature_count=missing_feature_count,
+        )
+        for profile in profile_grid
+    }
+    rank_movement = _stage12_weight_sweep_rank_movement(results_by_profile)
+
+    return {
+        "metadata": {
+            "run_id": f"{input_run_id}-lexical-replay",
+            "created_at": created.astimezone(UTC).isoformat(),
+            "input_run_id": input_run_id,
+            "input_diagnostic_run": input_run_path,
+            "input_timing_mode": input_metadata.get("timing_mode"),
+            "input_embedder_mode": input_metadata.get("embedder_mode"),
+            "input_embedding_model": input_metadata.get("embedding_model"),
+            "input_git_branch": input_metadata.get("git_branch"),
+            "input_git_sha": input_metadata.get("git_sha"),
+            "official_top_k_override": official_top_k,
+            "diagnostic_top_k_override": diagnostic_top_k,
+            "feature_definitions": stage13_lexical_feature_definitions(),
+            "profile_definitions": [
+                stage13_lexical_profile_to_dict(profile) for profile in profile_grid
+            ],
+            "target_cases": list(STAGE13_LEXICAL_TARGET_CASES),
+            "diagnostic_anchors": list(STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS.values()),
+        },
+        "input_run_metadata": dict(input_metadata),
+        "aggregate_metrics_by_profile": aggregate_by_profile,
+        "per_case_rank_movement": rank_movement,
+        "target_case_focus": [
+            item for item in rank_movement if item["example_id"] in STAGE13_LEXICAL_TARGET_CASES
+        ],
+        "anchor_diagnostics": _stage13_lexical_anchor_diagnostics(results_by_profile),
+        "regression_gates": regression_gates,
+        "recommendation": _stage13_lexical_recommendation(
+            baseline_results=baseline_results,
+            aggregate_by_profile=aggregate_by_profile,
+            regression_gates=regression_gates,
+        ),
+    }
+
+
+def stage13_lexical_feature_definitions() -> list[dict[str, object]]:
+    """Return reportable definitions for Stage 13c-1 lexical features."""
+
+    return [
+        {
+            "name": "token_overlap",
+            "description": "Jaccard overlap between normalized query and candidate tokens.",
+        },
+        {
+            "name": "query_token_coverage",
+            "description": "Fraction of normalized query tokens present in the candidate.",
+        },
+        {
+            "name": "rare_token_overlap",
+            "description": "Coverage of longer or anchor-like query tokens in the candidate.",
+        },
+        {
+            "name": "proper_name_overlap",
+            "description": "Coverage of simple capitalized query-token heuristics.",
+        },
+        {
+            "name": "number_currency_overlap",
+            "description": "Coverage of exact number, currency, and simple date tokens.",
+        },
+        {
+            "name": "relationship_anchor_overlap",
+            "description": "Coverage of relationship/action anchors such as lease or partner.",
+        },
+    ]
+
+
+def stage13_lexical_replay_report_to_markdown(payload: Mapping[str, object]) -> str:
+    """Render a Markdown report for Stage 13c-1 lexical replay output."""
+
+    metadata = _required_mapping(payload, "metadata")
+    feature_definitions = _required_list(metadata, "feature_definitions")
+    profile_definitions = _required_list(metadata, "profile_definitions")
+    aggregates = _required_mapping(payload, "aggregate_metrics_by_profile")
+    rank_movement = _required_list(payload, "per_case_rank_movement")
+    target_focus = _required_list(payload, "target_case_focus")
+    anchor_diagnostics = _required_list(payload, "anchor_diagnostics")
+    gates = _required_mapping(payload, "regression_gates")
+    recommendation = _required_mapping(payload, "recommendation")
+
+    lines = [
+        f"# Stage 13c-1 Lexical Replay: {_required_str(metadata, 'input_run_id')}",
+        "",
+        "## Metadata",
+        "",
+        f"- Input diagnostic run: {metadata.get('input_diagnostic_run')}",
+        f"- Timing mode: {metadata.get('input_timing_mode')}",
+        (
+            f"- Embedder: {metadata.get('input_embedder_mode')} "
+            f"({metadata.get('input_embedding_model')})"
+        ),
+        f"- Official top-k override: {metadata.get('official_top_k_override')}",
+        f"- Diagnostic top-k override: {metadata.get('diagnostic_top_k_override')}",
+        f"- Git SHA: {metadata.get('input_git_sha')}",
+        "",
+        "## Lexical Feature Definitions",
+        "",
+        "| Feature | Definition |",
+        "| --- | --- |",
+    ]
+    for item in feature_definitions:
+        feature = _as_mapping(item)
+        lines.append(f"| {feature['name']} | {feature['description']} |")
+
+    lines.extend(
+        [
+            "",
+            "## Profile Definitions",
+            "",
+            ("| Profile | Original | Token | Coverage | Rare | Proper | Number | Relationship |"),
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for item in profile_definitions:
+        profile = _as_mapping(item)
+        weights = _required_mapping(profile, "weights")
+        lines.append(
+            f"| {profile['name']} | {_format_metric(weights['original_score'])} | "
+            f"{_format_metric(weights['token_overlap'])} | "
+            f"{_format_metric(weights['query_token_coverage'])} | "
+            f"{_format_metric(weights['rare_token_overlap'])} | "
+            f"{_format_metric(weights['proper_name_overlap'])} | "
+            f"{_format_metric(weights['number_currency_overlap'])} | "
+            f"{_format_metric(weights['relationship_anchor_overlap'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Aggregate Metrics By Profile",
+            "",
+            (
+                "| Profile | Acceptable@K | Raw@K | Summary@K | MRR | "
+                "Direct Regressions | Negative Control | Missing Features |"
+            ),
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for profile_name, aggregate_value in aggregates.items():
+        aggregate = _as_mapping(aggregate_value)
+        lines.append(
+            f"| {profile_name} | {_format_metric(aggregate['acceptable_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['raw_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['summary_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['mean_reciprocal_rank'])} | "
+            f"{aggregate['direct_fact_regression_count']} | "
+            f"{aggregate['negative_control_no_hit_retained']} | "
+            f"{aggregate['missing_lexical_feature_count']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per-Case Rank Movement",
+            "",
+            (
+                "| Example | Top K | Profile | First Acceptable | First Raw | "
+                "First Summary | Acceptable Delta | Raw Delta | Summary Delta |"
+            ),
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for item in rank_movement:
+        movement = _as_mapping(item)
+        profiles = _required_mapping(movement, "profiles")
+        for profile_name, profile_value in profiles.items():
+            profile = _as_mapping(profile_value)
+            lines.append(
+                f"| {movement['example_id']} | {movement['top_k']} | {profile_name} | "
+                f"{_format_metric(profile['first_acceptable_rank'])} | "
+                f"{_format_metric(profile['first_raw_rank'])} | "
+                f"{_format_metric(profile['first_summary_rank'])} | "
+                f"{_format_metric(profile['acceptable_rank_delta'])} | "
+                f"{_format_metric(profile['raw_rank_delta'])} | "
+                f"{_format_metric(profile['summary_rank_delta'])} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Target-Case Focus",
+            "",
+            "| Example | Baseline First Acceptable | Best First Acceptable | Best Profile |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    )
+    for item in target_focus:
+        movement = _as_mapping(item)
+        lines.append(
+            f"| {movement['example_id']} | "
+            f"{_format_metric(movement['baseline_first_acceptable_rank'])} | "
+            f"{_format_metric(movement['best_first_acceptable_rank'])} | "
+            f"{movement['best_first_acceptable_profile']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Exact-Name And Anchor Diagnostics",
+            "",
+            "| Anchor | Profile | Diagnostic Count | Official Top K Count | First Official Rank |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+    )
+    for item in anchor_diagnostics:
+        row = _as_mapping(item)
+        lines.append(
+            f"| {row['anchor']} | {row['profile']} | {row['diagnostic_count']} | "
+            f"{row['official_top_k_count']} | {_format_metric(row['first_official_rank'])} |"
         )
 
     lines.extend(
@@ -1862,6 +2528,305 @@ def _profile_improves(
     )
 
 
+def _stage13_missing_lexical_feature_count(cases: Sequence[Stage12CaseResult]) -> int:
+    return sum(1 for case in cases for record in case.retrieved if record.lexical_features is None)
+
+
+def _stage13_lexical_aggregate_to_dict(
+    *,
+    baseline_results: Sequence[Stage12CaseResult],
+    profile_results: Sequence[Stage12CaseResult],
+    missing_feature_count: int,
+) -> dict[str, object]:
+    aggregate = stage12_aggregate_metrics_to_dict(summarize_stage12_results(profile_results))
+    aggregate.update(
+        {
+            "direct_fact_regression_count": _stage13_direct_fact_regression_count(
+                baseline_cases=baseline_results,
+                policy_cases=profile_results,
+            ),
+            "negative_control_no_hit_retained": _negative_control_no_hit_retained(profile_results),
+            "missing_lexical_feature_count": missing_feature_count,
+            "candidate_count": sum(len(result.retrieved) for result in profile_results),
+        }
+    )
+    return aggregate
+
+
+def _stage13_lexical_regression_gates(
+    *,
+    baseline_results: Sequence[Stage12CaseResult],
+    profile_results: Sequence[Stage12CaseResult],
+    missing_feature_count: int,
+) -> dict[str, object]:
+    baseline_aggregate = summarize_stage12_results(baseline_results)
+    profile_aggregate = summarize_stage12_results(profile_results)
+    direct_fact_regressions = _stage13_direct_fact_regression_count(
+        baseline_cases=baseline_results,
+        policy_cases=profile_results,
+    )
+    negative_control_no_hit_retained = _negative_control_no_hit_retained(profile_results)
+    gates = [
+        _gate_record(
+            "acceptable_hit_not_dropped",
+            failed=profile_aggregate.acceptable_hit_rate_at_k
+            < baseline_aggregate.acceptable_hit_rate_at_k - _METRIC_EPSILON,
+            value=profile_aggregate.acceptable_hit_rate_at_k,
+            baseline=baseline_aggregate.acceptable_hit_rate_at_k,
+        ),
+        _gate_record(
+            "raw_hit_not_dropped",
+            failed=profile_aggregate.raw_hit_rate_at_k
+            < baseline_aggregate.raw_hit_rate_at_k - _METRIC_EPSILON,
+            value=profile_aggregate.raw_hit_rate_at_k,
+            baseline=baseline_aggregate.raw_hit_rate_at_k,
+        ),
+        _gate_record(
+            "mrr_not_materially_dropped",
+            failed=profile_aggregate.mean_reciprocal_rank
+            < baseline_aggregate.mean_reciprocal_rank - _MATERIAL_MRR_DROP,
+            value=profile_aggregate.mean_reciprocal_rank,
+            baseline=baseline_aggregate.mean_reciprocal_rank,
+            threshold=_MATERIAL_MRR_DROP,
+        ),
+        _gate_record(
+            "direct_fact_regression",
+            failed=direct_fact_regressions > 0,
+            value=direct_fact_regressions,
+            detail="previously passing direct facts must keep preferred hits",
+        ),
+        _gate_record(
+            "negative_control_no_hit_retained",
+            failed=not negative_control_no_hit_retained,
+            value=negative_control_no_hit_retained,
+        ),
+        _gate_record(
+            "summary_gain_not_at_raw_expense",
+            failed=profile_aggregate.summary_hit_rate_at_k
+            > baseline_aggregate.summary_hit_rate_at_k + _METRIC_EPSILON
+            and profile_aggregate.raw_hit_rate_at_k
+            < baseline_aggregate.raw_hit_rate_at_k - _METRIC_EPSILON,
+            value=profile_aggregate.summary_hit_rate_at_k,
+            baseline=baseline_aggregate.summary_hit_rate_at_k,
+        ),
+        _gate_record(
+            "lexical_features_available",
+            failed=missing_feature_count > 0,
+            value=missing_feature_count,
+        ),
+        _gate_record(
+            "profile_is_generic",
+            failed=False,
+            value=True,
+            detail="built-in profiles do not branch on case IDs",
+        ),
+    ]
+    failed_gates = [str(gate["name"]) for gate in gates if gate.get("status") == "fail"]
+    return {
+        "recommended": not failed_gates,
+        "failed_gates": failed_gates,
+        "gates": gates,
+    }
+
+
+def _stage13_lexical_recommendation(
+    *,
+    baseline_results: Sequence[Stage12CaseResult],
+    aggregate_by_profile: Mapping[str, Mapping[str, object]],
+    regression_gates: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    baseline = aggregate_by_profile["baseline"]
+    candidates: list[tuple[tuple[float, float, float], str]] = []
+    for profile_name, aggregate in aggregate_by_profile.items():
+        if profile_name == "baseline":
+            continue
+        gates = regression_gates[profile_name]
+        if not gates.get("recommended"):
+            continue
+        if not _stage13_lexical_profile_improves(profile=aggregate, baseline=baseline):
+            continue
+        candidates.append(
+            (
+                (
+                    _required_float(aggregate, "acceptable_hit_rate_at_k"),
+                    _required_float(aggregate, "hit_rate_at_k"),
+                    _required_float(aggregate, "mean_reciprocal_rank"),
+                ),
+                profile_name,
+            )
+        )
+
+    if candidates:
+        _, profile_name = max(candidates)
+        return {
+            "decision": "lexical_rerank_candidate",
+            "profile": profile_name,
+            "explanation": (
+                "A lexical profile improved retrieval metrics without tripping "
+                "the Stage 13c-1 regression gates."
+            ),
+        }
+    if any(_positive_case_absent_from_diagnostic_top_k(result) for result in baseline_results):
+        return {
+            "decision": "candidate_generation_needed_later",
+            "profile": None,
+            "explanation": (
+                "At least one positive case lacks acceptable evidence at diagnostic depth, "
+                "so reranking alone cannot solve every failure."
+            ),
+        }
+    if any(
+        result.diagnostics.first_acceptable_diagnostic_rank is not None
+        and result.diagnostics.first_acceptable_diagnostic_rank > result.top_k
+        for result in baseline_results
+    ):
+        return {
+            "decision": "lexical_replay_insufficient",
+            "profile": None,
+            "explanation": (
+                "Expected evidence is visible at diagnostic depth, but no safe lexical "
+                "profile improved the official top-k metrics."
+            ),
+        }
+    return {
+        "decision": "no_lexical_change_recommended",
+        "profile": "baseline",
+        "explanation": "The baseline ordering remains the safest choice in this replay.",
+    }
+
+
+def _stage13_lexical_profile_improves(
+    *,
+    profile: Mapping[str, object],
+    baseline: Mapping[str, object],
+) -> bool:
+    return (
+        _required_float(profile, "acceptable_hit_rate_at_k")
+        > _required_float(baseline, "acceptable_hit_rate_at_k") + _METRIC_EPSILON
+        or _required_float(profile, "hit_rate_at_k")
+        > _required_float(baseline, "hit_rate_at_k") + _METRIC_EPSILON
+        or _required_float(profile, "mean_reciprocal_rank")
+        > _required_float(baseline, "mean_reciprocal_rank") + _MATERIAL_MRR_DROP
+    )
+
+
+def _positive_case_absent_from_diagnostic_top_k(result: Stage12CaseResult) -> bool:
+    has_positive_expected = bool(
+        result.expected_ids.raw or result.expected_ids.summary or result.expected_ids.acceptable
+    )
+    return has_positive_expected and not result.diagnostics.acceptable_in_diagnostic_top_k
+
+
+def _stage13_lexical_anchor_diagnostics(
+    results_by_profile: Mapping[str, Sequence[Stage12CaseResult]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for profile_name, results in results_by_profile.items():
+        for anchor in STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS.values():
+            diagnostic_records = [
+                record
+                for result in results
+                for record in result.retrieved
+                if _stage13_record_has_diagnostic_anchor(record, anchor)
+            ]
+            official_records = [
+                record
+                for result in results
+                for record in result.retrieved
+                if record.official_rank is not None
+                and record.official_rank <= result.top_k
+                and _stage13_record_has_diagnostic_anchor(record, anchor)
+            ]
+            first_rank = min(
+                (record.official_rank for record in official_records if record.official_rank),
+                default=None,
+            )
+            rows.append(
+                {
+                    "anchor": anchor,
+                    "profile": profile_name,
+                    "diagnostic_count": len(diagnostic_records),
+                    "official_top_k_count": len(official_records),
+                    "first_official_rank": first_rank,
+                }
+            )
+    return rows
+
+
+def _stage13_record_has_diagnostic_anchor(
+    record: Stage12RetrievedEpisodeRecord,
+    anchor: str,
+) -> bool:
+    return (
+        record.lexical_features is not None
+        and anchor in record.lexical_features.diagnostic_anchor_hits
+    )
+
+
+def _normalize_lexical_token(value: str) -> str:
+    token = value.strip().lower()
+    if token.startswith("$"):
+        token = token[1:]
+    if token.endswith("'s"):
+        token = token[:-2]
+    token = token.replace(",", "")
+    return token
+
+
+def _rare_lexical_tokens(text: str) -> set[str]:
+    tokens = set(stage13_lexical_tokens(text))
+    return {
+        token
+        for token in tokens
+        if len(token) >= 6
+        or token in _proper_name_tokens(text)
+        or token in _RELATIONSHIP_ANCHOR_TOKENS
+    }
+
+
+def _proper_name_tokens(text: str) -> set[str]:
+    names: set[str] = set()
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9']*\b", text):
+        value = match.group(0)
+        if value in _PROPER_NAME_STOPWORDS:
+            continue
+        token = _normalize_lexical_token(value)
+        if token and token not in _LEXICAL_STOPWORDS:
+            names.add(token)
+    return names
+
+
+def _number_currency_terms(text: str) -> set[str]:
+    tokens = set(stage13_lexical_tokens(text))
+    terms = {
+        _normalize_lexical_token(match.group(0))
+        for match in re.finditer(r"\$?\d[\d,]*(?:\.\d+)?", text)
+    }
+    terms.update(tokens.intersection(_DATE_ANCHOR_TOKENS))
+    return {term for term in terms if term}
+
+
+def _diagnostic_anchor_hits(content_tokens: set[str], number_terms: set[str]) -> tuple[str, ...]:
+    content_terms = content_tokens.union(number_terms)
+    return tuple(
+        label
+        for token, label in STAGE13_LEXICAL_DIAGNOSTIC_ANCHORS.items()
+        if token in content_terms
+    )
+
+
+def _jaccard_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left.intersection(right)) / len(left.union(right))
+
+
+def _coverage_score(query_terms: set[str], candidate_terms: set[str]) -> float:
+    if not query_terms:
+        return 0.0
+    return len(query_terms.intersection(candidate_terms)) / len(query_terms)
+
+
 def _has_recap_echo_above_first_acceptable_result(result: Stage12CaseResult) -> bool:
     first_acceptable = result.diagnostics.first_acceptable_diagnostic_rank
     if first_acceptable is None:
@@ -2315,6 +3280,12 @@ def _expected_ids_from_dict(record: Mapping[str, object]) -> Stage12ExpectedIds:
 def _retrieved_record_from_dict(record: Mapping[str, object]) -> Stage12RetrievedEpisodeRecord:
     score_components = _required_mapping(record, "score_components")
     expected_flags = _required_mapping(record, "expected_flags")
+    lexical_features_value = record.get("lexical_features")
+    lexical_features = (
+        None
+        if lexical_features_value is None
+        else _stage13_lexical_features_from_dict(_as_mapping(lexical_features_value))
+    )
     return Stage12RetrievedEpisodeRecord(
         episode_id=_required_uuid(record, "episode_id"),
         kind=_episode_kind(_required_str(record, "kind")),
@@ -2341,6 +3312,7 @@ def _retrieved_record_from_dict(record: Mapping[str, object]) -> Stage12Retrieve
         is_preferred_expected=_required_bool(expected_flags, "preferred"),
         is_acceptable=_required_bool(expected_flags, "acceptable"),
         is_current_query=_required_bool(expected_flags, "current_query"),
+        lexical_features=lexical_features,
     )
 
 
@@ -2377,6 +3349,20 @@ def _recap_pollution_from_dict(record: Mapping[str, object]) -> Stage12RecapPoll
     return Stage12RecapPollutionMetrics(
         count=_required_int(record, "count"),
         ratio=_required_float(record, "ratio"),
+    )
+
+
+def _stage13_lexical_features_from_dict(
+    record: Mapping[str, object],
+) -> Stage13LexicalFeatures:
+    return Stage13LexicalFeatures(
+        token_overlap=_required_float(record, "token_overlap"),
+        query_token_coverage=_required_float(record, "query_token_coverage"),
+        rare_token_overlap=_required_float(record, "rare_token_overlap"),
+        proper_name_overlap=_required_float(record, "proper_name_overlap"),
+        number_currency_overlap=_required_float(record, "number_currency_overlap"),
+        relationship_anchor_overlap=_required_float(record, "relationship_anchor_overlap"),
+        diagnostic_anchor_hits=_str_tuple(record.get("diagnostic_anchor_hits", ())),
     )
 
 
@@ -2695,6 +3681,7 @@ def _stage12_retrieved_record(
     current_query_ids: set[UUID],
     preferred_ids: set[UUID],
     timing_mode: TimingMode,
+    query: str,
 ) -> Stage12RetrievedEpisodeRecord:
     roles = () if label is None else label.roles
     fact_ids = () if label is None else label.fact_ids
@@ -2729,6 +3716,7 @@ def _stage12_retrieved_record(
         is_preferred_expected=episode.id in preferred_ids,
         is_acceptable=episode.id in acceptable_ids,
         is_current_query=is_current_query,
+        lexical_features=stage13_lexical_features(query, episode.content),
     )
 
 
@@ -3273,6 +4261,7 @@ def _retrieved_record_to_dict(record: Stage12RetrievedEpisodeRecord) -> dict[str
         },
         "label_roles": list(record.label_roles),
         "fact_ids": list(record.fact_ids),
+        "lexical_features": _stage13_lexical_features_to_dict(record.lexical_features),
     }
 
 
@@ -3307,4 +4296,20 @@ def _recap_pollution_to_dict(metrics: Stage12RecapPollutionMetrics) -> dict[str,
     return {
         "count": metrics.count,
         "ratio": metrics.ratio,
+    }
+
+
+def _stage13_lexical_features_to_dict(
+    features: Stage13LexicalFeatures | None,
+) -> dict[str, object] | None:
+    if features is None:
+        return None
+    return {
+        "token_overlap": features.token_overlap,
+        "query_token_coverage": features.query_token_coverage,
+        "rare_token_overlap": features.rare_token_overlap,
+        "proper_name_overlap": features.proper_name_overlap,
+        "number_currency_overlap": features.number_currency_overlap,
+        "relationship_anchor_overlap": features.relationship_anchor_overlap,
+        "diagnostic_anchor_hits": list(features.diagnostic_anchor_hits),
     }

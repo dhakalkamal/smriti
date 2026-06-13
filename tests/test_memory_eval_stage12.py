@@ -12,6 +12,7 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from scripts.run_retrieval_baseline import main as run_retrieval_baseline
+from scripts.run_retrieval_lexical_replay import main as run_retrieval_lexical_replay
 from scripts.run_retrieval_role_policy_replay import main as run_retrieval_role_policy_replay
 from scripts.run_retrieval_weight_sweep import main as run_retrieval_weight_sweep
 from smriti.config import Settings
@@ -29,15 +30,21 @@ from smriti.memory.eval import (
     Stage12ResolvedEpisodeLabel,
     Stage12ResolvedEvalCase,
     Stage12WeightProfile,
+    Stage13LexicalProfile,
     Stage13RolePolicy,
     replay_stage12_weight_profile_case,
+    replay_stage13_lexical_profile_case,
     replay_stage13_role_policy_case,
     run_stage12_weight_sweep,
+    run_stage13_lexical_replay,
     run_stage13_role_policy_replay,
     score_stage12_retrieval_case,
     score_stage12_weight_profile_record,
     stage12_case_result_from_dict,
     stage12_case_result_to_dict,
+    stage13_lexical_features,
+    stage13_lexical_replay_report_to_markdown,
+    stage13_lexical_tokens,
     stage13_role_policy_replay_report_to_markdown,
     stage13_weak_evidence_metrics,
     validate_stage12_corpus,
@@ -902,6 +909,250 @@ def test_stage12_weight_sweep_runner_smoke_writes_json_and_markdown(tmp_path: Pa
     assert "Stage 12b-2 Weight Sweep" in report_path.read_text(encoding="utf-8")
 
 
+def test_stage13_lexical_token_normalization() -> None:
+    assert stage13_lexical_tokens("What did Tunde's $3,650 lease do?") == (
+        "tunde",
+        "3650",
+        "lease",
+    )
+
+
+def test_stage13_lexical_feature_families_find_names_and_relationships() -> None:
+    features = stage13_lexical_features(
+        "What role does cousin Dele have in Tunde's studio plan?",
+        "Cousin Dele is the silent partner handling bookkeeping.",
+    )
+
+    assert features.token_overlap > 0.0
+    assert features.query_token_coverage == pytest.approx(2 / 6)
+    assert features.rare_token_overlap == pytest.approx(2 / 5)
+    assert features.proper_name_overlap == pytest.approx(1 / 2)
+    assert features.relationship_anchor_overlap == pytest.approx(1 / 3)
+    assert "Dele" in features.diagnostic_anchor_hits
+    assert "bookkeeping" in features.diagnostic_anchor_hits
+
+
+def test_stage13_lexical_number_currency_and_date_overlap() -> None:
+    features = stage13_lexical_features(
+        "What is the $3,650 cap for Friday July 31?",
+        "The kiln budget has a hard cap of $3,650 and the signing is Friday, July 31.",
+    )
+
+    assert features.number_currency_overlap == pytest.approx(1.0)
+    assert "$3,650" in features.diagnostic_anchor_hits
+
+
+def test_stage13_lexical_profile_recomputes_ranks() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-0000000003b1")
+    distractor_id = UUID("00000000-0000-4000-8000-0000000003b2")
+    case = _case(
+        raw=(expected_id,),
+        acceptable=(expected_id,),
+        top_k=1,
+        query="What role does cousin Dele have in Tunde's studio plan?",
+        labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+    baseline = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(
+                distractor_id,
+                rank=1,
+                similarity=0.9,
+                content="Lease timing and pottery wheels are still being planned.",
+            ),
+            _episode(
+                expected_id,
+                rank=2,
+                similarity=0.8,
+                content="Cousin Dele is the silent partner handling bookkeeping.",
+            ),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+    profile = Stage13LexicalProfile(
+        name="proper_name_only",
+        description="Synthetic test profile.",
+        original_score=0.0,
+        proper_name_overlap=1.0,
+    )
+
+    replayed = replay_stage13_lexical_profile_case(baseline, profile)
+
+    assert replayed.retrieved[0].episode_id == expected_id
+    assert replayed.metrics.acceptable_hit_at_k is True
+    assert replayed.diagnostics.first_acceptable_diagnostic_rank == 1
+
+
+def test_stage13_lexical_replay_recommends_safe_candidate_and_keeps_negative_control() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-0000000003c1")
+    distractor_id = UUID("00000000-0000-4000-8000-0000000003c2")
+    direct_case = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            query="What role does cousin Dele have in Tunde's studio plan?",
+            labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+        ),
+        (
+            _episode(
+                distractor_id,
+                rank=1,
+                similarity=0.9,
+                content="Lease timing and pottery wheels are still being planned.",
+            ),
+            _episode(
+                expected_id,
+                rank=2,
+                similarity=0.8,
+                content="Cousin Dele is the silent partner handling bookkeeping.",
+            ),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+    negative_control = score_stage12_retrieval_case(
+        _case(top_k=1, question_type="negative_control", query="Which supplier was chosen?"),
+        (
+            _episode(
+                distractor_id,
+                rank=1,
+                similarity=0.6,
+                content="The clay supplier is undecided.",
+            ),
+        ),
+        timing_mode="clean_memory",
+        diagnostic_top_k=1,
+    )
+    payload = run_stage13_lexical_replay(
+        input_metadata={
+            "run_id": "stage13-lexical-synthetic",
+            "timing_mode": "clean_memory",
+            "embedder_mode": "ollama",
+            "embedding_model": "nomic-embed-text",
+        },
+        cases=(direct_case, negative_control),
+        profiles=(
+            Stage13LexicalProfile(
+                name="baseline",
+                description="Preserve baseline.",
+                original_score=1.0,
+            ),
+            Stage13LexicalProfile(
+                name="proper_name_only",
+                description="Synthetic name profile.",
+                original_score=0.0,
+                proper_name_overlap=1.0,
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    recommendation = cast(dict[str, object], payload["recommendation"])
+    aggregates = cast(dict[str, object], payload["aggregate_metrics_by_profile"])
+    profile_aggregate = cast(dict[str, object], aggregates["proper_name_only"])
+
+    assert recommendation["decision"] == "lexical_rerank_candidate"
+    assert recommendation["profile"] == "proper_name_only"
+    assert profile_aggregate["negative_control_no_hit_retained"] is True
+    assert profile_aggregate["missing_lexical_feature_count"] == 0
+
+
+def test_stage13_lexical_replay_rejects_missing_features() -> None:
+    expected_id = UUID("00000000-0000-4000-8000-0000000003d1")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            labels=(_label(expected_id, "raw_source", is_expected=True),),
+        ),
+        (_episode(expected_id, rank=1),),
+        timing_mode="clean_memory",
+    )
+    record = stage12_case_result_to_dict(result)
+    retrieved = cast(list[dict[str, object]], record["retrieved"])
+    del retrieved[0]["lexical_features"]
+    parsed = stage12_case_result_from_dict(record)
+
+    with pytest.raises(InvalidRetrievalRequestError, match="requires lexical_features"):
+        run_stage13_lexical_replay(
+            input_metadata={"run_id": "stage13-missing-features"},
+            cases=(parsed,),
+            created_at=FIXED_NOW,
+        )
+
+
+def test_stage13_lexical_replay_runner_smoke_writes_json_and_markdown(
+    tmp_path: Path,
+) -> None:
+    expected_id = UUID("00000000-0000-4000-8000-0000000003e1")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            query="What role does cousin Dele have?",
+            labels=(_label(expected_id, "raw_source", is_expected=True, is_acceptable=True),),
+        ),
+        (
+            _episode(
+                expected_id,
+                rank=1,
+                content="Cousin Dele is the silent partner handling bookkeeping.",
+            ),
+        ),
+        timing_mode="clean_memory",
+    )
+    input_run = tmp_path / "input-run"
+    input_run.mkdir()
+    (input_run / "run.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "run_id": "stage13-lexical-smoke",
+                    "timing_mode": "clean_memory",
+                    "embedder_mode": "fake",
+                    "embedding_model": "nomic-embed-text",
+                    "git_branch": "stage-13-retrieval-evidence-improvements",
+                    "git_sha": "synthetic",
+                },
+                "aggregate_metrics": {},
+                "cases": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_run / "cases.jsonl").write_text(
+        json.dumps(stage12_case_result_to_dict(result), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = run_retrieval_lexical_replay(
+        [
+            "--input-run",
+            str(input_run),
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--report-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+
+    assert exit_code == 0
+    replay_path = tmp_path / "runs" / "stage13-lexical-smoke" / "lexical_replay.json"
+    report_path = tmp_path / "results" / "stage13-lexical-smoke-lexical-replay.md"
+    assert replay_path.exists()
+    assert report_path.exists()
+    payload = json.loads(replay_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["input_run_id"] == "stage13-lexical-smoke"
+    assert payload["metadata"]["profile_definitions"][0]["name"] == "baseline"
+    assert "lexical_combined" in payload["aggregate_metrics_by_profile"]
+    assert "Stage 13c-1 Lexical Replay" in report_path.read_text(encoding="utf-8")
+    assert "Exact-Name And Anchor Diagnostics" in stage13_lexical_replay_report_to_markdown(payload)
+
+
 def test_stage13_role_policy_replay_runner_smoke_writes_json_and_markdown(
     tmp_path: Path,
 ) -> None:
@@ -1084,13 +1335,14 @@ def _case(
     question_type: str = "direct_fact",
     top_k: int = 5,
     labels: tuple[Stage12ResolvedEpisodeLabel, ...] = (),
+    query: str = "query",
 ) -> Stage12ResolvedEvalCase:
     return Stage12ResolvedEvalCase(
         example_id="case",
         scenario_id="scenario",
         user_id=USER_ID,
         scope_id=SCOPE_ID,
-        query="query",
+        query=query,
         top_k=top_k,
         question_type=cast(QuestionType, question_type),
         fact_ids=("F1",),
@@ -1135,6 +1387,7 @@ def _episode(
     access_score: float = 0.0,
     importance_score: float = 0.0,
     frequency_score: float = 0.0,
+    content: str = "not serialized by Stage 12 result helpers",
 ) -> ScoredEpisode:
     return ScoredEpisode(
         result_rank=rank,
@@ -1147,7 +1400,7 @@ def _episode(
         message_position=rank if kind == "message" else None,
         range_start=13 if kind == "summary" else None,
         range_end=24 if kind == "summary" else None,
-        content="not serialized by Stage 12 result helpers",
+        content=content,
         created_at=FIXED_NOW,
         importance=0.0,
         access_count=0,
