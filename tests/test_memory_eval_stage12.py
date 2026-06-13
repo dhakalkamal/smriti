@@ -850,6 +850,38 @@ def test_stage12_weight_sweep_rejects_missing_score_components() -> None:
         stage12_case_result_from_dict(record)
 
 
+def test_stage12_case_result_serializes_lexical_features_without_content() -> None:
+    episode_id = UUID("00000000-0000-4000-8000-0000000003a1")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(episode_id,),
+            acceptable=(episode_id,),
+            query="What role does cousin Dele have?",
+            labels=(_label(episode_id, "raw_source", is_expected=True, is_acceptable=True),),
+        ),
+        (
+            _episode(
+                episode_id,
+                rank=1,
+                content="Cousin Dele is the silent partner handling bookkeeping.",
+            ),
+        ),
+        timing_mode="clean_memory",
+    )
+
+    record = stage12_case_result_to_dict(result)
+    parsed = stage12_case_result_from_dict(record)
+    retrieved = cast(list[dict[str, object]], record["retrieved"])
+    retrieved_record = retrieved[0]
+    lexical_features = cast(dict[str, object], retrieved_record["lexical_features"])
+
+    assert "content" not in retrieved_record
+    assert lexical_features["proper_name_overlap"] > 0.0
+    assert "Dele" in cast(list[str], lexical_features["diagnostic_anchor_hits"])
+    assert parsed.metrics == result.metrics
+    assert parsed.diagnostics == result.diagnostics
+
+
 def test_stage12_weight_sweep_runner_smoke_writes_json_and_markdown(tmp_path: Path) -> None:
     episode_id = UUID("00000000-0000-4000-8000-000000000381")
     result = score_stage12_retrieval_case(
@@ -1322,8 +1354,47 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
     assert len(payload["cases"]) == 9
     assert payload["cases"][0]["diagnostic_top_k"] == 25
     assert "failure_class" in payload["cases"][0]
+    case_records = cast(list[dict[str, object]], payload["cases"])
+    retrieved_records = [
+        retrieved
+        for case_record in case_records
+        for retrieved in cast(list[dict[str, object]], case_record["retrieved"])
+    ]
+    assert retrieved_records
+    assert all("content" not in retrieved for retrieved in retrieved_records)
+    assert all(isinstance(retrieved["lexical_features"], dict) for retrieved in retrieved_records)
+    first_features = cast(dict[str, object], retrieved_records[0]["lexical_features"])
+    assert set(first_features) == {
+        "token_overlap",
+        "query_token_coverage",
+        "rare_token_overlap",
+        "proper_name_overlap",
+        "number_currency_overlap",
+        "relationship_anchor_overlap",
+        "diagnostic_anchor_hits",
+    }
     assert "Stage 12a Retrieval Baseline" in report_path.read_text(encoding="utf-8")
     assert "Diagnostic Classification" in report_path.read_text(encoding="utf-8")
+
+    replay_exit_code = run_retrieval_lexical_replay(
+        [
+            "--input-run",
+            str(run_dir),
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--report-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+
+    lexical_replay_path = run_dir / "lexical_replay.json"
+    lexical_report_path = tmp_path / "results" / "stage12-smoke-lexical-replay.md"
+    assert replay_exit_code == 0
+    assert lexical_replay_path.exists()
+    assert lexical_report_path.exists()
+    lexical_payload = json.loads(lexical_replay_path.read_text(encoding="utf-8"))
+    assert lexical_payload["metadata"]["input_run_id"] == "stage12-smoke"
+    assert "lexical_combined" in lexical_payload["aggregate_metrics_by_profile"]
 
 
 def _case(
