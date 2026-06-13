@@ -22,6 +22,7 @@ from smriti.memory.eval import (
     EpisodeLabelRole,
     PreferredLayer,
     QuestionType,
+    Stage12CaseResult,
     Stage12Corpus,
     Stage12CorpusCase,
     Stage12CorpusEpisodeLabel,
@@ -32,6 +33,7 @@ from smriti.memory.eval import (
     Stage12WeightProfile,
     Stage13LexicalProfile,
     Stage13RolePolicy,
+    load_stage12_corpus,
     replay_stage12_weight_profile_case,
     replay_stage13_lexical_profile_case,
     replay_stage13_role_policy_case,
@@ -42,6 +44,8 @@ from smriti.memory.eval import (
     score_stage12_weight_profile_record,
     stage12_case_result_from_dict,
     stage12_case_result_to_dict,
+    stage13_evidence_policy_comparison,
+    stage13_evidence_policy_comparison_to_markdown,
     stage13_lexical_features,
     stage13_lexical_replay_report_to_markdown,
     stage13_lexical_tokens,
@@ -882,6 +886,163 @@ def test_stage12_case_result_serializes_lexical_features_without_content() -> No
     assert parsed.diagnostics == result.diagnostics
 
 
+def test_stage12_retrieved_records_include_provenance_without_content() -> None:
+    source_id = UUID("00000000-0000-4000-8000-000000000431")
+    summary_id = UUID("00000000-0000-4000-8000-000000000432")
+    echo_id = UUID("00000000-0000-4000-8000-000000000433")
+    recap_id = UUID("00000000-0000-4000-8000-000000000434")
+    scaffold_id = UUID("00000000-0000-4000-8000-000000000435")
+    distractor_id = UUID("00000000-0000-4000-8000-000000000436")
+    unknown_id = UUID("00000000-0000-4000-8000-000000000437")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(source_id,),
+            summary=(summary_id,),
+            acceptable=(source_id, summary_id),
+            labels=(
+                _label(source_id, "raw_source", is_expected=True, is_acceptable=True),
+                _label(
+                    summary_id,
+                    "summary_source",
+                    kind="summary",
+                    is_expected=True,
+                    is_acceptable=True,
+                ),
+                _label(echo_id, "assistant_answer_echo"),
+                _label(recap_id, "recap_question"),
+                _label(scaffold_id, "scaffold"),
+                _label(distractor_id, "distractor"),
+            ),
+        ),
+        (
+            _episode(source_id, rank=1),
+            _episode(summary_id, rank=2, kind="summary"),
+            _episode(echo_id, rank=3),
+            _episode(recap_id, rank=4),
+            _episode(scaffold_id, rank=5),
+            _episode(distractor_id, rank=6),
+            _episode(unknown_id, rank=7),
+        ),
+        diagnostic_top_k=7,
+    )
+
+    provenance_by_id = {
+        record.episode_id: record.evidence_provenance for record in result.retrieved
+    }
+    serialized = stage12_case_result_to_dict(result)
+    retrieved = cast(list[dict[str, object]], serialized["retrieved"])
+
+    assert provenance_by_id == {
+        source_id: "source_user",
+        summary_id: "source_summary",
+        echo_id: "assistant_echo",
+        recap_id: "recap_question",
+        scaffold_id: "scaffold",
+        distractor_id: "distractor",
+        unknown_id: "unknown",
+    }
+    assert all("content" not in record for record in retrieved)
+    assert all("evidence_provenance" in record for record in retrieved)
+    assert stage12_case_result_from_dict(serialized).retrieved[2].evidence_provenance == (
+        "assistant_echo"
+    )
+
+
+def test_stage13_evidence_policy_keeps_default_source_only_and_credits_derived() -> None:
+    source_id = UUID("00000000-0000-4000-8000-000000000441")
+    echo_id = UUID("00000000-0000-4000-8000-000000000442")
+    blocked = score_stage12_retrieval_case(
+        _case(
+            raw=(source_id,),
+            acceptable=(source_id,),
+            derived_answer=(echo_id,),
+            top_k=1,
+            labels=(
+                _label(echo_id, "assistant_answer_echo"),
+                _label(source_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(echo_id, rank=1), _episode(source_id, rank=2)),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+
+    assert blocked.metrics.acceptable_hit_at_k is False
+    assert blocked.metrics.source_hit_at_k is False
+    assert blocked.metrics.derived_answer_hit_at_k is True
+    assert blocked.metrics.source_miss_but_derived_hit_at_k is True
+    assert blocked.diagnostics.first_source_rank == 2
+    assert blocked.diagnostics.first_derived_answer_rank == 1
+
+    comparison = stage13_evidence_policy_comparison((blocked,))
+    aggregates = cast(dict[str, object], comparison["aggregate_metrics_by_policy"])
+    source_only = cast(dict[str, object], aggregates["SOURCE_ONLY"])
+    source_plus_derived = cast(dict[str, object], aggregates["SOURCE_PLUS_DERIVED"])
+    rows = cast(list[dict[str, object]], comparison["per_case"])
+
+    assert source_only["hit_rate_at_k"] == pytest.approx(0.0)
+    assert source_plus_derived["hit_rate_at_k"] == pytest.approx(1.0)
+    assert rows[0]["flips"] is True
+    assert "SOURCE_PLUS_DERIVED" in stage13_evidence_policy_comparison_to_markdown(comparison)
+
+
+def test_stage13_evidence_policy_terrafold_expected_counterfactual_shape() -> None:
+    cases = _terrafold_audit_policy_cases()
+    comparison = stage13_evidence_policy_comparison(cases)
+    aggregates = cast(dict[str, object], comparison["aggregate_metrics_by_policy"])
+    source_only = cast(dict[str, object], aggregates["SOURCE_ONLY"])
+    source_plus_derived = cast(dict[str, object], aggregates["SOURCE_PLUS_DERIVED"])
+    rows = cast(list[dict[str, object]], comparison["per_case"])
+    flipped = [row["example_id"] for row in rows if row["flips"]]
+    hit_by_case = {row["example_id"]: row for row in rows}
+
+    assert source_only["hit_count"] == 5
+    assert source_only["hit_rate_at_k"] == pytest.approx(5 / 9)
+    assert source_plus_derived["hit_count"] == 6
+    assert source_plus_derived["hit_rate_at_k"] == pytest.approx(6 / 9)
+    assert flipped == ["terrafold_f5_dele_bookkeeping"]
+    for example_id in (
+        "terrafold_f1_studio_name",
+        "terrafold_f3_kiln_budget",
+        "terrafold_f4_latex_allergy",
+        "terrafold_f6_class_size_wheels",
+    ):
+        assert hit_by_case[example_id]["SOURCE_ONLY_hit"] is True
+        assert hit_by_case[example_id]["SOURCE_PLUS_DERIVED_hit"] is True
+    assert hit_by_case["terrafold_negative_clay_supplier"]["SOURCE_ONLY_hit"] is False
+    assert hit_by_case["terrafold_negative_clay_supplier"]["SOURCE_PLUS_DERIVED_hit"] is False
+
+
+def test_terrafold_corpus_has_uniform_derived_answer_metadata() -> None:
+    corpus_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "evals"
+        / "corpora"
+        / "terrafold_planted_facts_v1.jsonl"
+    )
+    corpus = load_stage12_corpus(corpus_path)
+    derived_by_case = {case.example_id: case.expected_refs.derived_answer for case in corpus.cases}
+    provenance_by_ref = {label.semantic_ref: label for label in corpus.provenance_labels}
+    expected_derived_refs = {
+        "terrafold_f1_studio_name": ("tunde_echo_01_studio_name_answer",),
+        "terrafold_f3_kiln_budget": ("tunde_echo_02_kiln_budget_answer",),
+        "terrafold_f4_latex_allergy": ("tunde_echo_03_latex_answer",),
+        "terrafold_f5_dele_bookkeeping": ("tunde_echo_05_dele_bookkeeping_answer",),
+        "terrafold_f6_class_size_wheels": ("tunde_echo_04_class_answer",),
+    }
+
+    for example_id, refs in expected_derived_refs.items():
+        assert derived_by_case[example_id] == refs
+        for semantic_ref in refs:
+            assert provenance_by_ref[semantic_ref].roles == ("assistant_answer_echo",)
+    assert derived_by_case["terrafold_f2_landlord_lease"] == ()
+    assert derived_by_case["terrafold_negative_clay_supplier"] == ()
+    for case in corpus.cases:
+        for derived_ref in case.expected_refs.derived_answer:
+            assert derived_ref not in case.expected_refs.acceptable
+
+
 def test_stage12_weight_sweep_runner_smoke_writes_json_and_markdown(tmp_path: Path) -> None:
     episode_id = UUID("00000000-0000-4000-8000-000000000381")
     result = score_stage12_retrieval_case(
@@ -1473,6 +1634,84 @@ def test_stage13_role_policy_replay_runner_smoke_writes_json_and_markdown(
     assert "Regression Gates" in stage13_role_policy_replay_report_to_markdown(payload)
 
 
+def _terrafold_audit_policy_cases() -> tuple[Stage12CaseResult, ...]:
+    source_ids = [UUID(f"00000000-0000-4000-8000-0000000005{index:02d}") for index in range(1, 10)]
+    derived_ids = [UUID(f"00000000-0000-4000-8000-0000000006{index:02d}") for index in range(1, 10)]
+    cases = [
+        _policy_case("terrafold_f1_studio_name", source_ids[0], derived_ids[0], source_rank=1),
+        _policy_case("terrafold_f2_landlord_lease", source_ids[1], None, source_rank=1),
+        _policy_case("terrafold_f3_kiln_budget", source_ids[2], derived_ids[2], source_rank=1),
+        _policy_case("terrafold_f4_latex_allergy", source_ids[3], derived_ids[3], source_rank=2),
+        _policy_case(
+            "terrafold_f5_dele_bookkeeping",
+            source_ids[4],
+            derived_ids[4],
+            source_rank=12,
+            derived_rank=1,
+        ),
+        _policy_case(
+            "terrafold_f6_class_size_wheels", source_ids[5], derived_ids[5], source_rank=1
+        ),
+        _policy_case(
+            "terrafold_broad_operational_constraints",
+            source_ids[6],
+            None,
+            source_rank=9,
+            top_k=8,
+        ),
+        _policy_case(
+            "terrafold_either_opening_classes",
+            source_ids[7],
+            None,
+            source_rank=19,
+            top_k=8,
+        ),
+        score_stage12_retrieval_case(
+            _case(
+                example_id="terrafold_negative_clay_supplier",
+                top_k=5,
+                question_type="negative_control",
+            ),
+            (_episode(source_ids[8], rank=1),),
+            timing_mode="clean_memory",
+            diagnostic_top_k=1,
+        ),
+    ]
+    return tuple(cases)
+
+
+def _policy_case(
+    example_id: str,
+    source_id: UUID,
+    derived_id: UUID | None,
+    *,
+    source_rank: int,
+    derived_rank: int = 2,
+    top_k: int = 5,
+) -> Stage12CaseResult:
+    labels = [_label(source_id, "raw_source", is_expected=True, is_acceptable=True)]
+    derived_ids: tuple[UUID, ...] = ()
+    retrieved = [_episode(source_id, rank=source_rank)]
+    if derived_id is not None:
+        labels.append(_label(derived_id, "assistant_answer_echo"))
+        derived_ids = (derived_id,)
+        retrieved.append(_episode(derived_id, rank=derived_rank))
+
+    return score_stage12_retrieval_case(
+        _case(
+            example_id=example_id,
+            raw=(source_id,),
+            acceptable=(source_id,),
+            derived_answer=derived_ids,
+            top_k=top_k,
+            labels=tuple(labels),
+        ),
+        tuple(sorted(retrieved, key=lambda episode: episode.result_rank)),
+        timing_mode="clean_memory",
+        diagnostic_top_k=max(source_rank, derived_rank if derived_id is not None else 1),
+    )
+
+
 def test_stage12_corpus_validation_rejects_unknown_refs_and_roles() -> None:
     valid_label = Stage12CorpusEpisodeLabel(
         semantic_ref="known",
@@ -1618,10 +1857,12 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
 
 
 def _case(
+    example_id: str = "case",
     raw: tuple[UUID, ...] = (),
     summary: tuple[UUID, ...] = (),
     acceptable: tuple[UUID, ...] = (),
     current_query: tuple[UUID, ...] = (),
+    derived_answer: tuple[UUID, ...] = (),
     preferred_layer: str = "raw",
     question_type: str = "direct_fact",
     top_k: int = 5,
@@ -1629,7 +1870,7 @@ def _case(
     query: str = "query",
 ) -> Stage12ResolvedEvalCase:
     return Stage12ResolvedEvalCase(
-        example_id="case",
+        example_id=example_id,
         scenario_id="scenario",
         user_id=USER_ID,
         scope_id=SCOPE_ID,
@@ -1643,6 +1884,7 @@ def _case(
             summary=summary,
             acceptable=acceptable,
             current_query=current_query,
+            derived_answer=derived_answer,
         ),
         episode_labels=labels,
     )

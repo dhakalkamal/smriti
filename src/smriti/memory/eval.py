@@ -29,9 +29,19 @@ EpisodeLabelRole = Literal[
     "recap_question",
     "assistant_answer_echo",
     "distractor",
+    "scaffold",
     "current_query",
 ]
 EpisodeLabelLayer = Literal["raw", "summary", "diagnostic"]
+EpisodeEvidenceProvenance = Literal[
+    "source_user",
+    "source_summary",
+    "assistant_echo",
+    "recap_question",
+    "scaffold",
+    "distractor",
+    "unknown",
+]
 PreferredLayer = Literal["raw", "summary", "either"]
 QuestionType = Literal[
     "direct_fact",
@@ -73,6 +83,7 @@ Stage13LexicalReplayRecommendation = Literal[
     "candidate_generation_needed_later",
     "summary_only_gain_more_data_needed",
 ]
+Stage13EvidencePolicy = Literal["SOURCE_ONLY", "SOURCE_PLUS_DERIVED"]
 
 _VALID_EPISODE_LABEL_ROLES = frozenset(
     {
@@ -81,10 +92,22 @@ _VALID_EPISODE_LABEL_ROLES = frozenset(
         "recap_question",
         "assistant_answer_echo",
         "distractor",
+        "scaffold",
         "current_query",
     }
 )
 _VALID_EPISODE_LABEL_LAYERS = frozenset({"raw", "summary", "diagnostic"})
+_VALID_EVIDENCE_PROVENANCE = frozenset(
+    {
+        "source_user",
+        "source_summary",
+        "assistant_echo",
+        "recap_question",
+        "scaffold",
+        "distractor",
+        "unknown",
+    }
+)
 _VALID_PREFERRED_LAYERS = frozenset({"raw", "summary", "either"})
 _VALID_QUESTION_TYPES = frozenset(
     {
@@ -297,6 +320,7 @@ class Stage12ExpectedRefs:
     summary: tuple[str, ...]
     acceptable: tuple[str, ...]
     current_query: tuple[str, ...]
+    derived_answer: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -305,6 +329,7 @@ class Stage12ExpectedIds:
     summary: tuple[UUID, ...]
     acceptable: tuple[UUID, ...]
     current_query: tuple[UUID, ...]
+    derived_answer: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -358,6 +383,7 @@ class Stage12Corpus:
     embedding_model: str
     cases: tuple[Stage12CorpusCase, ...]
     notes: str | None = None
+    provenance_labels: tuple[Stage12CorpusEpisodeLabel, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -405,6 +431,7 @@ class Stage13LexicalFeatures:
 @dataclass(frozen=True)
 class Stage12RetrievedEpisodeRecord:
     episode_id: UUID
+    semantic_ref: str | None
     kind: EpisodeKind
     rank: int
     official_rank: int | None
@@ -421,11 +448,13 @@ class Stage12RetrievedEpisodeRecord:
     importance_score: float
     frequency_score: float
     label_roles: tuple[EpisodeLabelRole, ...]
+    evidence_provenance: EpisodeEvidenceProvenance
     fact_ids: tuple[str, ...]
     is_raw_expected: bool
     is_summary_expected: bool
     is_preferred_expected: bool
     is_acceptable: bool
+    is_derived_answer: bool
     is_current_query: bool
     lexical_features: Stage13LexicalFeatures | None = None
 
@@ -439,6 +468,11 @@ class Stage12CaseMetrics:
     raw_hit_at_k: bool
     summary_hit_at_k: bool
     acceptable_hit_at_k: bool
+    source_hit_at_k: bool
+    source_raw_hit_at_k: bool
+    source_summary_hit_at_k: bool
+    derived_answer_hit_at_k: bool
+    source_miss_but_derived_hit_at_k: bool
     kind_mix_at_k: Stage12KindMixMetrics
     self_query_hit: bool
     self_query_rank: int | None
@@ -453,10 +487,14 @@ class Stage12DiagnosticMetrics:
     raw_expected_in_diagnostic_top_k: bool
     summary_expected_in_diagnostic_top_k: bool
     acceptable_in_diagnostic_top_k: bool
+    source_in_diagnostic_top_k: bool
+    derived_answer_in_diagnostic_top_k: bool
     first_expected_diagnostic_rank: int | None
     first_raw_diagnostic_rank: int | None
     first_summary_diagnostic_rank: int | None
     first_acceptable_diagnostic_rank: int | None
+    first_source_rank: int | None
+    first_derived_answer_rank: int | None
     diagnostic_kind_mix: Stage12KindMixMetrics
     diagnostic_recap_pollution: Stage12RecapPollutionMetrics
     failure_class: tuple[Stage12FailureClass, ...]
@@ -487,6 +525,11 @@ class Stage12AggregateMetrics:
     raw_hit_rate_at_k: float
     summary_hit_rate_at_k: float
     acceptable_hit_rate_at_k: float
+    source_hit_rate_at_k: float
+    source_raw_hit_rate_at_k: float
+    source_summary_hit_rate_at_k: float
+    derived_answer_hit_rate_at_k: float
+    source_miss_but_derived_hit_rate_at_k: float
     self_query_hit_rate: float
     kind_mix_at_k: Stage12KindMixMetrics
     mean_recap_pollution_count_at_k: float
@@ -655,6 +698,8 @@ def score_stage12_retrieval_case(
     raw_expected_ids = set(case.expected_ids.raw)
     summary_expected_ids = set(case.expected_ids.summary)
     acceptable_ids = set(case.expected_ids.acceptable)
+    source_expected_ids = {*raw_expected_ids, *summary_expected_ids}
+    derived_answer_ids = set(case.expected_ids.derived_answer)
     current_query_ids = set(case.expected_ids.current_query)
     preferred_ids = _preferred_expected_id_set(case.expected_ids, case.preferred_layer)
 
@@ -680,6 +725,7 @@ def score_stage12_retrieval_case(
             raw_expected_ids=raw_expected_ids,
             summary_expected_ids=summary_expected_ids,
             acceptable_ids=acceptable_ids,
+            derived_answer_ids=derived_answer_ids,
             current_query_ids=current_query_ids,
             preferred_ids=preferred_ids,
             timing_mode=timing_mode,
@@ -699,6 +745,12 @@ def score_stage12_retrieval_case(
     official_episode_ids = tuple(record.episode_id for record in official_records)
     preferred_hits = tuple(
         episode_id for episode_id in official_episode_ids if episode_id in preferred_ids
+    )
+    source_hits = tuple(
+        episode_id for episode_id in official_episode_ids if episode_id in source_expected_ids
+    )
+    derived_answer_hits = tuple(
+        episode_id for episode_id in official_episode_ids if episode_id in derived_answer_ids
     )
     first_preferred_rank = next(
         (
@@ -731,6 +783,15 @@ def score_stage12_retrieval_case(
         acceptable_hit_at_k=any(
             episode_id in acceptable_ids for episode_id in official_episode_ids
         ),
+        source_hit_at_k=bool(source_hits),
+        source_raw_hit_at_k=any(
+            episode_id in raw_expected_ids for episode_id in official_episode_ids
+        ),
+        source_summary_hit_at_k=any(
+            episode_id in summary_expected_ids for episode_id in official_episode_ids
+        ),
+        derived_answer_hit_at_k=bool(derived_answer_hits),
+        source_miss_but_derived_hit_at_k=not source_hits and bool(derived_answer_hits),
         kind_mix_at_k=_kind_mix_metrics(official_records),
         self_query_hit=self_query_record is not None,
         self_query_rank=None if self_query_record is None else self_query_record.rank,
@@ -776,6 +837,11 @@ def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12Ag
             raw_hit_rate_at_k=0.0,
             summary_hit_rate_at_k=0.0,
             acceptable_hit_rate_at_k=0.0,
+            source_hit_rate_at_k=0.0,
+            source_raw_hit_rate_at_k=0.0,
+            source_summary_hit_rate_at_k=0.0,
+            derived_answer_hit_rate_at_k=0.0,
+            source_miss_but_derived_hit_rate_at_k=0.0,
             self_query_hit_rate=0.0,
             kind_mix_at_k=Stage12KindMixMetrics(
                 message_count=0,
@@ -804,6 +870,22 @@ def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12Ag
         / total_cases,
         acceptable_hit_rate_at_k=sum(1 for result in results if result.metrics.acceptable_hit_at_k)
         / total_cases,
+        source_hit_rate_at_k=sum(1 for result in results if result.metrics.source_hit_at_k)
+        / total_cases,
+        source_raw_hit_rate_at_k=sum(1 for result in results if result.metrics.source_raw_hit_at_k)
+        / total_cases,
+        source_summary_hit_rate_at_k=sum(
+            1 for result in results if result.metrics.source_summary_hit_at_k
+        )
+        / total_cases,
+        derived_answer_hit_rate_at_k=sum(
+            1 for result in results if result.metrics.derived_answer_hit_at_k
+        )
+        / total_cases,
+        source_miss_but_derived_hit_rate_at_k=sum(
+            1 for result in results if result.metrics.source_miss_but_derived_hit_at_k
+        )
+        / total_cases,
         self_query_hit_rate=sum(1 for result in results if result.metrics.self_query_hit)
         / total_cases,
         kind_mix_at_k=Stage12KindMixMetrics(
@@ -822,6 +904,119 @@ def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12Ag
         )
         / total_cases,
     )
+
+
+def stage13_evidence_policy_comparison(
+    cases: Sequence[Stage12CaseResult],
+) -> dict[str, object]:
+    """Compare source-only scoring with explicit derived-answer credit."""
+
+    case_rows = [_stage13_evidence_policy_case_row(case) for case in cases]
+    policies: tuple[Stage13EvidencePolicy, ...] = ("SOURCE_ONLY", "SOURCE_PLUS_DERIVED")
+    return {
+        "policies": list(policies),
+        "aggregate_metrics_by_policy": {
+            policy: _stage13_evidence_policy_aggregate(case_rows, policy) for policy in policies
+        },
+        "per_case": case_rows,
+    }
+
+
+def stage13_evidence_policy_comparison_to_markdown(payload: Mapping[str, object]) -> str:
+    """Render the Stage 13d evidence-policy comparison as a compact table."""
+
+    aggregates = _required_mapping(payload, "aggregate_metrics_by_policy")
+    per_case = _required_list(payload, "per_case")
+    lines = [
+        "# Stage 13d Evidence Policy Comparison",
+        "",
+        "## Aggregate Metrics",
+        "",
+        "| Policy | Hits | Total | Hit Rate |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for policy_name in ("SOURCE_ONLY", "SOURCE_PLUS_DERIVED"):
+        aggregate = _required_mapping(aggregates, policy_name)
+        lines.append(
+            f"| {policy_name} | {aggregate['hit_count']} | {aggregate['total_cases']} | "
+            f"{_format_metric(aggregate['hit_rate_at_k'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per-Case Comparison",
+            "",
+            (
+                "| Example | SOURCE_ONLY | SOURCE_PLUS_DERIVED | First Source | "
+                "First Derived | Derived Ref | Flips |"
+            ),
+            "| --- | ---: | ---: | ---: | ---: | --- | ---: |",
+        ]
+    )
+    for item in per_case:
+        row = _as_mapping(item)
+        lines.append(
+            f"| {row['example_id']} | {row['SOURCE_ONLY_hit']} | "
+            f"{row['SOURCE_PLUS_DERIVED_hit']} | {_format_metric(row['first_source_rank'])} | "
+            f"{_format_metric(row['first_derived_answer_rank'])} | "
+            f"{row.get('derived_answer_ref') or 'none'} | {row['flips']} |"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _stage13_evidence_policy_case_row(case: Stage12CaseResult) -> dict[str, object]:
+    source_only_hit = _stage13_evidence_policy_hit(case, "SOURCE_ONLY")
+    source_plus_derived_hit = _stage13_evidence_policy_hit(case, "SOURCE_PLUS_DERIVED")
+    first_derived_record = _first_derived_answer_record(case.retrieved)
+    return {
+        "example_id": case.example_id,
+        "SOURCE_ONLY_hit": source_only_hit,
+        "SOURCE_PLUS_DERIVED_hit": source_plus_derived_hit,
+        "first_source_rank": case.diagnostics.first_source_rank,
+        "first_derived_answer_rank": case.diagnostics.first_derived_answer_rank,
+        "derived_answer_ref": None
+        if first_derived_record is None
+        else first_derived_record.semantic_ref,
+        "flips": not source_only_hit and source_plus_derived_hit,
+    }
+
+
+def _stage13_evidence_policy_aggregate(
+    case_rows: Sequence[Mapping[str, object]],
+    policy: Stage13EvidencePolicy,
+) -> dict[str, object]:
+    hit_key = f"{policy}_hit"
+    hit_count = sum(1 for row in case_rows if row.get(hit_key) is True)
+    total_cases = len(case_rows)
+    return {
+        "hit_count": hit_count,
+        "total_cases": total_cases,
+        "hit_rate_at_k": 0.0 if total_cases == 0 else hit_count / total_cases,
+    }
+
+
+def _stage13_evidence_policy_hit(
+    case: Stage12CaseResult,
+    policy: Stage13EvidencePolicy,
+) -> bool:
+    if policy == "SOURCE_ONLY":
+        return case.metrics.source_hit_at_k
+    if policy == "SOURCE_PLUS_DERIVED":
+        return case.metrics.source_hit_at_k or case.metrics.derived_answer_hit_at_k
+    raise InvalidRetrievalRequestError(f"Stage 13 unknown evidence policy: {policy}")
+
+
+def _first_derived_answer_record(
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+) -> Stage12RetrievedEpisodeRecord | None:
+    derived_records = (
+        record
+        for record in records
+        if record.is_derived_answer and record.official_rank is not None
+    )
+    return next(iter(sorted(derived_records, key=lambda record: record.official_rank or 0)), None)
 
 
 def stage12_scoring_weights() -> dict[str, float]:
@@ -2184,6 +2379,16 @@ def stage12_case_result_from_dict(record: Mapping[str, object]) -> Stage12CaseRe
             record,
             "acceptable_in_diagnostic_top_k",
         ),
+        source_in_diagnostic_top_k=_optional_bool(
+            record,
+            "source_in_diagnostic_top_k",
+            default=_required_bool(record, "acceptable_in_diagnostic_top_k"),
+        ),
+        derived_answer_in_diagnostic_top_k=_optional_bool(
+            record,
+            "derived_answer_in_diagnostic_top_k",
+            default=False,
+        ),
         first_expected_diagnostic_rank=_optional_int(record, "first_expected_diagnostic_rank"),
         first_raw_diagnostic_rank=_optional_int(record, "first_raw_diagnostic_rank"),
         first_summary_diagnostic_rank=_optional_int(record, "first_summary_diagnostic_rank"),
@@ -2191,6 +2396,12 @@ def stage12_case_result_from_dict(record: Mapping[str, object]) -> Stage12CaseRe
             record,
             "first_acceptable_diagnostic_rank",
         ),
+        first_source_rank=_optional_int(
+            record,
+            "first_source_rank",
+            default=_optional_int(record, "first_acceptable_diagnostic_rank"),
+        ),
+        first_derived_answer_rank=_optional_int(record, "first_derived_answer_rank"),
         diagnostic_kind_mix=_kind_mix_from_dict(_required_mapping(record, "diagnostic_kind_mix")),
         diagnostic_recap_pollution=_recap_pollution_from_dict(
             _required_mapping(record, "diagnostic_recap_pollution")
@@ -2232,6 +2443,8 @@ def _stage12_case_result_from_records(
     raw_expected_ids = set(source.expected_ids.raw)
     summary_expected_ids = set(source.expected_ids.summary)
     acceptable_ids = set(source.expected_ids.acceptable)
+    source_expected_ids = {*raw_expected_ids, *summary_expected_ids}
+    derived_answer_ids = set(source.expected_ids.derived_answer)
     preferred_ids = _preferred_expected_id_set(source.expected_ids, source.preferred_layer)
     timing_mode: TimingMode = (
         "app_realistic" if any(record.is_current_query for record in records) else "clean_memory"
@@ -2248,6 +2461,12 @@ def _stage12_case_result_from_records(
     official_episode_ids = tuple(record.episode_id for record in official_records)
     preferred_hits = tuple(
         episode_id for episode_id in official_episode_ids if episode_id in preferred_ids
+    )
+    source_hits = tuple(
+        episode_id for episode_id in official_episode_ids if episode_id in source_expected_ids
+    )
+    derived_answer_hits = tuple(
+        episode_id for episode_id in official_episode_ids if episode_id in derived_answer_ids
     )
     first_preferred_rank = next(
         (
@@ -2275,6 +2494,15 @@ def _stage12_case_result_from_records(
         acceptable_hit_at_k=any(
             episode_id in acceptable_ids for episode_id in official_episode_ids
         ),
+        source_hit_at_k=bool(source_hits),
+        source_raw_hit_at_k=any(
+            episode_id in raw_expected_ids for episode_id in official_episode_ids
+        ),
+        source_summary_hit_at_k=any(
+            episode_id in summary_expected_ids for episode_id in official_episode_ids
+        ),
+        derived_answer_hit_at_k=bool(derived_answer_hits),
+        source_miss_but_derived_hit_at_k=not source_hits and bool(derived_answer_hits),
         kind_mix_at_k=_kind_mix_metrics(official_records),
         self_query_hit=self_query_record is not None,
         self_query_rank=None if self_query_record is None else self_query_record.rank,
@@ -3539,6 +3767,7 @@ def _expected_ids_from_dict(record: Mapping[str, object]) -> Stage12ExpectedIds:
         summary=_uuid_tuple(record.get("summary", ())),
         acceptable=_uuid_tuple(record.get("acceptable", ())),
         current_query=_uuid_tuple(record.get("current_query", ())),
+        derived_answer=_uuid_tuple(record.get("derived_answer", ())),
     )
 
 
@@ -3553,6 +3782,7 @@ def _retrieved_record_from_dict(record: Mapping[str, object]) -> Stage12Retrieve
     )
     return Stage12RetrievedEpisodeRecord(
         episode_id=_required_uuid(record, "episode_id"),
+        semantic_ref=_optional_str(record, "semantic_ref"),
         kind=_episode_kind(_required_str(record, "kind")),
         rank=_required_int(record, "rank"),
         official_rank=_optional_int(record, "official_rank"),
@@ -3571,17 +3801,27 @@ def _retrieved_record_from_dict(record: Mapping[str, object]) -> Stage12Retrieve
         label_roles=tuple(
             _episode_label_role(role) for role in _str_tuple(record.get("label_roles", ()))
         ),
+        evidence_provenance=_evidence_provenance_value(
+            str(record.get("evidence_provenance", "unknown"))
+        ),
         fact_ids=_str_tuple(record.get("fact_ids", ())),
         is_raw_expected=_required_bool(expected_flags, "raw"),
         is_summary_expected=_required_bool(expected_flags, "summary"),
         is_preferred_expected=_required_bool(expected_flags, "preferred"),
         is_acceptable=_required_bool(expected_flags, "acceptable"),
+        is_derived_answer=_optional_bool(expected_flags, "derived_answer", default=False),
         is_current_query=_required_bool(expected_flags, "current_query"),
         lexical_features=lexical_features,
     )
 
 
 def _case_metrics_from_dict(record: Mapping[str, object]) -> Stage12CaseMetrics:
+    source_hit = _optional_bool(
+        record,
+        "source_hit_at_k",
+        default=_required_bool(record, "acceptable_hit_at_k"),
+    )
+    derived_hit = _optional_bool(record, "derived_answer_hit_at_k", default=False)
     return Stage12CaseMetrics(
         hit_at_k=_required_bool(record, "hit_at_k"),
         reciprocal_rank=_required_float(record, "reciprocal_rank"),
@@ -3590,6 +3830,23 @@ def _case_metrics_from_dict(record: Mapping[str, object]) -> Stage12CaseMetrics:
         raw_hit_at_k=_required_bool(record, "raw_hit_at_k"),
         summary_hit_at_k=_required_bool(record, "summary_hit_at_k"),
         acceptable_hit_at_k=_required_bool(record, "acceptable_hit_at_k"),
+        source_hit_at_k=source_hit,
+        source_raw_hit_at_k=_optional_bool(
+            record,
+            "source_raw_hit_at_k",
+            default=_required_bool(record, "raw_hit_at_k"),
+        ),
+        source_summary_hit_at_k=_optional_bool(
+            record,
+            "source_summary_hit_at_k",
+            default=_required_bool(record, "summary_hit_at_k"),
+        ),
+        derived_answer_hit_at_k=derived_hit,
+        source_miss_but_derived_hit_at_k=_optional_bool(
+            record,
+            "source_miss_but_derived_hit_at_k",
+            default=not source_hit and derived_hit,
+        ),
         kind_mix_at_k=_kind_mix_from_dict(_required_mapping(record, "kind_mix_at_k")),
         self_query_hit=_required_bool(record, "self_query_hit"),
         self_query_rank=_optional_int(record, "self_query_rank"),
@@ -3637,6 +3894,12 @@ def _stage12_failure_class(value: str) -> Stage12FailureClass:
     return cast(Stage12FailureClass, value)
 
 
+def _evidence_provenance_value(value: str) -> EpisodeEvidenceProvenance:
+    if value not in _VALID_EVIDENCE_PROVENANCE:
+        raise InvalidRetrievalRequestError(f"Stage 12 unknown evidence provenance: {value}")
+    return cast(EpisodeEvidenceProvenance, value)
+
+
 def load_stage12_corpus(path: Path) -> Stage12Corpus:
     """Load a Stage 12a corpus from JSON or JSONL without reading local notes."""
 
@@ -3665,15 +3928,28 @@ def validate_stage12_corpus(corpus: Stage12Corpus) -> None:
     if not corpus.cases:
         raise InvalidRetrievalRequestError("Stage 12 corpus must include at least one case")
 
+    provenance_refs: set[str] = set()
+    for label in corpus.provenance_labels:
+        _validate_corpus_label(label)
+        if label.semantic_ref in provenance_refs:
+            raise InvalidRetrievalRequestError(
+                f"Stage 12 duplicate provenance label ref: {label.semantic_ref}"
+            )
+        provenance_refs.add(label.semantic_ref)
+
     example_ids: set[str] = set()
     for case in corpus.cases:
         if case.example_id in example_ids:
             raise InvalidRetrievalRequestError("Stage 12 corpus example_id values must be unique")
         example_ids.add(case.example_id)
-        validate_stage12_corpus_case(case)
+        validate_stage12_corpus_case(case, provenance_labels=corpus.provenance_labels)
 
 
-def validate_stage12_corpus_case(case: Stage12CorpusCase) -> None:
+def validate_stage12_corpus_case(
+    case: Stage12CorpusCase,
+    *,
+    provenance_labels: Sequence[Stage12CorpusEpisodeLabel] = (),
+) -> None:
     """Validate one corpus case before semantic refs are resolved to UUIDs."""
 
     if not case.example_id.strip():
@@ -3694,6 +3970,10 @@ def validate_stage12_corpus_case(case: Stage12CorpusCase) -> None:
             raise InvalidRetrievalRequestError(
                 f"Stage 12 duplicate episode label ref: {label.semantic_ref}"
             )
+        label_refs.add(label.semantic_ref)
+
+    for label in provenance_labels:
+        _validate_corpus_label(label)
         label_refs.add(label.semantic_ref)
 
     for expected_ref in _all_expected_refs(case.expected_refs):
@@ -3730,10 +4010,16 @@ def resolve_stage12_case(
     user_id: UUID,
     scope_id: UUID,
     ref_to_episode_id: Mapping[str, UUID],
+    *,
+    provenance_labels: Sequence[Stage12CorpusEpisodeLabel] = (),
 ) -> Stage12ResolvedEvalCase:
     """Resolve one semantic-ref corpus case to runtime episode UUIDs."""
 
-    validate_stage12_corpus_case(corpus_case)
+    validate_stage12_corpus_case(corpus_case, provenance_labels=provenance_labels)
+    merged_labels = _merge_stage12_corpus_labels(
+        provenance_labels=provenance_labels,
+        case_labels=corpus_case.episode_labels,
+    )
     resolved_labels = tuple(
         Stage12ResolvedEpisodeLabel(
             semantic_ref=label.semantic_ref,
@@ -3748,7 +4034,7 @@ def resolve_stage12_case(
             is_expected=label.is_expected,
             is_acceptable=label.is_acceptable,
         )
-        for label in corpus_case.episode_labels
+        for label in merged_labels
     )
 
     return Stage12ResolvedEvalCase(
@@ -3778,6 +4064,10 @@ def resolve_stage12_case(
                 _resolve_semantic_ref(ref, ref_to_episode_id)
                 for ref in corpus_case.expected_refs.current_query
             ),
+            derived_answer=tuple(
+                _resolve_semantic_ref(ref, ref_to_episode_id)
+                for ref in corpus_case.expected_refs.derived_answer
+            ),
         ),
         episode_labels=resolved_labels,
         notes=corpus_case.notes,
@@ -3799,9 +4089,61 @@ def resolve_stage12_corpus_cases(
             user_id=user_id,
             scope_id=scope_id,
             ref_to_episode_id=ref_to_episode_id,
+            provenance_labels=corpus.provenance_labels,
         )
         for case in corpus.cases
     ]
+
+
+def _merge_stage12_corpus_labels(
+    *,
+    provenance_labels: Sequence[Stage12CorpusEpisodeLabel],
+    case_labels: Sequence[Stage12CorpusEpisodeLabel],
+) -> tuple[Stage12CorpusEpisodeLabel, ...]:
+    merged: dict[str, Stage12CorpusEpisodeLabel] = {
+        label.semantic_ref: label for label in provenance_labels
+    }
+    for label in case_labels:
+        existing = merged.get(label.semantic_ref)
+        if existing is None:
+            merged[label.semantic_ref] = label
+            continue
+        merged[label.semantic_ref] = _merge_stage12_corpus_label(existing, label)
+    return tuple(merged.values())
+
+
+def _merge_stage12_corpus_label(
+    existing: Stage12CorpusEpisodeLabel,
+    case_label: Stage12CorpusEpisodeLabel,
+) -> Stage12CorpusEpisodeLabel:
+    if existing.episode_kind != case_label.episode_kind:
+        raise InvalidRetrievalRequestError(
+            f"Stage 12 provenance label kind mismatch: {case_label.semantic_ref}"
+        )
+    if existing.message_position != case_label.message_position:
+        raise InvalidRetrievalRequestError(
+            f"Stage 12 provenance label message_position mismatch: {case_label.semantic_ref}"
+        )
+    if existing.range_start != case_label.range_start or existing.range_end != case_label.range_end:
+        raise InvalidRetrievalRequestError(
+            f"Stage 12 provenance label range mismatch: {case_label.semantic_ref}"
+        )
+
+    return Stage12CorpusEpisodeLabel(
+        semantic_ref=case_label.semantic_ref,
+        roles=tuple(
+            _episode_label_role(role)
+            for role in _dedupe_str_tuple((*existing.roles, *case_label.roles))
+        ),
+        episode_kind=case_label.episode_kind,
+        layer=case_label.layer,
+        fact_ids=_dedupe_str_tuple((*existing.fact_ids, *case_label.fact_ids)),
+        message_position=case_label.message_position,
+        range_start=case_label.range_start,
+        range_end=case_label.range_end,
+        is_expected=existing.is_expected or case_label.is_expected,
+        is_acceptable=existing.is_acceptable or case_label.is_acceptable,
+    )
 
 
 def stage12_baseline_metadata_to_dict(metadata: Stage12BaselineRunMetadata) -> dict[str, object]:
@@ -3847,10 +4189,16 @@ def stage12_case_result_to_dict(result: Stage12CaseResult) -> dict[str, object]:
             result.diagnostics.summary_expected_in_diagnostic_top_k
         ),
         "acceptable_in_diagnostic_top_k": (result.diagnostics.acceptable_in_diagnostic_top_k),
+        "source_in_diagnostic_top_k": result.diagnostics.source_in_diagnostic_top_k,
+        "derived_answer_in_diagnostic_top_k": (
+            result.diagnostics.derived_answer_in_diagnostic_top_k
+        ),
         "first_expected_diagnostic_rank": result.diagnostics.first_expected_diagnostic_rank,
         "first_raw_diagnostic_rank": result.diagnostics.first_raw_diagnostic_rank,
         "first_summary_diagnostic_rank": result.diagnostics.first_summary_diagnostic_rank,
         "first_acceptable_diagnostic_rank": (result.diagnostics.first_acceptable_diagnostic_rank),
+        "first_source_rank": result.diagnostics.first_source_rank,
+        "first_derived_answer_rank": result.diagnostics.first_derived_answer_rank,
         "diagnostic_kind_mix": _kind_mix_to_dict(result.diagnostics.diagnostic_kind_mix),
         "diagnostic_recap_pollution": _recap_pollution_to_dict(
             result.diagnostics.diagnostic_recap_pollution
@@ -3872,6 +4220,11 @@ def stage12_aggregate_metrics_to_dict(metrics: Stage12AggregateMetrics) -> dict[
         "raw_hit_rate_at_k": metrics.raw_hit_rate_at_k,
         "summary_hit_rate_at_k": metrics.summary_hit_rate_at_k,
         "acceptable_hit_rate_at_k": metrics.acceptable_hit_rate_at_k,
+        "source_hit_rate_at_k": metrics.source_hit_rate_at_k,
+        "source_raw_hit_rate_at_k": metrics.source_raw_hit_rate_at_k,
+        "source_summary_hit_rate_at_k": metrics.source_summary_hit_rate_at_k,
+        "derived_answer_hit_rate_at_k": metrics.derived_answer_hit_rate_at_k,
+        "source_miss_but_derived_hit_rate_at_k": (metrics.source_miss_but_derived_hit_rate_at_k),
         "self_query_hit_rate": metrics.self_query_hit_rate,
         "kind_mix_at_k": _kind_mix_to_dict(metrics.kind_mix_at_k),
         "mean_recap_pollution_count_at_k": metrics.mean_recap_pollution_count_at_k,
@@ -3943,6 +4296,7 @@ def _stage12_retrieved_record(
     raw_expected_ids: set[UUID],
     summary_expected_ids: set[UUID],
     acceptable_ids: set[UUID],
+    derived_answer_ids: set[UUID],
     current_query_ids: set[UUID],
     preferred_ids: set[UUID],
     timing_mode: TimingMode,
@@ -3959,6 +4313,7 @@ def _stage12_retrieved_record(
 
     return Stage12RetrievedEpisodeRecord(
         episode_id=episode.id,
+        semantic_ref=None if label is None else label.semantic_ref,
         kind=episode.kind,
         rank=episode.result_rank,
         official_rank=official_rank,
@@ -3975,11 +4330,13 @@ def _stage12_retrieved_record(
         importance_score=episode.importance_score,
         frequency_score=episode.frequency_score,
         label_roles=roles,
+        evidence_provenance=_evidence_provenance(label=label, episode_kind=episode.kind),
         fact_ids=fact_ids,
         is_raw_expected=episode.id in raw_expected_ids,
         is_summary_expected=episode.id in summary_expected_ids,
         is_preferred_expected=episode.id in preferred_ids,
         is_acceptable=episode.id in acceptable_ids,
+        is_derived_answer=episode.id in derived_answer_ids,
         is_current_query=is_current_query,
         lexical_features=stage13_lexical_features(query, episode.content),
     )
@@ -3996,6 +4353,32 @@ def _is_current_query_episode(
     if episode.id in current_query_ids:
         return True
     return label is not None and "current_query" in label.roles
+
+
+def _evidence_provenance(
+    *,
+    label: Stage12ResolvedEpisodeLabel | None,
+    episode_kind: EpisodeKind,
+) -> EpisodeEvidenceProvenance:
+    """Classify eval-only evidence provenance from explicit corpus/fixture labels."""
+
+    if label is None:
+        return "source_summary" if episode_kind == "summary" else "unknown"
+
+    roles = set(label.roles)
+    if "raw_source" in roles:
+        return "source_user"
+    if "summary_source" in roles:
+        return "source_summary"
+    if "assistant_answer_echo" in roles:
+        return "assistant_echo"
+    if "recap_question" in roles:
+        return "recap_question"
+    if "distractor" in roles:
+        return "distractor"
+    if "scaffold" in roles or "current_query" in roles:
+        return "scaffold"
+    return "source_summary" if episode_kind == "summary" else "unknown"
 
 
 def _preferred_expected_id_set(
@@ -4054,11 +4437,18 @@ def _stage12_diagnostic_metrics(
     raw_expected_ids = set(expected_ids.raw)
     summary_expected_ids = set(expected_ids.summary)
     acceptable_ids = set(expected_ids.acceptable)
+    source_expected_ids = {*raw_expected_ids, *summary_expected_ids}
+    derived_answer_ids = set(expected_ids.derived_answer)
 
     first_expected_rank = _first_diagnostic_rank(diagnostic_official_records, preferred_ids)
     first_raw_rank = _first_diagnostic_rank(diagnostic_official_records, raw_expected_ids)
     first_summary_rank = _first_diagnostic_rank(diagnostic_official_records, summary_expected_ids)
     first_acceptable_rank = _first_diagnostic_rank(diagnostic_official_records, acceptable_ids)
+    first_source_rank = _first_diagnostic_rank(diagnostic_official_records, source_expected_ids)
+    first_derived_answer_rank = _first_diagnostic_rank(
+        diagnostic_official_records,
+        derived_answer_ids,
+    )
     failure_class = _stage12_failure_classes(
         top_k=top_k,
         timing_mode=timing_mode,
@@ -4076,10 +4466,14 @@ def _stage12_diagnostic_metrics(
         raw_expected_in_diagnostic_top_k=first_raw_rank is not None,
         summary_expected_in_diagnostic_top_k=first_summary_rank is not None,
         acceptable_in_diagnostic_top_k=first_acceptable_rank is not None,
+        source_in_diagnostic_top_k=first_source_rank is not None,
+        derived_answer_in_diagnostic_top_k=first_derived_answer_rank is not None,
         first_expected_diagnostic_rank=first_expected_rank,
         first_raw_diagnostic_rank=first_raw_rank,
         first_summary_diagnostic_rank=first_summary_rank,
         first_acceptable_diagnostic_rank=first_acceptable_rank,
+        first_source_rank=first_source_rank,
+        first_derived_answer_rank=first_derived_answer_rank,
         diagnostic_kind_mix=_kind_mix_metrics(diagnostic_official_records),
         diagnostic_recap_pollution=_recap_pollution_metrics(diagnostic_official_records),
         failure_class=failure_class,
@@ -4203,6 +4597,10 @@ def _parse_stage12_jsonl_records(records: Sequence[str]) -> Stage12Corpus:
         fixture_strategy=_required_str(metadata, "fixture_strategy"),
         embedding_model=_required_str(metadata, "embedding_model"),
         notes=_optional_str(metadata, "notes"),
+        provenance_labels=tuple(
+            _parse_stage12_label_record(_as_mapping(label))
+            for label in _optional_list(metadata, "provenance_labels")
+        ),
         cases=tuple(cases),
     )
 
@@ -4215,6 +4613,10 @@ def _parse_stage12_corpus_document(record: Mapping[str, object]) -> Stage12Corpu
         fixture_strategy=_required_str(record, "fixture_strategy"),
         embedding_model=_required_str(record, "embedding_model"),
         notes=_optional_str(record, "notes"),
+        provenance_labels=tuple(
+            _parse_stage12_label_record(_as_mapping(label))
+            for label in _optional_list(record, "provenance_labels")
+        ),
         cases=tuple(_parse_stage12_case_record(_as_mapping(example)) for example in examples),
     )
 
@@ -4235,6 +4637,7 @@ def _parse_stage12_case_record(record: Mapping[str, object]) -> Stage12CorpusCas
             summary=_str_tuple(record.get("summary_expected_refs", ())),
             acceptable=_str_tuple(record.get("acceptable_refs", ())),
             current_query=_str_tuple(record.get("current_query_refs", ())),
+            derived_answer=_str_tuple(record.get("derived_answer_refs", ())),
         ),
         episode_labels=tuple(
             _parse_stage12_label_record(_as_mapping(label))
@@ -4284,6 +4687,7 @@ def _all_expected_refs(expected_refs: Stage12ExpectedRefs) -> tuple[str, ...]:
         *expected_refs.summary,
         *expected_refs.acceptable,
         *expected_refs.current_query,
+        *expected_refs.derived_answer,
     )
 
 
@@ -4418,8 +4822,13 @@ def _optional_uuid(record: Mapping[str, object], key: str) -> UUID | None:
         raise InvalidRetrievalRequestError(f"Stage 12 field must be a UUID: {key}") from exc
 
 
-def _optional_int(record: Mapping[str, object], key: str) -> int | None:
-    value = record.get(key)
+def _optional_int(
+    record: Mapping[str, object],
+    key: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    value = record.get(key, default)
     if value is None:
         return None
     if not isinstance(value, int):
@@ -4436,6 +4845,13 @@ def _optional_bool(record: Mapping[str, object], key: str, *, default: bool) -> 
 
 def _required_list(record: Mapping[str, object], key: str) -> list[object]:
     value = record.get(key)
+    if not isinstance(value, list):
+        raise InvalidRetrievalRequestError(f"Stage 12 field must be a list: {key}")
+    return value
+
+
+def _optional_list(record: Mapping[str, object], key: str) -> list[object]:
+    value = record.get(key, [])
     if not isinstance(value, list):
         raise InvalidRetrievalRequestError(f"Stage 12 field must be a list: {key}")
     return value
@@ -4462,6 +4878,17 @@ def _str_tuple(value: object) -> tuple[str, ...]:
         if not isinstance(item, str):
             raise InvalidRetrievalRequestError("Stage 12 field must be a string list")
         result.append(item)
+    return tuple(result)
+
+
+def _dedupe_str_tuple(values: Sequence[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
     return tuple(result)
 
 
@@ -4494,12 +4921,14 @@ def _expected_ids_to_dict(expected_ids: Stage12ExpectedIds) -> dict[str, object]
         "summary": [str(episode_id) for episode_id in expected_ids.summary],
         "acceptable": [str(episode_id) for episode_id in expected_ids.acceptable],
         "current_query": [str(episode_id) for episode_id in expected_ids.current_query],
+        "derived_answer": [str(episode_id) for episode_id in expected_ids.derived_answer],
     }
 
 
 def _retrieved_record_to_dict(record: Stage12RetrievedEpisodeRecord) -> dict[str, object]:
     return {
         "episode_id": str(record.episode_id),
+        "semantic_ref": record.semantic_ref,
         "kind": record.kind,
         "rank": record.rank,
         "official_rank": record.official_rank,
@@ -4522,9 +4951,11 @@ def _retrieved_record_to_dict(record: Stage12RetrievedEpisodeRecord) -> dict[str
             "summary": record.is_summary_expected,
             "preferred": record.is_preferred_expected,
             "acceptable": record.is_acceptable,
+            "derived_answer": record.is_derived_answer,
             "current_query": record.is_current_query,
         },
         "label_roles": list(record.label_roles),
+        "evidence_provenance": record.evidence_provenance,
         "fact_ids": list(record.fact_ids),
         "lexical_features": _stage13_lexical_features_to_dict(record.lexical_features),
     }
@@ -4539,6 +4970,11 @@ def _case_metrics_to_dict(metrics: Stage12CaseMetrics) -> dict[str, object]:
         "raw_hit_at_k": metrics.raw_hit_at_k,
         "summary_hit_at_k": metrics.summary_hit_at_k,
         "acceptable_hit_at_k": metrics.acceptable_hit_at_k,
+        "source_hit_at_k": metrics.source_hit_at_k,
+        "source_raw_hit_at_k": metrics.source_raw_hit_at_k,
+        "source_summary_hit_at_k": metrics.source_summary_hit_at_k,
+        "derived_answer_hit_at_k": metrics.derived_answer_hit_at_k,
+        "source_miss_but_derived_hit_at_k": metrics.source_miss_but_derived_hit_at_k,
         "kind_mix_at_k": _kind_mix_to_dict(metrics.kind_mix_at_k),
         "self_query_hit": metrics.self_query_hit,
         "self_query_rank": metrics.self_query_rank,

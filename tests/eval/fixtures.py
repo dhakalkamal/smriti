@@ -307,7 +307,11 @@ def _base_messages() -> tuple[_FixtureMessage, ...]:
         ),
         _FixtureMessage("assistant", "Vinyl aprons are a separate optional supply note."),
         _FixtureMessage("user", "Bookkeeping setup should stay simple for launch."),
-        _FixtureMessage("assistant", "Bookkeeping belongs with Dele's silent-partner role."),
+        _FixtureMessage(
+            "assistant",
+            "Bookkeeping belongs with Dele's silent-partner role.",
+            "tunde_echo_05_dele_bookkeeping_answer",
+        ),
         _FixtureMessage("user", "Do not add extra wheels unless the budget changes."),
         _FixtureMessage("assistant", "The current wheel count remains exactly 9."),
     )
