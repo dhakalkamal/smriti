@@ -12,6 +12,7 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from scripts.run_retrieval_baseline import main as run_retrieval_baseline
+from scripts.run_retrieval_role_policy_replay import main as run_retrieval_role_policy_replay
 from scripts.run_retrieval_weight_sweep import main as run_retrieval_weight_sweep
 from smriti.config import Settings
 from smriti.db.migrate import apply_migrations
@@ -28,12 +29,17 @@ from smriti.memory.eval import (
     Stage12ResolvedEpisodeLabel,
     Stage12ResolvedEvalCase,
     Stage12WeightProfile,
+    Stage13RolePolicy,
     replay_stage12_weight_profile_case,
+    replay_stage13_role_policy_case,
     run_stage12_weight_sweep,
+    run_stage13_role_policy_replay,
     score_stage12_retrieval_case,
     score_stage12_weight_profile_record,
     stage12_case_result_from_dict,
     stage12_case_result_to_dict,
+    stage13_role_policy_replay_report_to_markdown,
+    stage13_weak_evidence_metrics,
     validate_stage12_corpus,
 )
 
@@ -338,6 +344,342 @@ def test_stage12_failure_class_negative_control() -> None:
     assert result.diagnostics.failure_class == ("negative_control",)
 
 
+def test_stage13_weak_evidence_metrics_split_recap_and_assistant_echo() -> None:
+    recap_id = UUID("00000000-0000-4000-8000-0000000003a1")
+    echo_id = UUID("00000000-0000-4000-8000-0000000003a2")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003a3")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            labels=(
+                _label(recap_id, "recap_question"),
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (
+            _episode(recap_id, rank=1),
+            _episode(echo_id, rank=2),
+            _episode(expected_id, rank=3),
+        ),
+    )
+
+    metrics = stage13_weak_evidence_metrics(result)
+
+    assert metrics.recap_above_first_acceptable_count == 1
+    assert metrics.assistant_echo_above_first_acceptable_count == 1
+    assert metrics.total_weak_evidence_above_first_acceptable_count == 2
+    assert metrics.recap_official_top_k_count == 1
+    assert metrics.assistant_echo_official_top_k_count == 1
+    assert metrics.recap_diagnostic_top_k_count == 1
+    assert metrics.assistant_echo_diagnostic_top_k_count == 1
+    assert metrics.first_blocking_weak_evidence_role == "recap"
+
+
+def test_stage13_weak_evidence_metrics_reports_both_for_dual_label() -> None:
+    weak_id = UUID("00000000-0000-4000-8000-0000000003b1")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003b2")
+    dual_label = Stage12ResolvedEpisodeLabel(
+        semantic_ref="dual",
+        episode_id=weak_id,
+        roles=("recap_question", "assistant_answer_echo"),
+        episode_kind="message",
+        layer="diagnostic",
+        fact_ids=("F1",),
+    )
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            labels=(
+                dual_label,
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(weak_id, rank=1), _episode(expected_id, rank=2)),
+    )
+
+    metrics = stage13_weak_evidence_metrics(result)
+
+    assert metrics.recap_above_first_acceptable_count == 1
+    assert metrics.assistant_echo_above_first_acceptable_count == 1
+    assert metrics.total_weak_evidence_above_first_acceptable_count == 1
+    assert metrics.first_blocking_weak_evidence_role == "both"
+
+
+def test_stage13_exclude_assistant_echo_policy_recomputes_official_ranks() -> None:
+    echo_id = UUID("00000000-0000-4000-8000-0000000003c1")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003c2")
+    baseline = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(echo_id, rank=1), _episode(expected_id, rank=2)),
+        diagnostic_top_k=2,
+    )
+    policy = Stage13RolePolicy(
+        name="exclude_assistant_echo",
+        description="test",
+        excluded_roles=("assistant_answer_echo",),
+    )
+
+    replayed = replay_stage13_role_policy_case(baseline, policy)
+    rank_by_id = {
+        record.episode_id: record.official_rank for record in replayed.case_result.retrieved
+    }
+
+    assert baseline.metrics.acceptable_hit_at_k is False
+    assert rank_by_id[echo_id] is None
+    assert rank_by_id[expected_id] == 1
+    assert replayed.case_result.metrics.acceptable_hit_at_k is True
+    assert replayed.weak_evidence.assistant_echo_diagnostic_top_k_count == 0
+
+
+def test_stage13_exclude_recap_policy_recomputes_official_ranks() -> None:
+    recap_id = UUID("00000000-0000-4000-8000-0000000003d1")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003d2")
+    baseline = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(recap_id, "recap_question"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(recap_id, rank=1), _episode(expected_id, rank=2)),
+        diagnostic_top_k=2,
+    )
+    policy = Stage13RolePolicy(
+        name="exclude_recap_question",
+        description="test",
+        excluded_roles=("recap_question",),
+        depends_on_recap_metadata=True,
+    )
+
+    replayed = replay_stage13_role_policy_case(baseline, policy)
+
+    assert replayed.case_result.metrics.acceptable_hit_at_k is True
+    assert replayed.weak_evidence.recap_diagnostic_top_k_count == 0
+
+
+def test_stage13_exclude_recap_and_echo_policy_removes_both_roles() -> None:
+    recap_id = UUID("00000000-0000-4000-8000-0000000003e1")
+    echo_id = UUID("00000000-0000-4000-8000-0000000003e2")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003e3")
+    baseline = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(recap_id, "recap_question"),
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (
+            _episode(recap_id, rank=1),
+            _episode(echo_id, rank=2),
+            _episode(expected_id, rank=3),
+        ),
+        diagnostic_top_k=3,
+    )
+    policy = Stage13RolePolicy(
+        name="exclude_recap_and_echo",
+        description="test",
+        excluded_roles=("recap_question", "assistant_answer_echo"),
+        depends_on_recap_metadata=True,
+    )
+
+    replayed = replay_stage13_role_policy_case(baseline, policy)
+
+    assert replayed.case_result.metrics.acceptable_hit_at_k is True
+    assert replayed.weak_evidence.recap_diagnostic_top_k_count == 0
+    assert replayed.weak_evidence.assistant_echo_diagnostic_top_k_count == 0
+
+
+def test_stage13_demote_assistant_echo_policy_moves_echo_behind_source() -> None:
+    echo_id = UUID("00000000-0000-4000-8000-0000000003f1")
+    expected_id = UUID("00000000-0000-4000-8000-0000000003f2")
+    baseline = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(echo_id, rank=1), _episode(expected_id, rank=2)),
+        diagnostic_top_k=2,
+    )
+    policy = Stage13RolePolicy(
+        name="demote_assistant_echo",
+        description="test",
+        demoted_roles=("assistant_answer_echo",),
+        demotion_strategy="move_behind_non_weak",
+    )
+
+    replayed = replay_stage13_role_policy_case(baseline, policy)
+
+    assert [record.episode_id for record in replayed.case_result.retrieved] == [
+        expected_id,
+        echo_id,
+    ]
+    assert replayed.case_result.metrics.acceptable_hit_at_k is True
+    assert replayed.weak_evidence.assistant_echo_above_first_acceptable_count == 0
+
+
+def test_stage13_role_policy_replay_preserves_current_query_exclusion() -> None:
+    current_id = UUID("00000000-0000-4000-8000-000000000401")
+    echo_id = UUID("00000000-0000-4000-8000-000000000402")
+    expected_id = UUID("00000000-0000-4000-8000-000000000403")
+    baseline = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            current_query=(current_id,),
+            top_k=1,
+            labels=(
+                _label(current_id, "current_query"),
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (
+            _episode(current_id, rank=1, similarity=1.0),
+            _episode(echo_id, rank=2),
+            _episode(expected_id, rank=3),
+        ),
+        timing_mode="app_realistic",
+        diagnostic_top_k=3,
+    )
+    policy = Stage13RolePolicy(
+        name="exclude_assistant_echo",
+        description="test",
+        excluded_roles=("assistant_answer_echo",),
+    )
+
+    replayed = replay_stage13_role_policy_case(baseline, policy)
+    official_ranks = {
+        record.episode_id: record.official_rank for record in replayed.case_result.retrieved
+    }
+
+    assert official_ranks[current_id] is None
+    assert official_ranks[echo_id] is None
+    assert official_ranks[expected_id] == 1
+    assert replayed.case_result.metrics.self_query_hit is True
+    assert replayed.case_result.metrics.acceptable_hit_at_k is True
+
+
+def test_stage13_role_policy_replay_recommends_assistant_echo_candidate() -> None:
+    echo_id = UUID("00000000-0000-4000-8000-000000000411")
+    expected_id = UUID("00000000-0000-4000-8000-000000000412")
+    negative_id = UUID("00000000-0000-4000-8000-000000000413")
+    blocked = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(echo_id, rank=1), _episode(expected_id, rank=2)),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+    negative_control = score_stage12_retrieval_case(
+        _case(top_k=1, question_type="negative_control"),
+        (_episode(negative_id, rank=1),),
+        timing_mode="clean_memory",
+    )
+
+    payload = run_stage13_role_policy_replay(
+        input_metadata={
+            "run_id": "stage13-role-synthetic",
+            "timing_mode": "clean_memory",
+            "embedder_mode": "ollama",
+            "embedding_model": "nomic-embed-text",
+        },
+        cases=(blocked, negative_control),
+        policies=(
+            Stage13RolePolicy(name="baseline", description="baseline"),
+            Stage13RolePolicy(
+                name="exclude_assistant_echo",
+                description="test",
+                excluded_roles=("assistant_answer_echo",),
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    recommendation = cast(dict[str, object], payload["recommendation"])
+    aggregates = cast(dict[str, object], payload["aggregate_metrics_by_policy"])
+    policy_aggregate = cast(dict[str, object], aggregates["exclude_assistant_echo"])
+
+    assert recommendation["decision"] == "assistant_echo_policy_candidate"
+    assert recommendation["policy"] == "exclude_assistant_echo"
+    assert policy_aggregate["negative_control_no_hit_retained"] is True
+
+
+def test_stage13_role_policy_replay_keeps_recap_eval_only() -> None:
+    recap_id = UUID("00000000-0000-4000-8000-000000000421")
+    expected_id = UUID("00000000-0000-4000-8000-000000000422")
+    blocked = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(recap_id, "recap_question"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(recap_id, rank=1), _episode(expected_id, rank=2)),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+
+    payload = run_stage13_role_policy_replay(
+        input_metadata={
+            "run_id": "stage13-recap-synthetic",
+            "timing_mode": "clean_memory",
+            "embedder_mode": "ollama",
+            "embedding_model": "nomic-embed-text",
+        },
+        cases=(blocked,),
+        policies=(
+            Stage13RolePolicy(name="baseline", description="baseline"),
+            Stage13RolePolicy(
+                name="exclude_recap_question",
+                description="test",
+                excluded_roles=("recap_question",),
+                depends_on_recap_metadata=True,
+            ),
+        ),
+        created_at=FIXED_NOW,
+    )
+
+    recommendation = cast(dict[str, object], payload["recommendation"])
+    gates = cast(dict[str, object], payload["regression_gates"])
+    recap_gates = cast(dict[str, object], gates["exclude_recap_question"])
+
+    assert recommendation["decision"] == "recap_policy_requires_metadata"
+    assert "recap_metadata_available" in recap_gates["failed_gates"]
+
+
 def test_stage12_weight_profile_score_recomputation() -> None:
     episode_id = UUID("00000000-0000-4000-8000-000000000341")
     case = _case(
@@ -558,6 +900,75 @@ def test_stage12_weight_sweep_runner_smoke_writes_json_and_markdown(tmp_path: Pa
     assert payload["metadata"]["input_run_id"] == "stage12-synthetic"
     assert payload["metadata"]["profile_definitions"][0]["name"] == "baseline"
     assert "Stage 12b-2 Weight Sweep" in report_path.read_text(encoding="utf-8")
+
+
+def test_stage13_role_policy_replay_runner_smoke_writes_json_and_markdown(
+    tmp_path: Path,
+) -> None:
+    echo_id = UUID("00000000-0000-4000-8000-000000000391")
+    expected_id = UUID("00000000-0000-4000-8000-000000000392")
+    result = score_stage12_retrieval_case(
+        _case(
+            raw=(expected_id,),
+            acceptable=(expected_id,),
+            top_k=1,
+            labels=(
+                _label(echo_id, "assistant_answer_echo"),
+                _label(expected_id, "raw_source", is_expected=True, is_acceptable=True),
+            ),
+        ),
+        (_episode(echo_id, rank=1), _episode(expected_id, rank=2)),
+        timing_mode="clean_memory",
+        diagnostic_top_k=2,
+    )
+    input_run = tmp_path / "input-run"
+    input_run.mkdir()
+    (input_run / "run.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "run_id": "stage13-role-synthetic",
+                    "timing_mode": "clean_memory",
+                    "embedder_mode": "fake",
+                    "embedding_model": "nomic-embed-text",
+                    "git_branch": "stage-13b-role-aware-evidence-diagnostics",
+                    "git_sha": "synthetic",
+                },
+                "aggregate_metrics": {},
+                "cases": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_run / "cases.jsonl").write_text(
+        json.dumps(stage12_case_result_to_dict(result), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = run_retrieval_role_policy_replay(
+        [
+            "--input-run",
+            str(input_run),
+            "--output-dir",
+            str(tmp_path / "runs"),
+            "--report-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+
+    assert exit_code == 0
+    replay_path = tmp_path / "runs" / "stage13-role-synthetic" / "role_policy_replay.json"
+    report_path = tmp_path / "results" / "stage13-role-synthetic-role-policy-replay.md"
+    assert replay_path.exists()
+    assert report_path.exists()
+    payload = json.loads(replay_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["input_run_id"] == "stage13-role-synthetic"
+    assert payload["metadata"]["policy_definitions"][0]["name"] == "baseline"
+    assert "exclude_assistant_echo" in payload["aggregate_metrics_by_policy"]
+    assert "Stage 13b Role Policy Replay" in report_path.read_text(encoding="utf-8")
+    assert "Regression Gates" in stage13_role_policy_replay_report_to_markdown(payload)
 
 
 def test_stage12_corpus_validation_rejects_unknown_refs_and_roles() -> None:

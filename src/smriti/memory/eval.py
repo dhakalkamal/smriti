@@ -57,6 +57,14 @@ Stage12WeightSweepRecommendation = Literal[
     "candidate_profile_for_future_stage",
     "weight_sweep_insufficient",
 ]
+Stage13RolePolicyDemotionStrategy = Literal["move_behind_non_weak"]
+Stage13FirstBlockingWeakEvidenceRole = Literal["recap", "assistant_echo", "both", "none"]
+Stage13RolePolicyRecommendation = Literal[
+    "no_role_policy_change_recommended",
+    "assistant_echo_policy_candidate",
+    "recap_policy_requires_metadata",
+    "role_policy_insufficient",
+]
 
 _VALID_EPISODE_LABEL_ROLES = frozenset(
     {
@@ -101,6 +109,7 @@ STAGE12_WEIGHT_SWEEP_TARGET_CASES = (
     "terrafold_either_opening_classes",
     "terrafold_f4_latex_allergy",
 )
+STAGE13_ROLE_POLICY_TARGET_CASES = STAGE12_WEIGHT_SWEEP_TARGET_CASES
 _MATERIAL_MRR_DROP = 0.01
 _METRIC_EPSILON = 1e-9
 
@@ -353,6 +362,36 @@ class Stage12WeightProfile:
     access: float
     importance: float
     frequency: float
+
+
+@dataclass(frozen=True)
+class Stage13RolePolicy:
+    name: str
+    description: str
+    excluded_roles: tuple[EpisodeLabelRole, ...] = ()
+    demoted_roles: tuple[EpisodeLabelRole, ...] = ()
+    demotion_strategy: Stage13RolePolicyDemotionStrategy | None = None
+    depends_on_recap_metadata: bool = False
+
+
+@dataclass(frozen=True)
+class Stage13WeakEvidenceMetrics:
+    recap_above_first_acceptable_count: int
+    assistant_echo_above_first_acceptable_count: int
+    total_weak_evidence_above_first_acceptable_count: int
+    recap_official_top_k_count: int
+    assistant_echo_official_top_k_count: int
+    recap_diagnostic_top_k_count: int
+    assistant_echo_diagnostic_top_k_count: int
+    first_blocking_weak_evidence_role: Stage13FirstBlockingWeakEvidenceRole
+
+
+@dataclass(frozen=True)
+class Stage13RolePolicyCaseResult:
+    policy_name: str
+    case_result: Stage12CaseResult
+    weak_evidence: Stage13WeakEvidenceMetrics
+    removed_legitimate_raw_source_count: int
 
 
 async def run_retrieval_eval(
@@ -1004,6 +1043,424 @@ def stage12_weight_sweep_report_to_markdown(payload: Mapping[str, object]) -> st
     return "\n".join(lines)
 
 
+def stage13_role_policies() -> tuple[Stage13RolePolicy, ...]:
+    """Return eval-only Stage 13b role-aware replay policies."""
+
+    return (
+        Stage13RolePolicy(
+            name="baseline",
+            description="Keep the emitted diagnostic ordering and current-query exclusion.",
+        ),
+        Stage13RolePolicy(
+            name="exclude_assistant_echo",
+            description="Remove assistant-answer echo labels from official replay ranking.",
+            excluded_roles=("assistant_answer_echo",),
+        ),
+        Stage13RolePolicy(
+            name="exclude_recap_question",
+            description="Remove recap-question labels from official replay ranking.",
+            excluded_roles=("recap_question",),
+            depends_on_recap_metadata=True,
+        ),
+        Stage13RolePolicy(
+            name="exclude_recap_and_echo",
+            description="Remove recap-question and assistant-answer echo labels from ranking.",
+            excluded_roles=("recap_question", "assistant_answer_echo"),
+            depends_on_recap_metadata=True,
+        ),
+        Stage13RolePolicy(
+            name="demote_assistant_echo",
+            description="Move assistant-answer echo labels behind non-weak evidence.",
+            demoted_roles=("assistant_answer_echo",),
+            demotion_strategy="move_behind_non_weak",
+        ),
+        Stage13RolePolicy(
+            name="demote_recap_question",
+            description="Move recap-question labels behind non-weak evidence.",
+            demoted_roles=("recap_question",),
+            demotion_strategy="move_behind_non_weak",
+            depends_on_recap_metadata=True,
+        ),
+    )
+
+
+def stage13_role_policy_to_dict(policy: Stage13RolePolicy) -> dict[str, object]:
+    """Convert one eval-only role policy to JSON-safe values."""
+
+    return {
+        "name": policy.name,
+        "description": policy.description,
+        "excluded_roles": list(policy.excluded_roles),
+        "demoted_roles": list(policy.demoted_roles),
+        "demotion_strategy": policy.demotion_strategy,
+        "depends_on_recap_metadata": policy.depends_on_recap_metadata,
+    }
+
+
+def replay_stage13_role_policy_case(
+    case: Stage12CaseResult,
+    policy: Stage13RolePolicy,
+    *,
+    official_top_k: int | None = None,
+    diagnostic_top_k: int | None = None,
+) -> Stage13RolePolicyCaseResult:
+    """Replay one emitted diagnostic case under an eval-only role policy."""
+
+    top_k = _resolve_stage12_weight_sweep_top_k(case.top_k, official_top_k)
+    case_diagnostic_top_k = _resolve_diagnostic_top_k(
+        top_k=top_k,
+        diagnostic_top_k=diagnostic_top_k
+        if diagnostic_top_k is not None
+        else case.diagnostics.diagnostic_top_k,
+    )
+    candidates = tuple(sorted(case.retrieved, key=lambda record: record.rank))[
+        :case_diagnostic_top_k
+    ]
+    ordered_candidates = _stage13_role_policy_ordered_candidates(candidates, policy)
+
+    official_rank = 0
+    replayed_records: list[Stage12RetrievedEpisodeRecord] = []
+    for replay_rank, record in enumerate(ordered_candidates, start=1):
+        if record.is_current_query or _stage13_record_has_any_role(
+            record,
+            policy.excluded_roles,
+        ):
+            new_official_rank: int | None = None
+        else:
+            official_rank += 1
+            new_official_rank = official_rank
+        replayed_records.append(
+            replace(
+                record,
+                rank=replay_rank,
+                official_rank=new_official_rank,
+            )
+        )
+
+    replayed = _stage12_case_result_from_records(
+        source=case,
+        records=tuple(replayed_records),
+        top_k=top_k,
+        diagnostic_top_k=case_diagnostic_top_k,
+    )
+    return Stage13RolePolicyCaseResult(
+        policy_name=policy.name,
+        case_result=replayed,
+        weak_evidence=stage13_weak_evidence_metrics(replayed),
+        removed_legitimate_raw_source_count=_stage13_removed_legitimate_raw_source_count(
+            candidates,
+            policy,
+        ),
+    )
+
+
+def stage13_weak_evidence_metrics(result: Stage12CaseResult) -> Stage13WeakEvidenceMetrics:
+    """Measure recap-question and assistant-echo pollution separately."""
+
+    diagnostic_records = tuple(
+        record for record in result.retrieved if record.official_rank is not None
+    )
+    official_records = tuple(
+        record
+        for record in diagnostic_records
+        if record.official_rank is not None and record.official_rank <= result.top_k
+    )
+    first_acceptable_rank = result.diagnostics.first_acceptable_diagnostic_rank
+    weak_before_acceptable = tuple(
+        record
+        for record in diagnostic_records
+        if _stage13_record_is_weak_evidence(record)
+        and (
+            first_acceptable_rank is None
+            or (record.official_rank is not None and record.official_rank < first_acceptable_rank)
+        )
+    )
+
+    return Stage13WeakEvidenceMetrics(
+        recap_above_first_acceptable_count=_stage13_count_role(
+            weak_before_acceptable,
+            "recap_question",
+        ),
+        assistant_echo_above_first_acceptable_count=_stage13_count_role(
+            weak_before_acceptable,
+            "assistant_answer_echo",
+        ),
+        total_weak_evidence_above_first_acceptable_count=len(weak_before_acceptable),
+        recap_official_top_k_count=_stage13_count_role(official_records, "recap_question"),
+        assistant_echo_official_top_k_count=_stage13_count_role(
+            official_records,
+            "assistant_answer_echo",
+        ),
+        recap_diagnostic_top_k_count=_stage13_count_role(
+            diagnostic_records,
+            "recap_question",
+        ),
+        assistant_echo_diagnostic_top_k_count=_stage13_count_role(
+            diagnostic_records,
+            "assistant_answer_echo",
+        ),
+        first_blocking_weak_evidence_role=_stage13_first_blocking_weak_evidence_role(
+            weak_before_acceptable
+        ),
+    )
+
+
+def run_stage13_role_policy_replay(
+    *,
+    input_metadata: Mapping[str, object],
+    cases: Sequence[Stage12CaseResult],
+    input_run_path: str | None = None,
+    official_top_k: int | None = None,
+    diagnostic_top_k: int | None = None,
+    policies: Sequence[Stage13RolePolicy] | None = None,
+    created_at: datetime | None = None,
+) -> dict[str, object]:
+    """Replay Stage 12 diagnostic records under eval-only role-aware policies."""
+
+    policy_grid = tuple(policies) if policies is not None else stage13_role_policies()
+    if not policy_grid:
+        raise InvalidRetrievalRequestError("Stage 13 role replay requires at least one policy")
+    policy_names = [policy.name for policy in policy_grid]
+    if len(set(policy_names)) != len(policy_names):
+        raise InvalidRetrievalRequestError("Stage 13 role replay policy names must be unique")
+    if "baseline" not in set(policy_names):
+        raise InvalidRetrievalRequestError("Stage 13 role replay requires a baseline policy")
+
+    input_run_id = _required_str(input_metadata, "run_id")
+    created = datetime.now(UTC) if created_at is None else created_at
+    results_by_policy = {
+        policy.name: tuple(
+            replay_stage13_role_policy_case(
+                case,
+                policy,
+                official_top_k=official_top_k,
+                diagnostic_top_k=diagnostic_top_k,
+            )
+            for case in cases
+        )
+        for policy in policy_grid
+    }
+    baseline_results = results_by_policy["baseline"]
+    aggregate_by_policy = {
+        policy.name: _stage13_role_policy_aggregate_to_dict(
+            baseline_results=baseline_results,
+            policy_results=results_by_policy[policy.name],
+        )
+        for policy in policy_grid
+    }
+    regression_gates = {
+        policy.name: _stage13_role_policy_regression_gates(
+            policy=policy,
+            baseline_results=baseline_results,
+            policy_results=results_by_policy[policy.name],
+        )
+        for policy in policy_grid
+    }
+    per_case_comparison = _stage13_role_policy_case_comparison(results_by_policy)
+
+    return {
+        "metadata": {
+            "run_id": f"{input_run_id}-role-policy-replay",
+            "created_at": created.astimezone(UTC).isoformat(),
+            "input_run_id": input_run_id,
+            "input_diagnostic_run": input_run_path,
+            "input_timing_mode": input_metadata.get("timing_mode"),
+            "input_embedder_mode": input_metadata.get("embedder_mode"),
+            "input_embedding_model": input_metadata.get("embedding_model"),
+            "input_git_branch": input_metadata.get("git_branch"),
+            "input_git_sha": input_metadata.get("git_sha"),
+            "official_top_k_override": official_top_k,
+            "diagnostic_top_k_override": diagnostic_top_k,
+            "policy_definitions": [stage13_role_policy_to_dict(policy) for policy in policy_grid],
+            "target_cases": list(STAGE13_ROLE_POLICY_TARGET_CASES),
+        },
+        "input_run_metadata": dict(input_metadata),
+        "aggregate_metrics_by_policy": aggregate_by_policy,
+        "per_case_policy_comparison": per_case_comparison,
+        "weak_evidence_pollution": _stage13_role_policy_weak_evidence_table(results_by_policy),
+        "target_case_focus": [
+            item
+            for item in per_case_comparison
+            if item["example_id"] in STAGE13_ROLE_POLICY_TARGET_CASES
+        ],
+        "regression_gates": regression_gates,
+        "recommendation": _stage13_role_policy_recommendation(
+            policies=policy_grid,
+            aggregate_by_policy=aggregate_by_policy,
+            regression_gates=regression_gates,
+        ),
+    }
+
+
+def stage13_role_policy_replay_report_to_markdown(payload: Mapping[str, object]) -> str:
+    """Render a Markdown report for Stage 13b role-policy replay output."""
+
+    metadata = _required_mapping(payload, "metadata")
+    aggregates = _required_mapping(payload, "aggregate_metrics_by_policy")
+    policy_definitions = _required_list(metadata, "policy_definitions")
+    per_case = _required_list(payload, "per_case_policy_comparison")
+    weak_table = _required_list(payload, "weak_evidence_pollution")
+    target_focus = _required_list(payload, "target_case_focus")
+    gates = _required_mapping(payload, "regression_gates")
+    recommendation = _required_mapping(payload, "recommendation")
+
+    lines = [
+        f"# Stage 13b Role Policy Replay: {_required_str(metadata, 'input_run_id')}",
+        "",
+        "## Metadata",
+        "",
+        f"- Input diagnostic run: {metadata.get('input_diagnostic_run')}",
+        f"- Timing mode: {metadata.get('input_timing_mode')}",
+        (
+            f"- Embedder: {metadata.get('input_embedder_mode')} "
+            f"({metadata.get('input_embedding_model')})"
+        ),
+        f"- Official top-k override: {metadata.get('official_top_k_override')}",
+        f"- Diagnostic top-k override: {metadata.get('diagnostic_top_k_override')}",
+        f"- Git SHA: {metadata.get('input_git_sha')}",
+        "",
+        "## Policy Definitions",
+        "",
+        "| Policy | Excluded Roles | Demoted Roles | Recap Metadata |",
+        "| --- | --- | --- | ---: |",
+    ]
+    for item in policy_definitions:
+        policy = _as_mapping(item)
+        lines.append(
+            f"| {policy['name']} | {_format_role_list(policy.get('excluded_roles'))} | "
+            f"{_format_role_list(policy.get('demoted_roles'))} | "
+            f"{policy.get('depends_on_recap_metadata')} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Aggregate Metrics By Policy",
+            "",
+            (
+                "| Policy | Acceptable@K | Raw@K | Summary@K | MRR | "
+                "Weak Before Evidence | Recap Before | Echo Before | Direct Regressions | "
+                "Negative Control Retained |"
+            ),
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for policy_name, aggregate_value in aggregates.items():
+        aggregate = _as_mapping(aggregate_value)
+        lines.append(
+            f"| {policy_name} | {_format_metric(aggregate['acceptable_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['raw_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['summary_hit_rate_at_k'])} | "
+            f"{_format_metric(aggregate['mean_reciprocal_rank'])} | "
+            f"{aggregate['total_weak_evidence_above_first_acceptable_count']} | "
+            f"{aggregate['recap_above_first_acceptable_count']} | "
+            f"{aggregate['assistant_echo_above_first_acceptable_count']} | "
+            f"{aggregate['direct_fact_regression_count']} | "
+            f"{aggregate['negative_control_no_hit_retained']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per-Case Policy Comparison",
+            "",
+            (
+                "| Example | Policy | Acceptable@K | First Acceptable | First Raw | "
+                "First Summary | Weak Before Evidence | First Blocking Role |"
+            ),
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for item in per_case:
+        comparison = _as_mapping(item)
+        policies = _required_mapping(comparison, "policies")
+        for policy_name, policy_value in policies.items():
+            policy = _as_mapping(policy_value)
+            weak = _required_mapping(policy, "weak_evidence")
+            lines.append(
+                f"| {comparison['example_id']} | {policy_name} | "
+                f"{policy['acceptable_hit_at_k']} | "
+                f"{_format_metric(policy['first_acceptable_rank'])} | "
+                f"{_format_metric(policy['first_raw_rank'])} | "
+                f"{_format_metric(policy['first_summary_rank'])} | "
+                f"{weak['total_weak_evidence_above_first_acceptable_count']} | "
+                f"{weak['first_blocking_weak_evidence_role']} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Weak-Evidence Pollution",
+            "",
+            (
+                "| Example | Policy | Recap Top K | Echo Top K | Recap Diagnostic | "
+                "Echo Diagnostic | Recap Before | Echo Before |"
+            ),
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for item in weak_table:
+        row = _as_mapping(item)
+        lines.append(
+            f"| {row['example_id']} | {row['policy']} | "
+            f"{row['recap_official_top_k_count']} | "
+            f"{row['assistant_echo_official_top_k_count']} | "
+            f"{row['recap_diagnostic_top_k_count']} | "
+            f"{row['assistant_echo_diagnostic_top_k_count']} | "
+            f"{row['recap_above_first_acceptable_count']} | "
+            f"{row['assistant_echo_above_first_acceptable_count']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Target-Case Focus",
+            "",
+            "| Example | Policy | First Acceptable | Weak Before Evidence |",
+            "| --- | --- | ---: | ---: |",
+        ]
+    )
+    for item in target_focus:
+        comparison = _as_mapping(item)
+        policies = _required_mapping(comparison, "policies")
+        for policy_name, policy_value in policies.items():
+            policy = _as_mapping(policy_value)
+            weak = _required_mapping(policy, "weak_evidence")
+            lines.append(
+                f"| {comparison['example_id']} | {policy_name} | "
+                f"{_format_metric(policy['first_acceptable_rank'])} | "
+                f"{weak['total_weak_evidence_above_first_acceptable_count']} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Regression Gates",
+            "",
+            "| Policy | Recommended | Failed Gates |",
+            "| --- | ---: | --- |",
+        ]
+    )
+    for policy_name, gate_value in gates.items():
+        gate_record = _as_mapping(gate_value)
+        failed = gate_record["failed_gates"]
+        failed_text = ", ".join(str(item) for item in failed) if isinstance(failed, list) else ""
+        lines.append(f"| {policy_name} | {gate_record['recommended']} | {failed_text or 'none'} |")
+
+    lines.extend(
+        [
+            "",
+            "## Recommendation",
+            "",
+            f"- Decision: {recommendation['decision']}",
+            f"- Policy: {recommendation.get('policy')}",
+            f"- Explanation: {recommendation['explanation']}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def stage12_case_result_from_dict(record: Mapping[str, object]) -> Stage12CaseResult:
     """Parse one emitted Stage 12 diagnostic case record."""
 
@@ -1436,6 +1893,383 @@ def _negative_control_no_hit_retained(results: Sequence[Stage12CaseResult]) -> b
     )
 
 
+def _stage13_role_policy_ordered_candidates(
+    candidates: Sequence[Stage12RetrievedEpisodeRecord],
+    policy: Stage13RolePolicy,
+) -> tuple[Stage12RetrievedEpisodeRecord, ...]:
+    if not policy.demoted_roles:
+        return tuple(candidates)
+    if policy.demotion_strategy != "move_behind_non_weak":
+        raise InvalidRetrievalRequestError(
+            f"Stage 13 unknown role-policy demotion strategy: {policy.demotion_strategy}"
+        )
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda record: (
+                1 if _stage13_record_has_any_role(record, policy.demoted_roles) else 0,
+                record.rank,
+            ),
+        )
+    )
+
+
+def _stage13_record_has_any_role(
+    record: Stage12RetrievedEpisodeRecord,
+    roles: Sequence[EpisodeLabelRole],
+) -> bool:
+    return bool(set(record.label_roles).intersection(roles))
+
+
+def _stage13_record_is_weak_evidence(record: Stage12RetrievedEpisodeRecord) -> bool:
+    return _stage13_record_has_any_role(
+        record,
+        ("recap_question", "assistant_answer_echo"),
+    )
+
+
+def _stage13_count_role(
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+    role: EpisodeLabelRole,
+) -> int:
+    return sum(1 for record in records if role in record.label_roles)
+
+
+def _stage13_first_blocking_weak_evidence_role(
+    weak_before_acceptable: Sequence[Stage12RetrievedEpisodeRecord],
+) -> Stage13FirstBlockingWeakEvidenceRole:
+    first = next(
+        iter(sorted(weak_before_acceptable, key=lambda record: record.official_rank or 0)),
+        None,
+    )
+    if first is None:
+        return "none"
+    has_recap = "recap_question" in first.label_roles
+    has_echo = "assistant_answer_echo" in first.label_roles
+    if has_recap and has_echo:
+        return "both"
+    if has_recap:
+        return "recap"
+    if has_echo:
+        return "assistant_echo"
+    return "none"
+
+
+def _stage13_removed_legitimate_raw_source_count(
+    candidates: Sequence[Stage12RetrievedEpisodeRecord],
+    policy: Stage13RolePolicy,
+) -> int:
+    if not policy.excluded_roles:
+        return 0
+    return sum(
+        1
+        for record in candidates
+        if _stage13_record_has_any_role(record, policy.excluded_roles)
+        and (
+            record.is_raw_expected or ("raw_source" in record.label_roles and record.is_acceptable)
+        )
+    )
+
+
+def _stage13_role_policy_aggregate_to_dict(
+    *,
+    baseline_results: Sequence[Stage13RolePolicyCaseResult],
+    policy_results: Sequence[Stage13RolePolicyCaseResult],
+) -> dict[str, object]:
+    baseline_cases = tuple(result.case_result for result in baseline_results)
+    policy_cases = tuple(result.case_result for result in policy_results)
+    aggregate = stage12_aggregate_metrics_to_dict(summarize_stage12_results(policy_cases))
+    weak_metrics = tuple(result.weak_evidence for result in policy_results)
+    first_blocking_counts = {
+        role: sum(
+            1 for metrics in weak_metrics if metrics.first_blocking_weak_evidence_role == role
+        )
+        for role in ("recap", "assistant_echo", "both", "none")
+    }
+    aggregate.update(
+        {
+            "recap_above_first_acceptable_count": sum(
+                metrics.recap_above_first_acceptable_count for metrics in weak_metrics
+            ),
+            "assistant_echo_above_first_acceptable_count": sum(
+                metrics.assistant_echo_above_first_acceptable_count for metrics in weak_metrics
+            ),
+            "total_weak_evidence_above_first_acceptable_count": sum(
+                metrics.total_weak_evidence_above_first_acceptable_count for metrics in weak_metrics
+            ),
+            "recap_official_top_k_count": sum(
+                metrics.recap_official_top_k_count for metrics in weak_metrics
+            ),
+            "assistant_echo_official_top_k_count": sum(
+                metrics.assistant_echo_official_top_k_count for metrics in weak_metrics
+            ),
+            "recap_diagnostic_top_k_count": sum(
+                metrics.recap_diagnostic_top_k_count for metrics in weak_metrics
+            ),
+            "assistant_echo_diagnostic_top_k_count": sum(
+                metrics.assistant_echo_diagnostic_top_k_count for metrics in weak_metrics
+            ),
+            "first_blocking_weak_evidence_role_counts": first_blocking_counts,
+            "direct_fact_regression_count": _stage13_direct_fact_regression_count(
+                baseline_cases=baseline_cases,
+                policy_cases=policy_cases,
+            ),
+            "negative_control_no_hit_retained": _negative_control_no_hit_retained(policy_cases),
+            "legitimate_raw_source_removed_count": sum(
+                result.removed_legitimate_raw_source_count for result in policy_results
+            ),
+        }
+    )
+    return aggregate
+
+
+def _stage13_direct_fact_regression_count(
+    *,
+    baseline_cases: Sequence[Stage12CaseResult],
+    policy_cases: Sequence[Stage12CaseResult],
+) -> int:
+    return sum(
+        1
+        for baseline, policy in zip(baseline_cases, policy_cases, strict=True)
+        if baseline.question_type == "direct_fact"
+        and baseline.metrics.hit_at_k
+        and not policy.metrics.hit_at_k
+    )
+
+
+def _stage13_role_policy_regression_gates(
+    *,
+    policy: Stage13RolePolicy,
+    baseline_results: Sequence[Stage13RolePolicyCaseResult],
+    policy_results: Sequence[Stage13RolePolicyCaseResult],
+) -> dict[str, object]:
+    baseline_cases = tuple(result.case_result for result in baseline_results)
+    policy_cases = tuple(result.case_result for result in policy_results)
+    baseline_aggregate = summarize_stage12_results(baseline_cases)
+    policy_aggregate = summarize_stage12_results(policy_cases)
+    direct_fact_regressions = _stage13_direct_fact_regression_count(
+        baseline_cases=baseline_cases,
+        policy_cases=policy_cases,
+    )
+    negative_control_no_hit_retained = _negative_control_no_hit_retained(policy_cases)
+    removed_raw_sources = sum(
+        result.removed_legitimate_raw_source_count for result in policy_results
+    )
+    gates = [
+        _gate_record(
+            "acceptable_hit_not_dropped",
+            failed=policy_aggregate.acceptable_hit_rate_at_k
+            < baseline_aggregate.acceptable_hit_rate_at_k - _METRIC_EPSILON,
+            value=policy_aggregate.acceptable_hit_rate_at_k,
+            baseline=baseline_aggregate.acceptable_hit_rate_at_k,
+        ),
+        _gate_record(
+            "raw_hit_not_dropped",
+            failed=policy_aggregate.raw_hit_rate_at_k
+            < baseline_aggregate.raw_hit_rate_at_k - _METRIC_EPSILON,
+            value=policy_aggregate.raw_hit_rate_at_k,
+            baseline=baseline_aggregate.raw_hit_rate_at_k,
+        ),
+        _gate_record(
+            "mrr_not_materially_dropped",
+            failed=policy_aggregate.mean_reciprocal_rank
+            < baseline_aggregate.mean_reciprocal_rank - _MATERIAL_MRR_DROP,
+            value=policy_aggregate.mean_reciprocal_rank,
+            baseline=baseline_aggregate.mean_reciprocal_rank,
+            threshold=_MATERIAL_MRR_DROP,
+        ),
+        _gate_record(
+            "direct_fact_regression",
+            failed=direct_fact_regressions > 0,
+            value=direct_fact_regressions,
+            detail="previously passing direct facts must keep preferred hits",
+        ),
+        _gate_record(
+            "negative_control_no_hit_retained",
+            failed=not negative_control_no_hit_retained,
+            value=negative_control_no_hit_retained,
+        ),
+        _gate_record(
+            "legitimate_raw_source_not_removed",
+            failed=removed_raw_sources > 0,
+            value=removed_raw_sources,
+        ),
+        _gate_record(
+            "recap_metadata_available",
+            failed=policy.depends_on_recap_metadata,
+            value=not policy.depends_on_recap_metadata,
+            detail="recap-question labels are eval-only today",
+        ),
+    ]
+    failed_gates = [str(gate["name"]) for gate in gates if gate.get("status") == "fail"]
+    return {
+        "recommended": not failed_gates,
+        "failed_gates": failed_gates,
+        "gates": gates,
+    }
+
+
+def _stage13_role_policy_case_comparison(
+    results_by_policy: Mapping[str, Sequence[Stage13RolePolicyCaseResult]],
+) -> list[dict[str, object]]:
+    baseline_results = results_by_policy["baseline"]
+    comparison: list[dict[str, object]] = []
+    for baseline in baseline_results:
+        policy_records: dict[str, object] = {}
+        for policy_name, policy_results in results_by_policy.items():
+            policy_result = _find_stage13_policy_case(
+                policy_results,
+                baseline.case_result.example_id,
+            )
+            policy_case = policy_result.case_result
+            policy_records[policy_name] = {
+                "hit_at_k": policy_case.metrics.hit_at_k,
+                "acceptable_hit_at_k": policy_case.metrics.acceptable_hit_at_k,
+                "raw_hit_at_k": policy_case.metrics.raw_hit_at_k,
+                "summary_hit_at_k": policy_case.metrics.summary_hit_at_k,
+                "reciprocal_rank": policy_case.metrics.reciprocal_rank,
+                "first_acceptable_rank": (policy_case.diagnostics.first_acceptable_diagnostic_rank),
+                "first_raw_rank": policy_case.diagnostics.first_raw_diagnostic_rank,
+                "first_summary_rank": policy_case.diagnostics.first_summary_diagnostic_rank,
+                "weak_evidence": _stage13_weak_evidence_metrics_to_dict(
+                    policy_result.weak_evidence
+                ),
+                "removed_legitimate_raw_source_count": (
+                    policy_result.removed_legitimate_raw_source_count
+                ),
+            }
+        comparison.append(
+            {
+                "example_id": baseline.case_result.example_id,
+                "question_type": baseline.case_result.question_type,
+                "preferred_layer": baseline.case_result.preferred_layer,
+                "top_k": baseline.case_result.top_k,
+                "policies": policy_records,
+            }
+        )
+    return comparison
+
+
+def _find_stage13_policy_case(
+    results: Sequence[Stage13RolePolicyCaseResult],
+    example_id: str,
+) -> Stage13RolePolicyCaseResult:
+    return next(result for result in results if result.case_result.example_id == example_id)
+
+
+def _stage13_role_policy_weak_evidence_table(
+    results_by_policy: Mapping[str, Sequence[Stage13RolePolicyCaseResult]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for policy_name, policy_results in results_by_policy.items():
+        for result in policy_results:
+            rows.append(
+                {
+                    "example_id": result.case_result.example_id,
+                    "policy": policy_name,
+                    **_stage13_weak_evidence_metrics_to_dict(result.weak_evidence),
+                }
+            )
+    return rows
+
+
+def _stage13_role_policy_recommendation(
+    *,
+    policies: Sequence[Stage13RolePolicy],
+    aggregate_by_policy: Mapping[str, Mapping[str, object]],
+    regression_gates: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    baseline = aggregate_by_policy["baseline"]
+    unsafe_improvements: list[str] = []
+    recap_improvements: list[str] = []
+    assistant_candidates: list[str] = []
+    for policy in policies:
+        if policy.name == "baseline":
+            continue
+        aggregate = aggregate_by_policy[policy.name]
+        if not _stage13_role_policy_improves(policy=aggregate, baseline=baseline):
+            continue
+        gates = regression_gates[policy.name]
+        if policy.depends_on_recap_metadata:
+            recap_improvements.append(policy.name)
+            continue
+        if gates.get("recommended"):
+            assistant_candidates.append(policy.name)
+        else:
+            unsafe_improvements.append(policy.name)
+
+    if assistant_candidates:
+        return {
+            "decision": "assistant_echo_policy_candidate",
+            "policy": assistant_candidates[0],
+            "explanation": (
+                "An assistant-echo policy improved or preserved retrieval metrics while "
+                "reducing weak-evidence pollution without tripping regression gates."
+            ),
+        }
+    if recap_improvements:
+        return {
+            "decision": "recap_policy_requires_metadata",
+            "policy": recap_improvements[0],
+            "explanation": (
+                "A recap-question policy improved the replay, but recap labels are "
+                "eval-only today and require durable metadata before production use."
+            ),
+        }
+    if unsafe_improvements:
+        return {
+            "decision": "role_policy_insufficient",
+            "policy": unsafe_improvements[0],
+            "explanation": (
+                "At least one role policy improved replay metrics but failed a regression "
+                "or safety gate."
+            ),
+        }
+    return {
+        "decision": "no_role_policy_change_recommended",
+        "policy": "baseline",
+        "explanation": (
+            "No eval-only role policy produced a safe improvement over the diagnostic baseline."
+        ),
+    }
+
+
+def _stage13_role_policy_improves(
+    *,
+    policy: Mapping[str, object],
+    baseline: Mapping[str, object],
+) -> bool:
+    return (
+        _required_float(policy, "acceptable_hit_rate_at_k")
+        > _required_float(baseline, "acceptable_hit_rate_at_k") + _METRIC_EPSILON
+        or _required_float(policy, "hit_rate_at_k")
+        > _required_float(baseline, "hit_rate_at_k") + _METRIC_EPSILON
+        or _required_float(policy, "mean_reciprocal_rank")
+        > _required_float(baseline, "mean_reciprocal_rank") + _MATERIAL_MRR_DROP
+        or _required_int(policy, "total_weak_evidence_above_first_acceptable_count")
+        < _required_int(baseline, "total_weak_evidence_above_first_acceptable_count")
+    )
+
+
+def _stage13_weak_evidence_metrics_to_dict(
+    metrics: Stage13WeakEvidenceMetrics,
+) -> dict[str, object]:
+    return {
+        "recap_above_first_acceptable_count": metrics.recap_above_first_acceptable_count,
+        "assistant_echo_above_first_acceptable_count": (
+            metrics.assistant_echo_above_first_acceptable_count
+        ),
+        "total_weak_evidence_above_first_acceptable_count": (
+            metrics.total_weak_evidence_above_first_acceptable_count
+        ),
+        "recap_official_top_k_count": metrics.recap_official_top_k_count,
+        "assistant_echo_official_top_k_count": metrics.assistant_echo_official_top_k_count,
+        "recap_diagnostic_top_k_count": metrics.recap_diagnostic_top_k_count,
+        "assistant_echo_diagnostic_top_k_count": metrics.assistant_echo_diagnostic_top_k_count,
+        "first_blocking_weak_evidence_role": metrics.first_blocking_weak_evidence_role,
+    }
+
+
 def _gate_record(
     name: str,
     *,
@@ -1461,6 +2295,12 @@ def _format_metric(value: object) -> str:
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
+
+
+def _format_role_list(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        return "none"
+    return ", ".join(str(item) for item in value)
 
 
 def _expected_ids_from_dict(record: Mapping[str, object]) -> Stage12ExpectedIds:
