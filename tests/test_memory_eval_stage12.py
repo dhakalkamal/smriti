@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 from testcontainers.postgres import PostgresContainer
 
+from scripts.run_retrieval_assembly_eval import main as run_retrieval_assembly_eval
 from scripts.run_retrieval_baseline import main as run_retrieval_baseline
 from scripts.run_retrieval_lexical_replay import main as run_retrieval_lexical_replay
 from scripts.run_retrieval_role_policy_replay import main as run_retrieval_role_policy_replay
@@ -1973,6 +1974,86 @@ def test_stage12_runner_smoke_writes_json_jsonl_and_markdown(tmp_path: Path) -> 
     assert lexical_payload["metadata"]["input_run_id"] == "stage12-smoke"
     assert "lexical_combined" in lexical_payload["aggregate_metrics_by_profile"]
     assert "Raw Evidence Rank Movement" in lexical_report_path.read_text(encoding="utf-8")
+
+
+def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        asyncio.run(apply_migrations(settings=settings, migrations_dir=migrations_dir))
+
+        exit_code = run_retrieval_assembly_eval(
+            [
+                "--database-url",
+                database_url,
+                "--output-root",
+                str(tmp_path),
+                "--run-id",
+                "stage13e1-assembly-smoke",
+                "--diagnostic-top-k",
+                "25",
+            ]
+        )
+
+    assert exit_code == 0
+    run_dir = tmp_path / "runs" / "stage13e1-assembly-smoke"
+    report_path = tmp_path / "results" / "stage13e1-assembly-smoke.md"
+    assert (run_dir / "run.json").exists()
+    assert (run_dir / "cases.jsonl").exists()
+    assert report_path.exists()
+
+    payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    aggregate = cast(dict[str, object], payload["aggregate_metrics"])
+    retrieval_candidate_metrics = cast(dict[str, object], aggregate["retrieval_candidate_metrics"])
+    assembled_context_metrics = cast(dict[str, object], aggregate["assembled_context_metrics"])
+
+    assert payload["metadata"]["eval_stage"] == "stage13e-1"
+    assert payload["metadata"]["eval_layer"] == "assembly"
+    assert payload["metadata"]["timing_mode"] == "app_realistic"
+    assert payload["metadata"]["embedder_mode"] == "fake"
+    assert payload["metadata"]["diagnostic_top_k"] == 25
+    assert len(payload["cases"]) == 9
+    assert retrieval_candidate_metrics["self_query_hit_rate"] == pytest.approx(0.0)
+    assert assembled_context_metrics["self_query_hit_rate"] == pytest.approx(0.0)
+    assert aggregate["active_query_exactly_once_rate"] == pytest.approx(1.0)
+    assert aggregate["recent_context_duplication_rate"] == pytest.approx(0.0)
+    assert "source_raw_hit_rate_at_k" in assembled_context_metrics
+    assert "source_summary_hit_rate_at_k" in assembled_context_metrics
+    assert "mean_source_ndcg_at_k" in assembled_context_metrics
+    assert "mean_source_reciprocal_rank" in assembled_context_metrics
+    assert "mean_source_raw_reciprocal_rank" in assembled_context_metrics
+    assert "mean_source_summary_reciprocal_rank" in assembled_context_metrics
+
+    case_records = cast(list[dict[str, object]], payload["cases"])
+    first_case = case_records[0]
+    first_candidate_metrics = cast(dict[str, object], first_case["retrieval_candidate_metrics"])
+    first_assembled_metrics = cast(dict[str, object], first_case["assembled_context_metrics"])
+    first_assembly_metrics = cast(dict[str, object], first_case["assembly_metrics"])
+    assert "self_query_hit" in first_candidate_metrics
+    assert "self_query_hit" in first_assembled_metrics
+    assert "active_query_occurrences" in first_assembly_metrics
+    assert "recent_context_duplication_rate" in first_assembly_metrics
+    assert "source_raw_hit_at_k" in first_assembled_metrics
+    assert "source_summary_hit_at_k" in first_assembled_metrics
+    assert "source_ndcg_at_k" in first_assembled_metrics
+    serialized_memories = [
+        memory
+        for case_record in case_records
+        for memory_key in ("retrieved_candidates", "admitted_memories", "skipped_memories")
+        for memory in cast(list[dict[str, object]], case_record[memory_key])
+    ]
+    assert serialized_memories
+    assert all("content" not in memory for memory in serialized_memories)
+    assert "Stage 13e-1 Assembly Eval" in report_path.read_text(encoding="utf-8")
 
 
 def _case(
