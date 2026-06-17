@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from smriti.chat import ChatRequest
 from smriti.memory import MessageRecord, ScoredEpisode
+
+MemoryPromptStyle = Literal["legacy", "typed_v1"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,7 @@ class PromptBuildRequest:
     recent_messages: tuple[MessageRecord, ...]
     query_message_id: UUID
     max_prompt_chars: int = 16000
+    memory_prompt_style: MemoryPromptStyle = "legacy"
 
 
 @dataclass(frozen=True)
@@ -52,12 +56,23 @@ class PromptBuildResult:
 
 
 @dataclass(frozen=True)
+class MemoryAdmissionDecision:
+    memory: ScoredEpisode
+    lane: str
+    admitted: bool
+    admission_reason: str | None
+    skip_reason: str | None
+
+
+@dataclass(frozen=True)
 class AssistantPromptAssembly:
     prompt: PromptBuildResult
     recent_context: RecentContextSelectionResult
     active_query_message_id: UUID
     excluded_message_ids: tuple[UUID, ...]
     retrieved_memories: tuple[ScoredEpisode, ...]
+    memory_admission_decisions: tuple[MemoryAdmissionDecision, ...]
+    memory_policy: str
     prompt_message_order: tuple[str, ...]
     active_query_occurrences: int
 

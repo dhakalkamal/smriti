@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from smriti.assistant.errors import (
     AssistantGenerationFailedError,
     AssistantGenerationUnavailableError,
+)
+from smriti.assistant.memory_policy import (
+    MemoryPolicyName,
+    TypedMemoryAdmissionConfig,
+    apply_typed_memory_admission,
+    finalize_memory_admission_decisions,
+    legacy_memory_admission_decisions,
 )
 from smriti.assistant.models import (
     AssistantGenerationRequest,
@@ -51,6 +58,10 @@ class AssistantOrchestrator:
 
     memory_service: MemoryService
     chat_generator: ChatGenerator
+    memory_policy: MemoryPolicyName = "legacy"
+    typed_v1_memory_config: TypedMemoryAdmissionConfig = field(
+        default_factory=TypedMemoryAdmissionConfig
+    )
 
     async def generate(self, request: AssistantGenerationRequest) -> AssistantGenerationResult:
         """Generate and persist one assistant response for a stored user message."""
@@ -191,28 +202,81 @@ class AssistantOrchestrator:
                 max_prompt_chars=request.max_prompt_chars,
             )
         )
-        retrieved_memories = await self.memory_service.retrieve_scoped_episodes(
-            user_id=request.user_id,
-            scope_id=request.scope_id,
-            query=context.query_message.content,
-            top_k=request.top_k,
-            exclude_message_ids=recent_context.selected_recent_message_ids,
-        )
-        prompt = build_chat_request(
-            request=PromptBuildRequest(
-                scope_system_prompt=context.scope.system_prompt,
-                retrieved_memories=tuple(retrieved_memories),
-                recent_messages=recent_context.selected_recent_messages,
-                query_message_id=request.query_message_id,
-                max_prompt_chars=request.max_prompt_chars,
+        if self.memory_policy == "legacy":
+            retrieved_memories = tuple(
+                await self.memory_service.retrieve_scoped_episodes(
+                    user_id=request.user_id,
+                    scope_id=request.scope_id,
+                    query=context.query_message.content,
+                    top_k=request.top_k,
+                    exclude_message_ids=recent_context.selected_recent_message_ids,
+                )
             )
-        )
+            prompt = build_chat_request(
+                request=PromptBuildRequest(
+                    scope_system_prompt=context.scope.system_prompt,
+                    retrieved_memories=retrieved_memories,
+                    recent_messages=recent_context.selected_recent_messages,
+                    query_message_id=request.query_message_id,
+                    max_prompt_chars=request.max_prompt_chars,
+                )
+            )
+            memory_admission_decisions = legacy_memory_admission_decisions(
+                retrieved_memories=retrieved_memories,
+                selected_memories=prompt.selected_memories,
+                skipped_memories=prompt.skipped_memories,
+            )
+        else:
+            candidate_top_k = max(request.top_k, self.typed_v1_memory_config.total_limit)
+            retrieved_memories = tuple(
+                await self.memory_service.retrieve_scoped_episodes(
+                    user_id=request.user_id,
+                    scope_id=request.scope_id,
+                    query=context.query_message.content,
+                    top_k=candidate_top_k,
+                    exclude_message_ids=recent_context.selected_recent_message_ids,
+                    update_access_metadata=False,
+                )
+            )
+            admission = apply_typed_memory_admission(
+                retrieved_memories,
+                config=self.typed_v1_memory_config,
+                excluded_message_ids=recent_context.selected_recent_message_ids,
+            )
+            prompt = build_chat_request(
+                request=PromptBuildRequest(
+                    scope_system_prompt=context.scope.system_prompt,
+                    retrieved_memories=admission.admitted_memories,
+                    recent_messages=recent_context.selected_recent_messages,
+                    query_message_id=request.query_message_id,
+                    max_prompt_chars=request.max_prompt_chars,
+                    memory_prompt_style="typed_v1",
+                )
+            )
+            prompt = replace(
+                prompt,
+                skipped_memories=_dedupe_memories(
+                    (*prompt.skipped_memories, *admission.skipped_memories)
+                ),
+            )
+            memory_admission_decisions = finalize_memory_admission_decisions(
+                admission.decisions,
+                selected_memories=prompt.selected_memories,
+                prompt_skipped_memories=prompt.skipped_memories,
+            )
+            await self.memory_service.update_episode_access_metadata(
+                user_id=request.user_id,
+                scope_id=request.scope_id,
+                episodes=prompt.selected_memories,
+            )
         return AssistantPromptAssembly(
             prompt=prompt,
             recent_context=recent_context,
             active_query_message_id=recent_context.active_query_message_id,
             excluded_message_ids=recent_context.selected_recent_message_ids,
-            retrieved_memories=tuple(retrieved_memories),
+            retrieved_memories=retrieved_memories,
+            memory_admission_decisions=memory_admission_decisions,
+            memory_policy=self.memory_policy,
             prompt_message_order=_prompt_message_order(prompt),
             active_query_occurrences=sum(
                 1
@@ -261,3 +325,14 @@ def _prompt_message_order(prompt: PromptBuildResult) -> tuple[str, ...]:
         *(f"memory:{memory.id}" for memory in prompt.selected_memories),
         *(f"recent:{message.role}:{message.id}" for message in prompt.selected_recent_messages),
     )
+
+
+def _dedupe_memories(memories: tuple[ScoredEpisode, ...]) -> tuple[ScoredEpisode, ...]:
+    seen: set[object] = set()
+    deduped: list[ScoredEpisode] = []
+    for memory in memories:
+        if memory.id in seen:
+            continue
+        seen.add(memory.id)
+        deduped.append(memory)
+    return tuple(deduped)

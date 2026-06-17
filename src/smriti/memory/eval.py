@@ -629,6 +629,17 @@ class Stage13AssemblyMetrics:
 
 
 @dataclass(frozen=True)
+class Stage13MemoryAdmissionRecord:
+    episode_id: UUID
+    lane: str
+    admitted: bool
+    admission_reason: str | None
+    skip_reason: str | None
+    original_rank: int
+    score: float
+
+
+@dataclass(frozen=True)
 class Stage13AssemblyCaseResult:
     example_id: str
     scenario_id: str
@@ -642,6 +653,7 @@ class Stage13AssemblyCaseResult:
     retrieved_candidates: tuple[Stage12RetrievedEpisodeRecord, ...]
     admitted_memories: tuple[Stage12RetrievedEpisodeRecord, ...]
     skipped_memories: tuple[Stage12RetrievedEpisodeRecord, ...]
+    memory_admission_records: tuple[Stage13MemoryAdmissionRecord, ...]
     prompt_message_order: tuple[str, ...]
     retrieval_candidate_metrics: Stage12CaseMetrics
     assembled_context_metrics: Stage12CaseMetrics
@@ -982,6 +994,7 @@ def score_stage13_assembly_case(
     excluded_message_ids: Sequence[UUID],
     prompt_message_order: Sequence[str],
     active_query_occurrences: int,
+    memory_admission_records: Sequence[Stage13MemoryAdmissionRecord] = (),
     timing_mode: TimingMode = "app_realistic",
     diagnostic_top_k: int | None = None,
 ) -> Stage13AssemblyCaseResult:
@@ -1044,6 +1057,7 @@ def score_stage13_assembly_case(
         retrieved_candidates=retrieval_candidate_result.retrieved,
         admitted_memories=admitted_records,
         skipped_memories=skipped_records,
+        memory_admission_records=tuple(memory_admission_records),
         prompt_message_order=tuple(prompt_message_order),
         retrieval_candidate_metrics=retrieval_candidate_result.metrics,
         assembled_context_metrics=assembled_context_result.metrics,
@@ -4474,6 +4488,10 @@ def stage13_assembly_case_result_to_dict(result: Stage13AssemblyCaseResult) -> d
         "skipped_memories": [
             _retrieved_record_to_dict(record) for record in result.skipped_memories
         ],
+        "memory_admission_records": [
+            _stage13_memory_admission_record_to_dict(record)
+            for record in result.memory_admission_records
+        ],
         "prompt_message_order": list(result.prompt_message_order),
         "retrieval_candidate_metrics": _case_metrics_to_dict(result.retrieval_candidate_metrics),
         "assembled_context_metrics": _case_metrics_to_dict(result.assembled_context_metrics),
@@ -4499,6 +4517,20 @@ def stage13_assembly_aggregate_metrics_to_dict(
         "over_retrieval_rate": metrics.over_retrieval_rate,
         "false_positive_retrieval_rate": metrics.false_positive_retrieval_rate,
         "active_query_exactly_once_rate": metrics.active_query_exactly_once_rate,
+    }
+
+
+def _stage13_memory_admission_record_to_dict(
+    record: Stage13MemoryAdmissionRecord,
+) -> dict[str, object]:
+    return {
+        "episode_id": str(record.episode_id),
+        "lane": record.lane,
+        "admitted": record.admitted,
+        "admission_reason": record.admission_reason,
+        "skip_reason": record.skip_reason,
+        "original_rank": record.original_rank,
+        "score": record.score,
     }
 
 

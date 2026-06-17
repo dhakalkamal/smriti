@@ -19,7 +19,7 @@ from smriti.api.routes import (
     retrieval_router,
     scopes_router,
 )
-from smriti.assistant import AssistantOrchestrator
+from smriti.assistant import AssistantOrchestrator, TypedMemoryAdmissionConfig
 from smriti.chat import ChatGenerator, OllamaChatGenerator
 from smriti.config import Settings, get_settings
 from smriti.db.client import close_pool, get_pool
@@ -62,6 +62,13 @@ def create_app(
         assistant_orchestrator = AssistantOrchestrator(
             memory_service=memory_service,
             chat_generator=resolved_chat_generator,
+            memory_policy=resolved_settings.memory_policy,
+            typed_v1_memory_config=TypedMemoryAdmissionConfig(
+                total_limit=resolved_settings.memory_typed_v1_total_limit,
+                raw_source_limit=resolved_settings.memory_typed_v1_raw_source_limit,
+                summary_source_limit=resolved_settings.memory_typed_v1_summary_source_limit,
+                assistant_derived_limit=(resolved_settings.memory_typed_v1_assistant_derived_limit),
+            ),
         )
         summary_episode_memory_scheduler = SummaryEpisodeMemoryScheduler(
             memory_service=memory_service,

@@ -87,6 +87,7 @@ class _ScoredEpisodeCandidate:
     conversation_id: UUID
     kind: EpisodeKind
     message_id: UUID | None
+    message_role: MessageRole | None
     message_position: int | None
     range_start: int | None
     range_end: int | None
@@ -700,6 +701,7 @@ class MemoryService:
         *,
         exclude_message_id: UUID | None = None,
         exclude_message_ids: Sequence[UUID] = (),
+        update_access_metadata: bool = True,
         now: datetime | None = None,
     ) -> list[ScoredEpisode]:
         """Retrieve embedded episodes from exactly one user-owned scope."""
@@ -753,6 +755,7 @@ class MemoryService:
                     episodes.conversation_id,
                     episodes.kind,
                     episodes.message_id,
+                    messages.role AS message_role,
                     messages.position AS message_position,
                     episodes.range_start,
                     episodes.range_end,
@@ -793,7 +796,7 @@ class MemoryService:
                     start=1,
                 )
             ]
-            if retrieved_episodes:
+            if retrieved_episodes and update_access_metadata:
                 await self._update_retrieved_episode_access_metadata(
                     connection=connection,
                     user_id=user_id,
@@ -803,6 +806,35 @@ class MemoryService:
                 )
 
         return retrieved_episodes
+
+    async def update_episode_access_metadata(
+        self,
+        *,
+        user_id: UUID,
+        scope_id: UUID,
+        episodes: Sequence[ScoredEpisode],
+        now: datetime | None = None,
+    ) -> None:
+        """Update access reinforcement for final admitted retrieval episodes."""
+
+        if not episodes:
+            return
+
+        accessed_at = _resolve_scoring_now(now)
+        episode_ids = _dedupe_episode_ids(episodes)
+        async with self.pool.acquire() as connection, connection.transaction():
+            await self._ensure_scope_belongs_to_user(
+                connection=connection,
+                user_id=user_id,
+                scope_id=scope_id,
+            )
+            await self._update_retrieved_episode_access_metadata(
+                connection=connection,
+                user_id=user_id,
+                scope_id=scope_id,
+                episode_ids=episode_ids,
+                accessed_at=accessed_at,
+            )
 
     async def record_used_memories(
         self,
@@ -1594,6 +1626,17 @@ def _excluded_message_ids(
     return tuple(ids)
 
 
+def _dedupe_episode_ids(episodes: Sequence[ScoredEpisode]) -> list[UUID]:
+    ids: list[UUID] = []
+    seen: set[UUID] = set()
+    for episode in episodes:
+        if episode.id in seen:
+            continue
+        ids.append(episode.id)
+        seen.add(episode.id)
+    return ids
+
+
 def _scope_from_row(row: asyncpg.Record) -> ScopeRecord:
     return ScopeRecord(
         id=cast(UUID, row["id"]),
@@ -1754,6 +1797,7 @@ def _scored_episode_candidate_from_row(
         conversation_id=cast(UUID, row["conversation_id"]),
         kind=cast(EpisodeKind, row["kind"]),
         message_id=cast(UUID | None, row["message_id"]),
+        message_role=cast(MessageRole | None, row["message_role"]),
         message_position=cast(int | None, row["message_position"]),
         range_start=cast(int | None, row["range_start"]),
         range_end=cast(int | None, row["range_end"]),
@@ -1784,6 +1828,7 @@ def _scored_episode_from_candidate(
         conversation_id=candidate.conversation_id,
         kind=candidate.kind,
         message_id=candidate.message_id,
+        message_role=candidate.message_role,
         message_position=candidate.message_position,
         range_start=candidate.range_start,
         range_end=candidate.range_end,

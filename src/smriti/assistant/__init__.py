@@ -6,6 +6,10 @@ from smriti.assistant.errors import (
     AssistantGenerationUnavailableError,
     InvalidAssistantRequestError,
 )
+from smriti.assistant.memory_policy import (
+    MemoryPolicyName,
+    TypedMemoryAdmissionConfig,
+)
 from smriti.assistant.models import (
     AssistantGenerationRequest,
     AssistantGenerationResult,
@@ -16,6 +20,8 @@ from smriti.assistant.models import (
     AssistantStreamPreparation,
     AssistantStreamStart,
     AssistantStreamToken,
+    MemoryAdmissionDecision,
+    MemoryPromptStyle,
     PromptBuildRequest,
     PromptBuildResult,
     RecentContextSelectionRequest,
@@ -48,10 +54,14 @@ __all__ = [
     "DEFAULT_RECENT_MESSAGE_LIMIT",
     "FIXED_PRIVACY_INSTRUCTIONS",
     "InvalidAssistantRequestError",
+    "MemoryAdmissionDecision",
+    "MemoryPolicyName",
+    "MemoryPromptStyle",
     "PromptBuildRequest",
     "PromptBuildResult",
     "RecentContextSelectionRequest",
     "RecentContextSelectionResult",
+    "TypedMemoryAdmissionConfig",
     "build_chat_request",
     "select_recent_context",
 ]

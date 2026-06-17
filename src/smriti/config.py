@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+MemoryPolicy = Literal["legacy", "typed_v1"]
 
 
 class Settings(BaseSettings):
@@ -30,6 +33,11 @@ class Settings(BaseSettings):
     ollama_chat_timeout_seconds: float = Field(default=60.0, gt=0)
     summary_episode_memory_enabled: bool = Field(default=False)
     summary_episode_window_messages: int = Field(default=12, ge=1)
+    memory_policy: MemoryPolicy = Field(default="legacy")
+    memory_typed_v1_total_limit: int = Field(default=6, ge=0)
+    memory_typed_v1_raw_source_limit: int = Field(default=4, ge=0)
+    memory_typed_v1_summary_source_limit: int = Field(default=2, ge=0)
+    memory_typed_v1_assistant_derived_limit: int = Field(default=0, ge=0)
 
     model_config = SettingsConfigDict(
         env_prefix="SMRITI_",

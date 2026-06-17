@@ -195,6 +195,7 @@ class ScoredEpisode:
     importance_score: float
     frequency_score: float
     score: float
+    message_role: MessageRole | None = None
 
 
 @dataclass(frozen=True)

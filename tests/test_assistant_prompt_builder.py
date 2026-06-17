@@ -87,6 +87,33 @@ def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget
     assert not any("small low" in content for content in prompt_contents)
 
 
+def test_prompt_builder_typed_v1_uses_clean_memory_sections() -> None:
+    query_message = _message(1, "user", "q")
+    raw_memory = _episode(rank=1, score=0.9, content="raw source", role="user")
+    summary_memory = _summary_episode(rank=2, score=0.8, content="summary source")
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=(raw_memory, summary_memory),
+            recent_messages=(query_message,),
+            query_message_id=query_message.id,
+            max_prompt_chars=1000,
+            memory_prompt_style="typed_v1",
+        )
+    )
+
+    prompt_text = "\n".join(message.content for message in result.chat_request.messages)
+    assert result.selected_memories == (raw_memory, summary_memory)
+    assert "Long-term source memories" in prompt_text
+    assert "Long-term summary memories" in prompt_text
+    assert "raw source" in prompt_text
+    assert "summary source" in prompt_text
+    assert "episode_id=" not in prompt_text
+    assert "rank=" not in prompt_text
+    assert "score=" not in prompt_text
+
+
 def test_prompt_builder_reserves_selected_recent_context_before_memory() -> None:
     older_message = _message(1, "user", "older")
     recent_message = _message(2, "assistant", "recent")
@@ -217,7 +244,7 @@ def _message(position: int, role: str, content: str) -> MessageRecord:
     )
 
 
-def _episode(rank: int, score: float, content: str) -> ScoredEpisode:
+def _episode(rank: int, score: float, content: str, role: str = "user") -> ScoredEpisode:
     return ScoredEpisode(
         result_rank=rank,
         id=UUID(int=1000 + rank),
@@ -229,6 +256,34 @@ def _episode(rank: int, score: float, content: str) -> ScoredEpisode:
         message_position=rank,
         range_start=None,
         range_end=None,
+        content=content,
+        created_at=FIXED_NOW,
+        importance=0.0,
+        access_count=0,
+        last_accessed_at=None,
+        embedding_model_id=1,
+        similarity=score,
+        recency_score=0.0,
+        access_score=0.0,
+        importance_score=0.0,
+        frequency_score=0.0,
+        score=score,
+        message_role=role,  # type: ignore[arg-type]
+    )
+
+
+def _summary_episode(rank: int, score: float, content: str) -> ScoredEpisode:
+    return ScoredEpisode(
+        result_rank=rank,
+        id=UUID(int=2000 + rank),
+        user_id=UUID(int=1),
+        scope_id=UUID(int=2),
+        conversation_id=UUID(int=999),
+        kind="summary",
+        message_id=None,
+        message_position=None,
+        range_start=1,
+        range_end=4,
         content=content,
         created_at=FIXED_NOW,
         importance=0.0,

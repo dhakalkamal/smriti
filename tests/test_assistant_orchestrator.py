@@ -17,6 +17,7 @@ from smriti.assistant import (
     AssistantStreamError,
     AssistantStreamStart,
     AssistantStreamToken,
+    TypedMemoryAdmissionConfig,
 )
 from smriti.chat import (
     ChatConfigurationError,
@@ -254,6 +255,78 @@ async def test_assistant_orchestrator_debug_preparation_exposes_assembly_boundar
         f"recent:user:{query_message.id}",
     )
     assert assembly.active_query_occurrences == 1
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_typed_v1_reinforces_selected_only() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 2, "user", "find memory")
+    raw_memory = _episode(
+        UUID(int=10),
+        rank=1,
+        score=0.9,
+        content="raw source",
+        role="user",
+    )
+    assistant_memory = _episode(
+        UUID(int=11),
+        rank=2,
+        score=0.8,
+        content="assistant echo",
+        role="assistant",
+    )
+    summary_memory = _summary_episode(UUID(int=12), rank=3, score=0.7, content="summary source")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[raw_memory, assistant_memory, summary_memory],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="unused", model="fake-chat")),
+        memory_policy="typed_v1",
+        typed_v1_memory_config=TypedMemoryAdmissionConfig(
+            total_limit=2,
+            raw_source_limit=1,
+            summary_source_limit=1,
+            assistant_derived_limit=0,
+        ),
+    )
+
+    assembly = await orchestrator.prepare_generation_debug(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+            max_prompt_chars=1000,
+        )
+    )
+
+    assert memory_service.retrieve_update_access_metadata_flags == [False]
+    assert memory_service.retrieve_top_k_values == [2]
+    assert assembly.memory_policy == "typed_v1"
+    assert assembly.prompt.selected_memories == (raw_memory, summary_memory)
+    assert memory_service.access_update_requests == [(raw_memory, summary_memory)]
+    decisions_by_id = {
+        decision.memory.id: decision for decision in assembly.memory_admission_decisions
+    }
+    assert decisions_by_id[raw_memory.id].lane == "raw_source"
+    assert decisions_by_id[raw_memory.id].admitted is True
+    assert decisions_by_id[summary_memory.id].lane == "summary_source"
+    assert decisions_by_id[summary_memory.id].admitted is True
+    assert decisions_by_id[assistant_memory.id].lane == "assistant_derived"
+    assert decisions_by_id[assistant_memory.id].admitted is False
+    assert decisions_by_id[assistant_memory.id].skip_reason == "assistant_derived_disabled"
+    prompt_text = "\n".join(message.content for message in assembly.prompt.chat_request.messages)
+    assert "Long-term source memories" in prompt_text
+    assert "Long-term summary memories" in prompt_text
+    assert "episode_id=" not in prompt_text
+    assert "rank=" not in prompt_text
+    assert "score=" not in prompt_text
 
 
 @pytest.mark.asyncio
@@ -591,7 +664,10 @@ class _FakeMemoryService:
     retrieved: list[ScoredEpisode]
     persisted: AssistantResponseRecord | None
     retrieve_queries: list[str] = field(default_factory=list)
+    retrieve_top_k_values: list[int] = field(default_factory=list)
     retrieve_exclude_message_id_sets: list[tuple[UUID, ...]] = field(default_factory=list)
+    retrieve_update_access_metadata_flags: list[bool] = field(default_factory=list)
+    access_update_requests: list[tuple[ScoredEpisode, ...]] = field(default_factory=list)
     persist_requests: list[AppendAssistantResponseWithProvenanceRequest] = field(
         default_factory=list
     )
@@ -612,14 +688,27 @@ class _FakeMemoryService:
         *,
         exclude_message_id: UUID | None = None,
         exclude_message_ids: tuple[UUID, ...] = (),
+        update_access_metadata: bool = True,
     ) -> list[ScoredEpisode]:
-        _ = (user_id, scope_id, top_k)
+        _ = (user_id, scope_id)
         self.retrieve_queries.append(query)
+        self.retrieve_top_k_values.append(top_k)
+        self.retrieve_update_access_metadata_flags.append(update_access_metadata)
         ids = tuple(exclude_message_ids)
         if exclude_message_id is not None and exclude_message_id not in ids:
             ids = (*ids, exclude_message_id)
         self.retrieve_exclude_message_id_sets.append(ids)
         return self.retrieved
+
+    async def update_episode_access_metadata(
+        self,
+        *,
+        user_id: UUID,
+        scope_id: UUID,
+        episodes: tuple[ScoredEpisode, ...],
+    ) -> None:
+        _ = (user_id, scope_id)
+        self.access_update_requests.append(episodes)
 
     async def append_assistant_response_with_provenance(
         self,
@@ -716,7 +805,13 @@ def _message(
     )
 
 
-def _episode(episode_id: UUID, rank: int, score: float, content: str) -> ScoredEpisode:
+def _episode(
+    episode_id: UUID,
+    rank: int,
+    score: float,
+    content: str,
+    role: str = "user",
+) -> ScoredEpisode:
     return ScoredEpisode(
         result_rank=rank,
         id=episode_id,
@@ -728,6 +823,34 @@ def _episode(episode_id: UUID, rank: int, score: float, content: str) -> ScoredE
         message_position=rank,
         range_start=None,
         range_end=None,
+        content=content,
+        created_at=FIXED_NOW,
+        importance=0.0,
+        access_count=0,
+        last_accessed_at=None,
+        embedding_model_id=1,
+        similarity=score,
+        recency_score=0.0,
+        access_score=0.0,
+        importance_score=0.0,
+        frequency_score=0.0,
+        score=score,
+        message_role=role,  # type: ignore[arg-type]
+    )
+
+
+def _summary_episode(episode_id: UUID, rank: int, score: float, content: str) -> ScoredEpisode:
+    return ScoredEpisode(
+        result_rank=rank,
+        id=episode_id,
+        user_id=UUID(int=1),
+        scope_id=UUID(int=2),
+        conversation_id=UUID(int=3),
+        kind="summary",
+        message_id=None,
+        message_position=None,
+        range_start=1,
+        range_end=4,
         content=content,
         created_at=FIXED_NOW,
         importance=0.0,

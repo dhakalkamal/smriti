@@ -1999,6 +1999,8 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
                 str(tmp_path),
                 "--run-id",
                 "stage13e1-assembly-smoke",
+                "--memory-policy",
+                "typed_v1",
                 "--diagnostic-top-k",
                 "25",
             ]
@@ -2016,8 +2018,9 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     retrieval_candidate_metrics = cast(dict[str, object], aggregate["retrieval_candidate_metrics"])
     assembled_context_metrics = cast(dict[str, object], aggregate["assembled_context_metrics"])
 
-    assert payload["metadata"]["eval_stage"] == "stage13e-1"
+    assert payload["metadata"]["eval_stage"] == "stage13e-2"
     assert payload["metadata"]["eval_layer"] == "assembly"
+    assert payload["metadata"]["memory_policy"] == "typed_v1"
     assert payload["metadata"]["timing_mode"] == "app_realistic"
     assert payload["metadata"]["embedder_mode"] == "fake"
     assert payload["metadata"]["diagnostic_top_k"] == 25
@@ -2045,6 +2048,7 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     assert "source_raw_hit_at_k" in first_assembled_metrics
     assert "source_summary_hit_at_k" in first_assembled_metrics
     assert "source_ndcg_at_k" in first_assembled_metrics
+    assert "memory_admission_records" in first_case
     serialized_memories = [
         memory
         for case_record in case_records
@@ -2053,7 +2057,15 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     ]
     assert serialized_memories
     assert all("content" not in memory for memory in serialized_memories)
-    assert "Stage 13e-1 Assembly Eval" in report_path.read_text(encoding="utf-8")
+    admission_records = [
+        record
+        for case_record in case_records
+        for record in cast(list[dict[str, object]], case_record["memory_admission_records"])
+    ]
+    assert admission_records
+    assert all("lane" in record for record in admission_records)
+    assert all("content" not in record for record in admission_records)
+    assert "Stage 13e-2 Assembly Eval" in report_path.read_text(encoding="utf-8")
 
 
 def _case(

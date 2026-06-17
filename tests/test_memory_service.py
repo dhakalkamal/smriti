@@ -934,6 +934,9 @@ async def test_retrieve_scoped_episodes_can_exclude_active_and_recent_message_ep
             )
             assert active_message_episode.episode.id in {episode.id for episode in unfiltered}
             assert recent_message_episode.episode.id in {episode.id for episode in unfiltered}
+            role_by_id = {episode.id: episode.message_role for episode in unfiltered}
+            assert role_by_id[active_message_episode.episode.id] == "user"
+            assert role_by_id[recent_message_episode.episode.id] == "assistant"
 
             filtered = await service.retrieve_scoped_episodes(
                 user_id=user_id,
@@ -1551,6 +1554,62 @@ async def test_retrieve_scoped_episodes_updates_access_metadata_only_for_returne
             assert by_id[episodes[2].id]["access_count"] == 0
             assert by_id[episodes[2].id]["last_accessed_at"] is None
             assert retrieval_count == 0
+
+            read_only_results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query=query,
+                top_k=2,
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW + timedelta(minutes=1),
+            )
+            assert [result.id for result in read_only_results] == [
+                episodes[0].id,
+                episodes[1].id,
+            ]
+
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(
+                    """
+                    SELECT id, access_count, last_accessed_at
+                    FROM episodes
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [episode.id for episode in episodes],
+                )
+
+            by_id = {row["id"]: row for row in rows}
+            assert by_id[episodes[0].id]["access_count"] == 2
+            assert by_id[episodes[0].id]["last_accessed_at"] == FIXED_RETRIEVAL_NOW
+            assert by_id[episodes[1].id]["access_count"] == 2
+            assert by_id[episodes[1].id]["last_accessed_at"] == FIXED_RETRIEVAL_NOW
+
+            await service.update_episode_access_metadata(
+                user_id=user_id,
+                scope_id=scope_id,
+                episodes=(read_only_results[0],),
+                now=FIXED_RETRIEVAL_NOW + timedelta(minutes=2),
+            )
+
+            async with pool.acquire() as connection:
+                rows = await connection.fetch(
+                    """
+                    SELECT id, access_count, last_accessed_at
+                    FROM episodes
+                    WHERE id = ANY($1::uuid[]);
+                    """,
+                    [episode.id for episode in episodes],
+                )
+
+            by_id = {row["id"]: row for row in rows}
+            assert by_id[episodes[0].id]["access_count"] == 3
+            assert by_id[episodes[0].id]["last_accessed_at"] == (
+                FIXED_RETRIEVAL_NOW + timedelta(minutes=2)
+            )
+            assert by_id[episodes[1].id]["access_count"] == 2
+            assert by_id[episodes[1].id]["last_accessed_at"] == FIXED_RETRIEVAL_NOW
+            assert by_id[episodes[2].id]["access_count"] == 0
+            assert by_id[episodes[2].id]["last_accessed_at"] is None
         finally:
             await close_pool()
 

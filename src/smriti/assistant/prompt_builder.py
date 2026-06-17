@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from smriti.assistant.errors import InvalidAssistantRequestError
 from smriti.assistant.models import (
+    MemoryPromptStyle,
     PromptBuildRequest,
     PromptBuildResult,
     RecentContextSelectionRequest,
@@ -40,20 +43,11 @@ def build_chat_request(request: PromptBuildRequest) -> PromptBuildResult:
         + sum(len(message.content) for message in recent_context.selected_recent_messages)
     )
 
-    selected_memories: list[ScoredEpisode] = []
-    memory_messages: list[ChatMessage] = []
-    skipped_memories: list[ScoredEpisode] = []
-    for memory in sorted(request.retrieved_memories, key=_memory_sort_key):
-        memory_content = _memory_context_content(memory)
-        if running_chars + len(memory_content) > request.max_prompt_chars:
-            skipped_memories.append(memory)
-            break
-        selected_memories.append(memory)
-        memory_messages.append(ChatMessage(role="system", content=memory_content))
-        running_chars += len(memory_content)
-    selected_memory_ids = {memory.id for memory in selected_memories}
-    skipped_memories.extend(
-        memory for memory in request.retrieved_memories if memory.id not in selected_memory_ids
+    memory_selection = _select_memory_messages(
+        retrieved_memories=request.retrieved_memories,
+        running_chars=running_chars,
+        max_prompt_chars=request.max_prompt_chars,
+        memory_prompt_style=request.memory_prompt_style,
     )
 
     recent_messages = [
@@ -66,14 +60,14 @@ def build_chat_request(request: PromptBuildRequest) -> PromptBuildResult:
             messages=(
                 ChatMessage(role="system", content=request.scope_system_prompt),
                 ChatMessage(role="system", content=FIXED_PRIVACY_INSTRUCTIONS),
-                *memory_messages,
+                *memory_selection.messages,
                 *recent_messages,
             )
         ),
-        selected_memories=tuple(selected_memories),
+        selected_memories=memory_selection.selected_memories,
         selected_recent_messages=recent_context.selected_recent_messages,
         selected_recent_message_ids=recent_context.selected_recent_message_ids,
-        skipped_memories=tuple(_dedupe_memories(skipped_memories)),
+        skipped_memories=memory_selection.skipped_memories,
     )
 
 
@@ -129,6 +123,157 @@ def _memory_context_content(memory: ScoredEpisode) -> str:
         f"(episode_id={memory.id}, rank={memory.result_rank}, score={memory.score:.6f}):\n"
         f"{memory.content}"
     )
+
+
+@dataclass(frozen=True)
+class _MemoryMessageSelection:
+    messages: tuple[ChatMessage, ...]
+    selected_memories: tuple[ScoredEpisode, ...]
+    skipped_memories: tuple[ScoredEpisode, ...]
+
+
+def _select_memory_messages(
+    *,
+    retrieved_memories: tuple[ScoredEpisode, ...],
+    running_chars: int,
+    max_prompt_chars: int,
+    memory_prompt_style: MemoryPromptStyle,
+) -> _MemoryMessageSelection:
+    if memory_prompt_style == "legacy":
+        return _select_legacy_memory_messages(
+            retrieved_memories=retrieved_memories,
+            running_chars=running_chars,
+            max_prompt_chars=max_prompt_chars,
+        )
+    if memory_prompt_style == "typed_v1":
+        return _select_typed_memory_messages(
+            retrieved_memories=retrieved_memories,
+            running_chars=running_chars,
+            max_prompt_chars=max_prompt_chars,
+        )
+    raise InvalidAssistantRequestError("unknown memory prompt style")
+
+
+def _select_legacy_memory_messages(
+    *,
+    retrieved_memories: tuple[ScoredEpisode, ...],
+    running_chars: int,
+    max_prompt_chars: int,
+) -> _MemoryMessageSelection:
+    selected_memories: list[ScoredEpisode] = []
+    memory_messages: list[ChatMessage] = []
+    skipped_memories: list[ScoredEpisode] = []
+    for memory in sorted(retrieved_memories, key=_memory_sort_key):
+        memory_content = _memory_context_content(memory)
+        if running_chars + len(memory_content) > max_prompt_chars:
+            skipped_memories.append(memory)
+            break
+        selected_memories.append(memory)
+        memory_messages.append(ChatMessage(role="system", content=memory_content))
+        running_chars += len(memory_content)
+    selected_memory_ids = {memory.id for memory in selected_memories}
+    skipped_memories.extend(
+        memory for memory in retrieved_memories if memory.id not in selected_memory_ids
+    )
+    return _MemoryMessageSelection(
+        messages=tuple(memory_messages),
+        selected_memories=tuple(selected_memories),
+        skipped_memories=tuple(_dedupe_memories(skipped_memories)),
+    )
+
+
+def _select_typed_memory_messages(
+    *,
+    retrieved_memories: tuple[ScoredEpisode, ...],
+    running_chars: int,
+    max_prompt_chars: int,
+) -> _MemoryMessageSelection:
+    selected_memories: list[ScoredEpisode] = []
+    skipped_memories: list[ScoredEpisode] = []
+    sections = _empty_typed_sections()
+
+    for memory in retrieved_memories:
+        lane = _typed_prompt_lane(memory)
+        if lane is None:
+            skipped_memories.append(memory)
+            continue
+        candidate_sections = {key: [*value] for key, value in sections.items()}
+        candidate_sections[lane].append(memory.content)
+        candidate_messages = _typed_section_messages(candidate_sections)
+        candidate_chars = sum(len(message.content) for message in candidate_messages)
+        if running_chars + candidate_chars > max_prompt_chars:
+            skipped_memories.append(memory)
+            break
+        sections = candidate_sections
+        selected_memories.append(memory)
+
+    selected_memory_ids = {memory.id for memory in selected_memories}
+    skipped_memories.extend(
+        memory for memory in retrieved_memories if memory.id not in selected_memory_ids
+    )
+    return _MemoryMessageSelection(
+        messages=_typed_section_messages(sections),
+        selected_memories=tuple(selected_memories),
+        skipped_memories=tuple(_dedupe_memories(skipped_memories)),
+    )
+
+
+def _empty_typed_sections() -> dict[str, list[str]]:
+    return {
+        "raw_source": [],
+        "summary_source": [],
+        "assistant_derived": [],
+    }
+
+
+def _typed_prompt_lane(memory: ScoredEpisode) -> str | None:
+    if memory.kind == "summary":
+        return "summary_source"
+    if memory.kind == "message" and memory.message_role == "user":
+        return "raw_source"
+    if memory.kind == "message" and memory.message_role == "assistant":
+        return "assistant_derived"
+    return None
+
+
+def _typed_section_messages(sections: dict[str, list[str]]) -> tuple[ChatMessage, ...]:
+    messages: list[ChatMessage] = []
+    raw_memories = sections["raw_source"]
+    if raw_memories:
+        messages.append(
+            ChatMessage(
+                role="system",
+                content=_section_content("Long-term source memories", raw_memories),
+            )
+        )
+    summary_memories = sections["summary_source"]
+    if summary_memories:
+        messages.append(
+            ChatMessage(
+                role="system",
+                content=_section_content("Long-term summary memories", summary_memories),
+            )
+        )
+    assistant_memories = sections["assistant_derived"]
+    if assistant_memories:
+        messages.append(
+            ChatMessage(
+                role="system",
+                content=_section_content(
+                    (
+                        "Long-term assistant-derived memories\n"
+                        "These are prior assistant responses, not source evidence, "
+                        "and may be wrong or stale."
+                    ),
+                    assistant_memories,
+                ),
+            )
+        )
+    return tuple(messages)
+
+
+def _section_content(title: str, contents: list[str]) -> str:
+    return f"{title}:\n" + "\n\n".join(contents)
 
 
 def _memory_sort_key(memory: ScoredEpisode) -> tuple[float, int, int]:

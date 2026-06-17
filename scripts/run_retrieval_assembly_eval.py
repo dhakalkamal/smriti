@@ -26,10 +26,10 @@ if TYPE_CHECKING:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the Stage 13e-1 assembly-aware retrieval eval."""
+    """Run the Stage 13e-2 assembly-aware retrieval eval."""
 
     parser = argparse.ArgumentParser(
-        description="Run the Stage 13e-1 assembly-aware retrieval eval.",
+        description="Run the Stage 13e-2 assembly-aware retrieval eval.",
     )
     parser.add_argument(
         "--corpus",
@@ -41,7 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--mode",
         choices=("app_realistic",),
         default="app_realistic",
-        help="Assembly eval mode. Stage 13e-1 currently requires app_realistic.",
+        help="Assembly eval mode. Stage 13e-2 currently requires app_realistic.",
     )
     parser.add_argument(
         "--embedder",
@@ -85,6 +85,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_RECENT_MESSAGE_LIMIT,
         help=f"Recent message load limit. Defaults to {DEFAULT_RECENT_MESSAGE_LIMIT}.",
     )
+    parser.add_argument(
+        "--memory-policy",
+        choices=("legacy", "typed_v1"),
+        default=None,
+        help="Override SMRITI_MEMORY_POLICY for assembly eval comparison.",
+    )
     args = parser.parse_args(argv)
     if args.diagnostic_top_k is not None and args.diagnostic_top_k <= 0:
         parser.error("--diagnostic-top-k must be greater than zero")
@@ -96,7 +102,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    from smriti.assistant import AssistantGenerationRequest, AssistantOrchestrator
+    from smriti.assistant import (
+        AssistantGenerationRequest,
+        AssistantOrchestrator,
+        TypedMemoryAdmissionConfig,
+    )
     from smriti.chat import ChatResponse, FakeChatGenerator
     from smriti.config import Settings
     from smriti.db.client import close_pool, get_pool
@@ -105,6 +115,7 @@ async def _run(args: argparse.Namespace) -> int:
     from smriti.memory import MemoryService
     from smriti.memory.eval import (
         Stage12BaselineRunMetadata,
+        Stage13MemoryAdmissionRecord,
         load_stage12_corpus,
         score_stage13_assembly_case,
         stage12_baseline_metadata_to_dict,
@@ -118,6 +129,7 @@ async def _run(args: argparse.Namespace) -> int:
     settings = Settings()
     if args.database_url is not None:
         settings = settings.model_copy(update={"database_url": args.database_url})
+    memory_policy = args.memory_policy or settings.memory_policy
 
     if args.apply_migrations:
         await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
@@ -144,9 +156,21 @@ async def _run(args: argparse.Namespace) -> int:
                 finish_reason="stop",
             )
         ),
+        memory_policy=memory_policy,
+        typed_v1_memory_config=TypedMemoryAdmissionConfig(
+            total_limit=settings.memory_typed_v1_total_limit,
+            raw_source_limit=settings.memory_typed_v1_raw_source_limit,
+            summary_source_limit=settings.memory_typed_v1_summary_source_limit,
+            assistant_derived_limit=settings.memory_typed_v1_assistant_derived_limit,
+        ),
     )
     created_at = datetime.now(UTC)
-    run_id = args.run_id or _default_run_id(created_at, args.mode, args.embedder)
+    run_id = args.run_id or _default_run_id(
+        created_at,
+        args.mode,
+        args.embedder,
+        memory_policy,
+    )
 
     try:
         fixture, cases = await build_terrafold_fixture(
@@ -184,6 +208,18 @@ async def _run(args: argparse.Namespace) -> int:
                     excluded_message_ids=assembly.excluded_message_ids,
                     prompt_message_order=assembly.prompt_message_order,
                     active_query_occurrences=assembly.active_query_occurrences,
+                    memory_admission_records=tuple(
+                        Stage13MemoryAdmissionRecord(
+                            episode_id=decision.memory.id,
+                            lane=decision.lane,
+                            admitted=decision.admitted,
+                            admission_reason=decision.admission_reason,
+                            skip_reason=decision.skip_reason,
+                            original_rank=decision.memory.result_rank,
+                            score=decision.memory.score,
+                        )
+                        for decision in assembly.memory_admission_decisions
+                    ),
                     timing_mode=args.mode,
                     diagnostic_top_k=retrieval_top_k,
                 )
@@ -213,9 +249,17 @@ async def _run(args: argparse.Namespace) -> int:
         metadata_payload = stage12_baseline_metadata_to_dict(metadata)
         metadata_payload.update(
             {
-                "eval_stage": "stage13e-1",
+                "eval_stage": "stage13e-2",
                 "eval_layer": "assembly",
-                "memory_policy": "stage13e1_recent_context_exclusion",
+                "memory_policy": memory_policy,
+                "memory_typed_v1_total_limit": settings.memory_typed_v1_total_limit,
+                "memory_typed_v1_raw_source_limit": (settings.memory_typed_v1_raw_source_limit),
+                "memory_typed_v1_summary_source_limit": (
+                    settings.memory_typed_v1_summary_source_limit
+                ),
+                "memory_typed_v1_assistant_derived_limit": (
+                    settings.memory_typed_v1_assistant_derived_limit
+                ),
                 "max_prompt_chars": args.max_prompt_chars,
                 "recent_message_limit": args.recent_message_limit,
             }
@@ -233,9 +277,9 @@ async def _run(args: argparse.Namespace) -> int:
     finally:
         await close_pool()
 
-    print(f"Wrote Stage 13e-1 assembly eval output to {args.output_root / 'runs' / run_id}")
+    print(f"Wrote Stage 13e-2 assembly eval output to {args.output_root / 'runs' / run_id}")
     print(
-        "Wrote Stage 13e-1 assembly eval Markdown report to "
+        "Wrote Stage 13e-2 assembly eval Markdown report to "
         f"{args.output_root / 'results' / f'{run_id}.md'}"
     )
     return 0
@@ -248,7 +292,7 @@ async def _current_query_message_context(
     current_query_ids = case.expected_ids.current_query
     if len(current_query_ids) != 1:
         raise ValueError(
-            f"Stage 13e-1 assembly eval requires exactly one current query episode: "
+            f"Stage 13e-2 assembly eval requires exactly one current query episode: "
             f"{case.example_id}"
         )
 
@@ -265,7 +309,7 @@ async def _current_query_message_context(
         )
     if row is None or row["message_id"] is None:
         raise ValueError(
-            "Stage 13e-1 assembly eval current query episode must resolve to a message_id: "
+            "Stage 13e-2 assembly eval current query episode must resolve to a message_id: "
             f"{case.example_id}"
         )
     return row["message_id"], row["conversation_id"]
@@ -310,7 +354,7 @@ def _markdown_report(
     retrieval_metrics = _mapping_value(aggregate_metrics, "retrieval_candidate_metrics")
     assembled_metrics = _mapping_value(aggregate_metrics, "assembled_context_metrics")
     lines = [
-        f"# Stage 13e-1 Assembly Eval: {metadata['run_id']}",
+        f"# Stage 13e-2 Assembly Eval: {metadata['run_id']}",
         "",
         "## Metadata",
         "",
@@ -318,6 +362,7 @@ def _markdown_report(
         f"- Timing mode: {metadata['timing_mode']}",
         f"- Embedder: {metadata['embedder_mode']} ({metadata['embedding_model']})",
         f"- Diagnostic top-k: {metadata['diagnostic_top_k']}",
+        f"- Memory policy: {metadata['memory_policy']}",
         f"- Max prompt chars: {metadata['max_prompt_chars']}",
         f"- Recent message limit: {metadata['recent_message_limit']}",
         f"- Git branch: {metadata['git_branch']}",
@@ -417,9 +462,9 @@ def _format_metric(value: object) -> str:
     return str(value)
 
 
-def _default_run_id(created_at: datetime, mode: str, embedder: str) -> str:
+def _default_run_id(created_at: datetime, mode: str, embedder: str, memory_policy: str) -> str:
     timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
-    return f"stage13e1-assembly-{mode}-{embedder}-{timestamp}"
+    return f"stage13e2-assembly-{memory_policy}-{mode}-{embedder}-{timestamp}"
 
 
 def _git_output(args: tuple[str, ...]) -> str | None:
