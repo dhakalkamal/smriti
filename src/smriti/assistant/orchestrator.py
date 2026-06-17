@@ -10,6 +10,7 @@ from smriti.assistant.errors import (
 from smriti.assistant.models import (
     AssistantGenerationRequest,
     AssistantGenerationResult,
+    AssistantPromptAssembly,
     AssistantStreamDone,
     AssistantStreamError,
     AssistantStreamEvent,
@@ -18,8 +19,9 @@ from smriti.assistant.models import (
     AssistantStreamToken,
     PromptBuildRequest,
     PromptBuildResult,
+    RecentContextSelectionRequest,
 )
-from smriti.assistant.prompt_builder import build_chat_request
+from smriti.assistant.prompt_builder import build_chat_request, select_recent_context
 from smriti.chat import (
     ChatConfigurationError,
     ChatConnectionError,
@@ -53,7 +55,8 @@ class AssistantOrchestrator:
     async def generate(self, request: AssistantGenerationRequest) -> AssistantGenerationResult:
         """Generate and persist one assistant response for a stored user message."""
 
-        prompt = await self._prepare_generation(request)
+        assembly = await self._prepare_generation(request)
+        prompt = assembly.prompt
 
         try:
             chat_response = await self.chat_generator.generate(prompt.chat_request)
@@ -83,7 +86,8 @@ class AssistantOrchestrator:
     ) -> AssistantStreamPreparation:
         """Prepare a streaming response before the HTTP stream is opened."""
 
-        prompt = await self._prepare_generation(request)
+        assembly = await self._prepare_generation(request)
+        prompt = assembly.prompt
         streaming_generator = self._streaming_chat_generator()
         return AssistantStreamPreparation(
             request=request,
@@ -92,6 +96,14 @@ class AssistantOrchestrator:
             used_memory_episode_ids=tuple(memory.id for memory in prompt.selected_memories),
             chat_model=streaming_generator.model,
         )
+
+    async def prepare_generation_debug(
+        self,
+        request: AssistantGenerationRequest,
+    ) -> AssistantPromptAssembly:
+        """Prepare assistant generation and expose content-free assembly boundaries."""
+
+        return await self._prepare_generation(request)
 
     async def stream_prepared(
         self,
@@ -161,7 +173,7 @@ class AssistantOrchestrator:
     async def _prepare_generation(
         self,
         request: AssistantGenerationRequest,
-    ) -> PromptBuildResult:
+    ) -> AssistantPromptAssembly:
         context = await self.memory_service.load_assistant_generation_context(
             LoadAssistantGenerationContextRequest(
                 user_id=request.user_id,
@@ -171,21 +183,42 @@ class AssistantOrchestrator:
                 recent_message_limit=request.recent_message_limit,
             )
         )
+        recent_context = select_recent_context(
+            RecentContextSelectionRequest(
+                scope_system_prompt=context.scope.system_prompt,
+                recent_messages=context.recent_messages,
+                query_message_id=request.query_message_id,
+                max_prompt_chars=request.max_prompt_chars,
+            )
+        )
         retrieved_memories = await self.memory_service.retrieve_scoped_episodes(
             user_id=request.user_id,
             scope_id=request.scope_id,
             query=context.query_message.content,
             top_k=request.top_k,
-            exclude_message_id=context.query_message.id,
+            exclude_message_ids=recent_context.selected_recent_message_ids,
         )
-        return build_chat_request(
+        prompt = build_chat_request(
             request=PromptBuildRequest(
                 scope_system_prompt=context.scope.system_prompt,
                 retrieved_memories=tuple(retrieved_memories),
-                recent_messages=context.recent_messages,
+                recent_messages=recent_context.selected_recent_messages,
                 query_message_id=request.query_message_id,
                 max_prompt_chars=request.max_prompt_chars,
             )
+        )
+        return AssistantPromptAssembly(
+            prompt=prompt,
+            recent_context=recent_context,
+            active_query_message_id=recent_context.active_query_message_id,
+            excluded_message_ids=recent_context.selected_recent_message_ids,
+            retrieved_memories=tuple(retrieved_memories),
+            prompt_message_order=_prompt_message_order(prompt),
+            active_query_occurrences=sum(
+                1
+                for message in prompt.selected_recent_messages
+                if message.id == recent_context.active_query_message_id
+            ),
         )
 
     async def _persist_assistant_response(
@@ -219,3 +252,12 @@ def _assistant_token_count(content: str, completion_tokens: int | None) -> int:
     if content == "":
         return 0
     return max(1, len(content) // 4)
+
+
+def _prompt_message_order(prompt: PromptBuildResult) -> tuple[str, ...]:
+    return (
+        "system:scope",
+        "system:privacy",
+        *(f"memory:{memory.id}" for memory in prompt.selected_memories),
+        *(f"recent:{message.role}:{message.id}" for message in prompt.selected_recent_messages),
+    )

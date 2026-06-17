@@ -699,6 +699,7 @@ class MemoryService:
         top_k: int,
         *,
         exclude_message_id: UUID | None = None,
+        exclude_message_ids: Sequence[UUID] = (),
         now: datetime | None = None,
     ) -> list[ScoredEpisode]:
         """Retrieve embedded episodes from exactly one user-owned scope."""
@@ -714,6 +715,10 @@ class MemoryService:
         # candidate set, then rerank in Python. Lower-similarity episodes with
         # high recency/importance may be missed until eval tuning improves this.
         candidate_limit = max(top_k * RETRIEVAL_CANDIDATE_MULTIPLIER, MIN_RETRIEVAL_CANDIDATES)
+        excluded_message_ids = _excluded_message_ids(
+            exclude_message_id=exclude_message_id,
+            exclude_message_ids=exclude_message_ids,
+        )
 
         async with self.pool.acquire() as connection, connection.transaction():
             await self._ensure_scope_belongs_to_user(
@@ -723,7 +728,9 @@ class MemoryService:
             )
             embedding_model_pk = await self._embedding_model_pk(connection)
             message_exclusion_predicate = (
-                "" if exclude_message_id is None else "AND episodes.message_id IS DISTINCT FROM $6"
+                ""
+                if not excluded_message_ids
+                else "AND (episodes.message_id IS NULL OR episodes.message_id <> ALL($6::uuid[]))"
             )
             retrieval_query_args: tuple[object, ...] = (
                 scope_id,
@@ -732,10 +739,10 @@ class MemoryService:
                 embedding_model_pk,
                 candidate_limit,
             )
-            if exclude_message_id is not None:
+            if excluded_message_ids:
                 retrieval_query_args = (
                     *retrieval_query_args,
-                    exclude_message_id,
+                    list(excluded_message_ids),
                 )
             rows = await connection.fetch(
                 f"""
@@ -1568,6 +1575,23 @@ class MemoryService:
     def _validate_embedding_vector(self, vector: EmbeddingVector) -> None:
         if len(vector) != EMBEDDINGS_768_DIMENSIONS:
             raise VectorDimensionError("Embedding vector must have 768 dimensions")
+
+
+def _excluded_message_ids(
+    *,
+    exclude_message_id: UUID | None,
+    exclude_message_ids: Sequence[UUID],
+) -> tuple[UUID, ...]:
+    ids: list[UUID] = []
+    seen: set[UUID] = set()
+    for message_id in exclude_message_ids:
+        if message_id in seen:
+            continue
+        ids.append(message_id)
+        seen.add(message_id)
+    if exclude_message_id is not None and exclude_message_id not in seen:
+        ids.append(exclude_message_id)
+    return tuple(ids)
 
 
 def _scope_from_row(row: asyncpg.Record) -> ScopeRecord:

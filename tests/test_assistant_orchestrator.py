@@ -89,7 +89,7 @@ async def test_assistant_orchestrator_generates_once_and_persists_selected_memor
 
     assert len(chat_generator.requests) == 1
     assert memory_service.retrieve_queries == ["find memory"]
-    assert memory_service.retrieve_exclude_message_ids == [query_message.id]
+    assert memory_service.retrieve_exclude_message_id_sets == [(query_message.id,)]
     assert memory_service.persist_requests[0].used == (high_memory,)
     assert memory_service.persist_requests[0].token_count == 7
     assert result.assistant_message == persisted_message
@@ -151,10 +151,109 @@ async def test_assistant_orchestrator_streams_tokens_then_persists_before_done()
     assert done.chat_model == "fake-stream"
     assert done.finish_reason == "stop"
     assert done.used_memory_episode_ids == (memory.id,)
-    assert memory_service.retrieve_exclude_message_ids == [query_message.id]
+    assert memory_service.retrieve_exclude_message_id_sets == [(query_message.id,)]
     assert memory_service.persist_requests[0].content == "hello world"
     assert memory_service.persist_requests[0].used == (memory,)
     assert memory_service.persist_requests[0].token_count == 2
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_excludes_selected_recent_context_from_memory() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    older_message = _message(UUID(int=30), conversation_id, 1, "user", "older context")
+    recent_answer = _message(UUID(int=31), conversation_id, 2, "assistant", "recent answer")
+    query_message = _message(UUID(int=4), conversation_id, 3, "user", "find memory")
+    persisted_message = _message(UUID(int=20), conversation_id, 4, "assistant", "answer")
+    memory_service = _FakeMemoryService(
+        context=_context(
+            user_id,
+            scope_id,
+            conversation_id,
+            query_message,
+            recent_messages=(older_message, recent_answer, query_message),
+        ),
+        retrieved=[],
+        persisted=AssistantResponseRecord(
+            message=persisted_message,
+            used_episode_ids=(),
+            scoring_version="stage-5.2-weighted-v1",
+            retrieved_at=FIXED_NOW,
+        ),
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="answer", model="fake-chat")),
+    )
+
+    await orchestrator.generate(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=2,
+            max_prompt_chars=1000,
+        )
+    )
+
+    assert memory_service.retrieve_exclude_message_id_sets == [
+        (older_message.id, recent_answer.id, query_message.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_debug_preparation_exposes_assembly_boundaries() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    older_message = _message(UUID(int=30), conversation_id, 1, "user", "older context")
+    query_message = _message(UUID(int=4), conversation_id, 2, "user", "find memory")
+    memory = _episode(UUID(int=10), rank=1, score=0.9, content="high memory")
+    memory_service = _FakeMemoryService(
+        context=_context(
+            user_id,
+            scope_id,
+            conversation_id,
+            query_message,
+            recent_messages=(older_message, query_message),
+        ),
+        retrieved=[memory],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="unused", model="fake-chat")),
+    )
+
+    assembly = await orchestrator.prepare_generation_debug(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+            max_prompt_chars=1000,
+        )
+    )
+
+    assert assembly.active_query_message_id == query_message.id
+    assert assembly.recent_context.selected_recent_message_ids == (
+        older_message.id,
+        query_message.id,
+    )
+    assert assembly.excluded_message_ids == (older_message.id, query_message.id)
+    assert assembly.retrieved_memories == (memory,)
+    assert assembly.prompt.selected_memories == (memory,)
+    assert assembly.prompt_message_order == (
+        "system:scope",
+        "system:privacy",
+        f"memory:{memory.id}",
+        f"recent:user:{older_message.id}",
+        f"recent:user:{query_message.id}",
+    )
+    assert assembly.active_query_occurrences == 1
 
 
 @pytest.mark.asyncio
@@ -492,7 +591,7 @@ class _FakeMemoryService:
     retrieved: list[ScoredEpisode]
     persisted: AssistantResponseRecord | None
     retrieve_queries: list[str] = field(default_factory=list)
-    retrieve_exclude_message_ids: list[UUID | None] = field(default_factory=list)
+    retrieve_exclude_message_id_sets: list[tuple[UUID, ...]] = field(default_factory=list)
     persist_requests: list[AppendAssistantResponseWithProvenanceRequest] = field(
         default_factory=list
     )
@@ -512,10 +611,14 @@ class _FakeMemoryService:
         top_k: int,
         *,
         exclude_message_id: UUID | None = None,
+        exclude_message_ids: tuple[UUID, ...] = (),
     ) -> list[ScoredEpisode]:
         _ = (user_id, scope_id, top_k)
         self.retrieve_queries.append(query)
-        self.retrieve_exclude_message_ids.append(exclude_message_id)
+        ids = tuple(exclude_message_ids)
+        if exclude_message_id is not None and exclude_message_id not in ids:
+            ids = (*ids, exclude_message_id)
+        self.retrieve_exclude_message_id_sets.append(ids)
         return self.retrieved
 
     async def append_assistant_response_with_provenance(
@@ -571,6 +674,7 @@ def _context(
     scope_id: UUID,
     conversation_id: UUID,
     query_message: MessageRecord,
+    recent_messages: tuple[MessageRecord, ...] | None = None,
 ) -> AssistantGenerationContextRecord:
     return AssistantGenerationContextRecord(
         scope=ScopeRecord(
@@ -590,7 +694,7 @@ def _context(
             updated_at=FIXED_NOW,
         ),
         query_message=query_message,
-        recent_messages=(query_message,),
+        recent_messages=(query_message,) if recent_messages is None else recent_messages,
     )
 
 

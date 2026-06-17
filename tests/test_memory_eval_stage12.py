@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -42,8 +44,11 @@ from smriti.memory.eval import (
     run_stage13_role_policy_replay,
     score_stage12_retrieval_case,
     score_stage12_weight_profile_record,
+    score_stage13_assembly_case,
     stage12_case_result_from_dict,
     stage12_case_result_to_dict,
+    stage13_assembly_aggregate_metrics_to_dict,
+    stage13_assembly_case_result_to_dict,
     stage13_evidence_policy_comparison,
     stage13_evidence_policy_comparison_to_markdown,
     stage13_lexical_features,
@@ -51,6 +56,7 @@ from smriti.memory.eval import (
     stage13_lexical_tokens,
     stage13_role_policy_replay_report_to_markdown,
     stage13_weak_evidence_metrics,
+    summarize_stage13_assembly_results,
     validate_stage12_corpus,
 )
 
@@ -226,6 +232,119 @@ def test_stage12_kind_mix_counts_official_message_and_summary_results() -> None:
     assert result.metrics.kind_mix_at_k.summary_count == 1
     assert result.metrics.kind_mix_at_k.total_count == 2
     assert result.metrics.kind_mix_at_k.summary_ratio == pytest.approx(0.5)
+
+
+def test_stage12_source_mrr_and_ndcg_are_rank_aware() -> None:
+    distractor_id = UUID("00000000-0000-4000-8000-000000000253")
+    raw_id = UUID("00000000-0000-4000-8000-000000000254")
+    summary_id = UUID("00000000-0000-4000-8000-000000000255")
+    case = _case(
+        raw=(raw_id,),
+        summary=(summary_id,),
+        acceptable=(raw_id, summary_id),
+        top_k=3,
+        labels=(
+            _label(raw_id, "raw_source", is_expected=True, is_acceptable=True),
+            _label(
+                summary_id,
+                "summary_source",
+                kind="summary",
+                is_expected=True,
+                is_acceptable=True,
+            ),
+        ),
+    )
+
+    result = score_stage12_retrieval_case(
+        case,
+        (
+            _episode(distractor_id, rank=1),
+            _episode(raw_id, rank=2),
+            _episode(summary_id, rank=3, kind="summary"),
+        ),
+        timing_mode="clean_memory",
+    )
+
+    expected_dcg = (1 / math.log2(2 + 1)) + (1 / math.log2(3 + 1))
+    ideal_dcg = (1 / math.log2(1 + 1)) + (1 / math.log2(2 + 1))
+    assert result.metrics.source_reciprocal_rank == pytest.approx(0.5)
+    assert result.metrics.source_raw_reciprocal_rank == pytest.approx(0.5)
+    assert result.metrics.source_summary_reciprocal_rank == pytest.approx(1 / 3)
+    assert result.metrics.source_ndcg_at_k == pytest.approx(expected_dcg / ideal_dcg)
+
+
+def test_stage13_assembly_scores_admitted_context_and_exposes_debug_boundaries() -> None:
+    recent_message_id = UUID("00000000-0000-4000-8000-000000000901")
+    active_query_message_id = UUID("00000000-0000-4000-8000-000000000902")
+    recent_duplicate_id = UUID("00000000-0000-4000-8000-000000000256")
+    source_id = UUID("00000000-0000-4000-8000-000000000257")
+    recent_duplicate = replace(
+        _episode(recent_duplicate_id, rank=1),
+        message_id=recent_message_id,
+    )
+    source = _episode(source_id, rank=2)
+    case = _case(
+        raw=(source_id,),
+        acceptable=(source_id,),
+        top_k=2,
+        labels=(_label(source_id, "raw_source", is_expected=True, is_acceptable=True),),
+    )
+
+    result = score_stage13_assembly_case(
+        case,
+        retrieved_candidates=(recent_duplicate, source),
+        admitted_memories=(source,),
+        skipped_memories=(recent_duplicate,),
+        recent_context_ids=(recent_message_id, active_query_message_id),
+        active_query_message_id=active_query_message_id,
+        excluded_message_ids=(recent_message_id, active_query_message_id),
+        prompt_message_order=(
+            "system",
+            "system",
+            f"memory:{source_id}",
+            f"recent:user:{active_query_message_id}",
+        ),
+        active_query_occurrences=1,
+        timing_mode="clean_memory",
+    )
+    negative = score_stage13_assembly_case(
+        _case(top_k=1, question_type="negative_control"),
+        retrieved_candidates=(source,),
+        admitted_memories=(source,),
+        skipped_memories=(),
+        recent_context_ids=(active_query_message_id,),
+        active_query_message_id=active_query_message_id,
+        excluded_message_ids=(active_query_message_id,),
+        prompt_message_order=("system", "system", f"memory:{source_id}"),
+        active_query_occurrences=1,
+        timing_mode="clean_memory",
+    )
+    aggregate = summarize_stage13_assembly_results((result, negative))
+    serialized = stage13_assembly_case_result_to_dict(result)
+    aggregate_payload = stage13_assembly_aggregate_metrics_to_dict(aggregate)
+
+    assert result.recent_context_ids == (recent_message_id, active_query_message_id)
+    assert result.excluded_message_ids == (recent_message_id, active_query_message_id)
+    assert [record.episode_id for record in result.retrieved_candidates] == [
+        recent_duplicate_id,
+        source_id,
+    ]
+    assert [record.episode_id for record in result.admitted_memories] == [source_id]
+    assert [record.episode_id for record in result.skipped_memories] == [recent_duplicate_id]
+    assert result.retrieval_candidate_metrics.source_reciprocal_rank == pytest.approx(0.5)
+    assert result.assembled_context_metrics.source_reciprocal_rank == pytest.approx(1.0)
+    assert result.assembled_context_metrics.self_query_hit is False
+    assert result.assembly_metrics.recent_context_duplication_rate == pytest.approx(0.0)
+    assert negative.assembly_metrics.false_positive_retrieval is True
+    assert aggregate.active_query_exactly_once_rate == pytest.approx(1.0)
+    assert aggregate.false_positive_retrieval_rate == pytest.approx(0.5)
+    assert serialized["assembly_metrics"]["active_query_occurrences"] == 1
+    assert serialized["retrieval_candidate_metrics"]["source_reciprocal_rank"] == pytest.approx(0.5)
+    assert serialized["assembled_context_metrics"]["source_reciprocal_rank"] == pytest.approx(1.0)
+    assert "content" not in serialized["admitted_memories"][0]
+    assert aggregate_payload["assembled_context_metrics"]["mean_source_reciprocal_rank"] == (
+        pytest.approx(0.5)
+    )
 
 
 def test_stage12_diagnostic_top_k_finds_expected_below_official_window() -> None:

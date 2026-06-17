@@ -823,7 +823,7 @@ async def test_retrieve_scoped_episodes_returns_only_scope_and_embedded_rows() -
 
 
 @pytest.mark.asyncio
-async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only() -> None:
+async def test_retrieve_scoped_episodes_can_exclude_active_and_recent_message_episodes() -> None:
     migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
 
     with PostgresContainer(
@@ -857,6 +857,15 @@ async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only(
                     user_id=user_id,
                     conversation_id=conversation_id,
                     role="user",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            recent_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
                     content=content,
                     token_count=len(content.split()),
                 )
@@ -924,18 +933,23 @@ async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only(
                 now=FIXED_RETRIEVAL_NOW,
             )
             assert active_message_episode.episode.id in {episode.id for episode in unfiltered}
+            assert recent_message_episode.episode.id in {episode.id for episode in unfiltered}
 
             filtered = await service.retrieve_scoped_episodes(
                 user_id=user_id,
                 scope_id=scope_id,
                 query=content,
                 top_k=10,
-                exclude_message_id=active_message_episode.message.id,
+                exclude_message_ids=(
+                    active_message_episode.message.id,
+                    recent_message_episode.message.id,
+                ),
                 now=FIXED_RETRIEVAL_NOW,
             )
 
             filtered_ids = {episode.id for episode in filtered}
             assert active_message_episode.episode.id not in filtered_ids
+            assert recent_message_episode.episode.id not in filtered_ids
             assert source_episode.id in filtered_ids
             assert summary_episode_id in filtered_ids
             assert other_scope_episode.id not in filtered_ids
@@ -943,7 +957,9 @@ async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only(
             assert all(episode.user_id == user_id for episode in filtered)
             assert all(episode.scope_id == scope_id for episode in filtered)
             assert all(
-                episode.message_id != active_message_episode.message.id for episode in filtered
+                episode.message_id
+                not in {active_message_episode.message.id, recent_message_episode.message.id}
+                for episode in filtered
             )
             assert any(
                 episode.id == summary_episode_id
@@ -965,7 +981,7 @@ async def test_retrieve_scoped_episodes_can_exclude_active_message_episode_only(
                     scope_id=scope_id,
                     query=content,
                     top_k=10,
-                    exclude_message_id=active_message_episode.message.id,
+                    exclude_message_ids=(active_message_episode.message.id,),
                     now=FIXED_RETRIEVAL_NOW,
                 )
         finally:

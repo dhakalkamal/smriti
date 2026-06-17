@@ -51,6 +51,11 @@ def test_prompt_builder_orders_sections_and_preserves_roles() -> None:
     assert messages[-1].content == "current question"
     assert [message.content for message in messages].count("current question") == 1
     assert result.selected_memories == (selected_memory,)
+    assert result.selected_recent_message_ids == (
+        _message(1, "user", "previous question").id,
+        assistant_message.id,
+        query_message.id,
+    )
 
 
 def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget() -> None:
@@ -76,9 +81,47 @@ def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget
     )
 
     assert result.selected_memories == (high_score_memory,)
+    assert result.skipped_memories == (oversized_memory, later_small_memory)
     prompt_contents = [message.content for message in result.chat_request.messages]
     assert any("small high" in content for content in prompt_contents)
     assert not any("small low" in content for content in prompt_contents)
+
+
+def test_prompt_builder_reserves_selected_recent_context_before_memory() -> None:
+    older_message = _message(1, "user", "older")
+    recent_message = _message(2, "assistant", "recent")
+    query_message = _message(3, "user", "query")
+    memory = _episode(rank=1, score=0.9, content="memory" * 100)
+    max_prompt_chars = (
+        len("scope")
+        + len(FIXED_PRIVACY_INSTRUCTIONS)
+        + len(older_message.content)
+        + len(recent_message.content)
+        + len(query_message.content)
+    )
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=(memory,),
+            recent_messages=(older_message, recent_message, query_message),
+            query_message_id=query_message.id,
+            max_prompt_chars=max_prompt_chars,
+        )
+    )
+
+    assert result.selected_memories == ()
+    assert result.skipped_memories == (memory,)
+    assert result.selected_recent_message_ids == (
+        older_message.id,
+        recent_message.id,
+        query_message.id,
+    )
+    assert [message.content for message in result.chat_request.messages[-3:]] == [
+        "older",
+        "recent",
+        "query",
+    ]
 
 
 def test_prompt_builder_adds_recent_messages_newest_first_for_budget_then_chronological() -> None:
@@ -106,6 +149,7 @@ def test_prompt_builder_adds_recent_messages_newest_first_for_budget_then_chrono
         "newer",
         "query",
     ]
+    assert result.selected_recent_message_ids == (newer_message.id, query_message.id)
 
 
 def test_prompt_builder_rejects_mandatory_sections_over_budget() -> None:

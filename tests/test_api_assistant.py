@@ -694,6 +694,7 @@ async def test_assistant_generation_excludes_current_query_from_retrieval_proven
                     conversation_id=conversation.id,
                     query_message_id=query_message_episode.message.id,
                     top_k=5,
+                    recent_message_limit=1,
                 )
             )
 
@@ -1072,8 +1073,9 @@ class _PoisonedRetrievalMemoryService:
         top_k: int,
         *,
         exclude_message_id: UUID | None = None,
+        exclude_message_ids: tuple[UUID, ...] = (),
     ) -> list[ScoredEpisode]:
-        _ = (user_id, scope_id, query, top_k, exclude_message_id)
+        _ = (user_id, scope_id, query, top_k, exclude_message_id, exclude_message_ids)
         return list(self.poisoned_memories)
 
     async def append_assistant_response_with_provenance(self, request):

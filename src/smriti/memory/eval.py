@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -463,6 +464,10 @@ class Stage12RetrievedEpisodeRecord:
 class Stage12CaseMetrics:
     hit_at_k: bool
     reciprocal_rank: float
+    source_reciprocal_rank: float
+    source_raw_reciprocal_rank: float
+    source_summary_reciprocal_rank: float
+    source_ndcg_at_k: float
     precision_at_k: float
     recall_at_k: float
     raw_hit_at_k: bool
@@ -520,6 +525,10 @@ class Stage12AggregateMetrics:
     total_cases: int
     hit_rate_at_k: float
     mean_reciprocal_rank: float
+    mean_source_reciprocal_rank: float
+    mean_source_raw_reciprocal_rank: float
+    mean_source_summary_reciprocal_rank: float
+    mean_source_ndcg_at_k: float
     mean_precision_at_k: float
     mean_recall_at_k: float
     raw_hit_rate_at_k: float
@@ -607,6 +616,48 @@ class Stage13RolePolicyCaseResult:
     case_result: Stage12CaseResult
     weak_evidence: Stage13WeakEvidenceMetrics
     removed_legitimate_raw_source_count: int
+
+
+@dataclass(frozen=True)
+class Stage13AssemblyMetrics:
+    recent_context_duplication_rate: float
+    over_retrieval: bool
+    false_positive_retrieval: bool
+    active_query_occurrences: int
+    admitted_memory_count: int
+    retrieved_candidate_count: int
+
+
+@dataclass(frozen=True)
+class Stage13AssemblyCaseResult:
+    example_id: str
+    scenario_id: str
+    question_type: QuestionType
+    preferred_layer: PreferredLayer
+    top_k: int
+    expected_ids: Stage12ExpectedIds
+    active_query_message_id: UUID
+    recent_context_ids: tuple[UUID, ...]
+    excluded_message_ids: tuple[UUID, ...]
+    retrieved_candidates: tuple[Stage12RetrievedEpisodeRecord, ...]
+    admitted_memories: tuple[Stage12RetrievedEpisodeRecord, ...]
+    skipped_memories: tuple[Stage12RetrievedEpisodeRecord, ...]
+    prompt_message_order: tuple[str, ...]
+    retrieval_candidate_metrics: Stage12CaseMetrics
+    assembled_context_metrics: Stage12CaseMetrics
+    assembly_metrics: Stage13AssemblyMetrics
+    notes: str | None = None
+
+
+@dataclass(frozen=True)
+class Stage13AssemblyAggregateMetrics:
+    total_cases: int
+    retrieval_candidate_metrics: Stage12AggregateMetrics
+    assembled_context_metrics: Stage12AggregateMetrics
+    recent_context_duplication_rate: float
+    over_retrieval_rate: float
+    false_positive_retrieval_rate: float
+    active_query_exactly_once_rate: float
 
 
 async def run_retrieval_eval(
@@ -760,6 +811,9 @@ def score_stage12_retrieval_case(
         ),
         None,
     )
+    first_source_rank = _first_diagnostic_rank(official_records, source_expected_ids)
+    first_raw_rank = _first_diagnostic_rank(official_records, raw_expected_ids)
+    first_summary_rank = _first_diagnostic_rank(official_records, summary_expected_ids)
     self_query_record = next(
         (
             record
@@ -772,6 +826,12 @@ def score_stage12_retrieval_case(
     metrics = Stage12CaseMetrics(
         hit_at_k=bool(preferred_hits),
         reciprocal_rank=0.0 if first_preferred_rank is None else 1.0 / first_preferred_rank,
+        source_reciprocal_rank=0.0 if first_source_rank is None else 1.0 / first_source_rank,
+        source_raw_reciprocal_rank=0.0 if first_raw_rank is None else 1.0 / first_raw_rank,
+        source_summary_reciprocal_rank=0.0
+        if first_summary_rank is None
+        else 1.0 / first_summary_rank,
+        source_ndcg_at_k=_binary_ndcg_at_k(official_records, source_expected_ids, case.top_k),
         precision_at_k=0.0
         if not official_records
         else len(set(preferred_hits)) / len(official_records),
@@ -826,12 +886,20 @@ def score_stage12_retrieval_case(
 def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12AggregateMetrics:
     """Aggregate the required Stage 12a metrics across cases."""
 
-    total_cases = len(results)
+    return _summarize_stage12_metrics(tuple(result.metrics for result in results))
+
+
+def _summarize_stage12_metrics(metrics: Sequence[Stage12CaseMetrics]) -> Stage12AggregateMetrics:
+    total_cases = len(metrics)
     if total_cases == 0:
         return Stage12AggregateMetrics(
             total_cases=0,
             hit_rate_at_k=0.0,
             mean_reciprocal_rank=0.0,
+            mean_source_reciprocal_rank=0.0,
+            mean_source_raw_reciprocal_rank=0.0,
+            mean_source_summary_reciprocal_rank=0.0,
+            mean_source_ndcg_at_k=0.0,
             mean_precision_at_k=0.0,
             mean_recall_at_k=0.0,
             raw_hit_rate_at_k=0.0,
@@ -854,40 +922,41 @@ def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12Ag
             mean_recap_pollution_ratio_at_k=0.0,
         )
 
-    total_message_count = sum(result.metrics.kind_mix_at_k.message_count for result in results)
-    total_summary_count = sum(result.metrics.kind_mix_at_k.summary_count for result in results)
+    total_message_count = sum(item.kind_mix_at_k.message_count for item in metrics)
+    total_summary_count = sum(item.kind_mix_at_k.summary_count for item in metrics)
     total_kind_count = total_message_count + total_summary_count
 
     return Stage12AggregateMetrics(
         total_cases=total_cases,
-        hit_rate_at_k=sum(1 for result in results if result.metrics.hit_at_k) / total_cases,
-        mean_reciprocal_rank=sum(result.metrics.reciprocal_rank for result in results)
+        hit_rate_at_k=sum(1 for item in metrics if item.hit_at_k) / total_cases,
+        mean_reciprocal_rank=sum(item.reciprocal_rank for item in metrics) / total_cases,
+        mean_source_reciprocal_rank=sum(item.source_reciprocal_rank for item in metrics)
         / total_cases,
-        mean_precision_at_k=sum(result.metrics.precision_at_k for result in results) / total_cases,
-        mean_recall_at_k=sum(result.metrics.recall_at_k for result in results) / total_cases,
-        raw_hit_rate_at_k=sum(1 for result in results if result.metrics.raw_hit_at_k) / total_cases,
-        summary_hit_rate_at_k=sum(1 for result in results if result.metrics.summary_hit_at_k)
+        mean_source_raw_reciprocal_rank=sum(item.source_raw_reciprocal_rank for item in metrics)
         / total_cases,
-        acceptable_hit_rate_at_k=sum(1 for result in results if result.metrics.acceptable_hit_at_k)
-        / total_cases,
-        source_hit_rate_at_k=sum(1 for result in results if result.metrics.source_hit_at_k)
-        / total_cases,
-        source_raw_hit_rate_at_k=sum(1 for result in results if result.metrics.source_raw_hit_at_k)
-        / total_cases,
-        source_summary_hit_rate_at_k=sum(
-            1 for result in results if result.metrics.source_summary_hit_at_k
+        mean_source_summary_reciprocal_rank=sum(
+            item.source_summary_reciprocal_rank for item in metrics
         )
         / total_cases,
-        derived_answer_hit_rate_at_k=sum(
-            1 for result in results if result.metrics.derived_answer_hit_at_k
-        )
+        mean_source_ndcg_at_k=sum(item.source_ndcg_at_k for item in metrics) / total_cases,
+        mean_precision_at_k=sum(item.precision_at_k for item in metrics) / total_cases,
+        mean_recall_at_k=sum(item.recall_at_k for item in metrics) / total_cases,
+        raw_hit_rate_at_k=sum(1 for item in metrics if item.raw_hit_at_k) / total_cases,
+        summary_hit_rate_at_k=sum(1 for item in metrics if item.summary_hit_at_k) / total_cases,
+        acceptable_hit_rate_at_k=sum(1 for item in metrics if item.acceptable_hit_at_k)
+        / total_cases,
+        source_hit_rate_at_k=sum(1 for item in metrics if item.source_hit_at_k) / total_cases,
+        source_raw_hit_rate_at_k=sum(1 for item in metrics if item.source_raw_hit_at_k)
+        / total_cases,
+        source_summary_hit_rate_at_k=sum(1 for item in metrics if item.source_summary_hit_at_k)
+        / total_cases,
+        derived_answer_hit_rate_at_k=sum(1 for item in metrics if item.derived_answer_hit_at_k)
         / total_cases,
         source_miss_but_derived_hit_rate_at_k=sum(
-            1 for result in results if result.metrics.source_miss_but_derived_hit_at_k
+            1 for item in metrics if item.source_miss_but_derived_hit_at_k
         )
         / total_cases,
-        self_query_hit_rate=sum(1 for result in results if result.metrics.self_query_hit)
-        / total_cases,
+        self_query_hit_rate=sum(1 for item in metrics if item.self_query_hit) / total_cases,
         kind_mix_at_k=Stage12KindMixMetrics(
             message_count=total_message_count,
             summary_count=total_summary_count,
@@ -895,12 +964,142 @@ def summarize_stage12_results(results: Sequence[Stage12CaseResult]) -> Stage12Ag
             message_ratio=0.0 if total_kind_count == 0 else total_message_count / total_kind_count,
             summary_ratio=0.0 if total_kind_count == 0 else total_summary_count / total_kind_count,
         ),
-        mean_recap_pollution_count_at_k=sum(
-            result.metrics.recap_pollution_at_k.count for result in results
+        mean_recap_pollution_count_at_k=sum(item.recap_pollution_at_k.count for item in metrics)
+        / total_cases,
+        mean_recap_pollution_ratio_at_k=sum(item.recap_pollution_at_k.ratio for item in metrics)
+        / total_cases,
+    )
+
+
+def score_stage13_assembly_case(
+    case: Stage12ResolvedEvalCase,
+    *,
+    retrieved_candidates: Sequence[ScoredEpisode],
+    admitted_memories: Sequence[ScoredEpisode],
+    skipped_memories: Sequence[ScoredEpisode],
+    recent_context_ids: Sequence[UUID],
+    active_query_message_id: UUID,
+    excluded_message_ids: Sequence[UUID],
+    prompt_message_order: Sequence[str],
+    active_query_occurrences: int,
+    timing_mode: TimingMode = "app_realistic",
+    diagnostic_top_k: int | None = None,
+) -> Stage13AssemblyCaseResult:
+    """Score one assistant-generation assembly using the Stage 12 metric vocabulary."""
+
+    validate_stage12_eval_case(case)
+    _validate_timing_mode(timing_mode)
+
+    candidate_diagnostic_top_k = _resolve_diagnostic_top_k(
+        top_k=case.top_k,
+        diagnostic_top_k=diagnostic_top_k,
+    )
+    retrieval_candidate_result = score_stage12_retrieval_case(
+        case,
+        retrieved_candidates,
+        timing_mode,
+        diagnostic_top_k=candidate_diagnostic_top_k,
+    )
+    admitted_ranked = _episodes_with_admission_ranks(admitted_memories)
+    admitted_diagnostic_top_k = max(case.top_k, len(admitted_ranked), 1)
+    assembled_context_result = score_stage12_retrieval_case(
+        case,
+        admitted_ranked,
+        timing_mode,
+        diagnostic_top_k=admitted_diagnostic_top_k,
+    )
+    skipped_records = (
+        score_stage12_retrieval_case(
+            case,
+            skipped_memories,
+            timing_mode,
+            diagnostic_top_k=max(case.top_k, len(skipped_memories), 1),
+        ).retrieved
+        if skipped_memories
+        else ()
+    )
+    recent_context_id_set = set(recent_context_ids)
+    admitted_records = assembled_context_result.retrieved
+    duplicate_count = sum(
+        1
+        for record in admitted_records
+        if record.message_id is not None and record.message_id in recent_context_id_set
+    )
+    admitted_count = len(admitted_records)
+    no_answer_case = case.question_type == "negative_control" or not (
+        case.expected_ids.raw or case.expected_ids.summary or case.expected_ids.acceptable
+    )
+    false_positive_retrieval = no_answer_case and admitted_count > 0
+
+    return Stage13AssemblyCaseResult(
+        example_id=case.example_id,
+        scenario_id=case.scenario_id,
+        question_type=case.question_type,
+        preferred_layer=case.preferred_layer,
+        top_k=case.top_k,
+        expected_ids=case.expected_ids,
+        active_query_message_id=active_query_message_id,
+        recent_context_ids=tuple(recent_context_ids),
+        excluded_message_ids=tuple(excluded_message_ids),
+        retrieved_candidates=retrieval_candidate_result.retrieved,
+        admitted_memories=admitted_records,
+        skipped_memories=skipped_records,
+        prompt_message_order=tuple(prompt_message_order),
+        retrieval_candidate_metrics=retrieval_candidate_result.metrics,
+        assembled_context_metrics=assembled_context_result.metrics,
+        assembly_metrics=Stage13AssemblyMetrics(
+            recent_context_duplication_rate=0.0
+            if admitted_count == 0
+            else duplicate_count / admitted_count,
+            over_retrieval=false_positive_retrieval,
+            false_positive_retrieval=false_positive_retrieval,
+            active_query_occurrences=active_query_occurrences,
+            admitted_memory_count=admitted_count,
+            retrieved_candidate_count=len(retrieval_candidate_result.retrieved),
+        ),
+        notes=case.notes,
+    )
+
+
+def summarize_stage13_assembly_results(
+    results: Sequence[Stage13AssemblyCaseResult],
+) -> Stage13AssemblyAggregateMetrics:
+    """Aggregate assembly-aware candidate and admitted-memory metrics."""
+
+    total_cases = len(results)
+    retrieval_candidate_metrics = _summarize_stage12_metrics(
+        tuple(result.retrieval_candidate_metrics for result in results)
+    )
+    assembled_context_metrics = _summarize_stage12_metrics(
+        tuple(result.assembled_context_metrics for result in results)
+    )
+    if total_cases == 0:
+        return Stage13AssemblyAggregateMetrics(
+            total_cases=0,
+            retrieval_candidate_metrics=retrieval_candidate_metrics,
+            assembled_context_metrics=assembled_context_metrics,
+            recent_context_duplication_rate=0.0,
+            over_retrieval_rate=0.0,
+            false_positive_retrieval_rate=0.0,
+            active_query_exactly_once_rate=0.0,
+        )
+
+    return Stage13AssemblyAggregateMetrics(
+        total_cases=total_cases,
+        retrieval_candidate_metrics=retrieval_candidate_metrics,
+        assembled_context_metrics=assembled_context_metrics,
+        recent_context_duplication_rate=sum(
+            result.assembly_metrics.recent_context_duplication_rate for result in results
         )
         / total_cases,
-        mean_recap_pollution_ratio_at_k=sum(
-            result.metrics.recap_pollution_at_k.ratio for result in results
+        over_retrieval_rate=sum(1 for result in results if result.assembly_metrics.over_retrieval)
+        / total_cases,
+        false_positive_retrieval_rate=sum(
+            1 for result in results if result.assembly_metrics.false_positive_retrieval
+        )
+        / total_cases,
+        active_query_exactly_once_rate=sum(
+            1 for result in results if result.assembly_metrics.active_query_occurrences == 1
         )
         / total_cases,
     )
@@ -2476,6 +2675,9 @@ def _stage12_case_result_from_records(
         ),
         None,
     )
+    first_source_rank = _first_diagnostic_rank(official_records, source_expected_ids)
+    first_raw_rank = _first_diagnostic_rank(official_records, raw_expected_ids)
+    first_summary_rank = _first_diagnostic_rank(official_records, summary_expected_ids)
     self_query_record = next(
         (record for record in records if record.rank <= top_k and record.is_current_query),
         None,
@@ -2483,6 +2685,12 @@ def _stage12_case_result_from_records(
     metrics = Stage12CaseMetrics(
         hit_at_k=bool(preferred_hits),
         reciprocal_rank=0.0 if first_preferred_rank is None else 1.0 / first_preferred_rank,
+        source_reciprocal_rank=0.0 if first_source_rank is None else 1.0 / first_source_rank,
+        source_raw_reciprocal_rank=0.0 if first_raw_rank is None else 1.0 / first_raw_rank,
+        source_summary_reciprocal_rank=0.0
+        if first_summary_rank is None
+        else 1.0 / first_summary_rank,
+        source_ndcg_at_k=_binary_ndcg_at_k(official_records, source_expected_ids, top_k),
         precision_at_k=0.0
         if not official_records
         else len(set(preferred_hits)) / len(official_records),
@@ -3825,6 +4033,14 @@ def _case_metrics_from_dict(record: Mapping[str, object]) -> Stage12CaseMetrics:
     return Stage12CaseMetrics(
         hit_at_k=_required_bool(record, "hit_at_k"),
         reciprocal_rank=_required_float(record, "reciprocal_rank"),
+        source_reciprocal_rank=_optional_float(record, "source_reciprocal_rank") or 0.0,
+        source_raw_reciprocal_rank=_optional_float(record, "source_raw_reciprocal_rank") or 0.0,
+        source_summary_reciprocal_rank=_optional_float(
+            record,
+            "source_summary_reciprocal_rank",
+        )
+        or 0.0,
+        source_ndcg_at_k=_optional_float(record, "source_ndcg_at_k") or 0.0,
         precision_at_k=_required_float(record, "precision_at_k"),
         recall_at_k=_required_float(record, "recall_at_k"),
         raw_hit_at_k=_required_bool(record, "raw_hit_at_k"),
@@ -4215,6 +4431,10 @@ def stage12_aggregate_metrics_to_dict(metrics: Stage12AggregateMetrics) -> dict[
         "total_cases": metrics.total_cases,
         "hit_rate_at_k": metrics.hit_rate_at_k,
         "mean_reciprocal_rank": metrics.mean_reciprocal_rank,
+        "mean_source_reciprocal_rank": metrics.mean_source_reciprocal_rank,
+        "mean_source_raw_reciprocal_rank": metrics.mean_source_raw_reciprocal_rank,
+        "mean_source_summary_reciprocal_rank": metrics.mean_source_summary_reciprocal_rank,
+        "mean_source_ndcg_at_k": metrics.mean_source_ndcg_at_k,
         "mean_precision_at_k": metrics.mean_precision_at_k,
         "mean_recall_at_k": metrics.mean_recall_at_k,
         "raw_hit_rate_at_k": metrics.raw_hit_rate_at_k,
@@ -4229,6 +4449,67 @@ def stage12_aggregate_metrics_to_dict(metrics: Stage12AggregateMetrics) -> dict[
         "kind_mix_at_k": _kind_mix_to_dict(metrics.kind_mix_at_k),
         "mean_recap_pollution_count_at_k": metrics.mean_recap_pollution_count_at_k,
         "mean_recap_pollution_ratio_at_k": metrics.mean_recap_pollution_ratio_at_k,
+    }
+
+
+def stage13_assembly_case_result_to_dict(result: Stage13AssemblyCaseResult) -> dict[str, object]:
+    """Convert one assembly-aware case result to content-free JSON-safe values."""
+
+    return {
+        "example_id": result.example_id,
+        "scenario_id": result.scenario_id,
+        "question_type": result.question_type,
+        "preferred_layer": result.preferred_layer,
+        "top_k": result.top_k,
+        "expected_ids": _expected_ids_to_dict(result.expected_ids),
+        "active_query_message_id": str(result.active_query_message_id),
+        "recent_context_ids": [str(message_id) for message_id in result.recent_context_ids],
+        "excluded_message_ids": [str(message_id) for message_id in result.excluded_message_ids],
+        "retrieved_candidates": [
+            _retrieved_record_to_dict(record) for record in result.retrieved_candidates
+        ],
+        "admitted_memories": [
+            _retrieved_record_to_dict(record) for record in result.admitted_memories
+        ],
+        "skipped_memories": [
+            _retrieved_record_to_dict(record) for record in result.skipped_memories
+        ],
+        "prompt_message_order": list(result.prompt_message_order),
+        "retrieval_candidate_metrics": _case_metrics_to_dict(result.retrieval_candidate_metrics),
+        "assembled_context_metrics": _case_metrics_to_dict(result.assembled_context_metrics),
+        "assembly_metrics": _stage13_assembly_metrics_to_dict(result.assembly_metrics),
+        "notes": result.notes,
+    }
+
+
+def stage13_assembly_aggregate_metrics_to_dict(
+    metrics: Stage13AssemblyAggregateMetrics,
+) -> dict[str, object]:
+    """Convert assembly-aware aggregate metrics to JSON-safe values."""
+
+    return {
+        "total_cases": metrics.total_cases,
+        "retrieval_candidate_metrics": stage12_aggregate_metrics_to_dict(
+            metrics.retrieval_candidate_metrics
+        ),
+        "assembled_context_metrics": stage12_aggregate_metrics_to_dict(
+            metrics.assembled_context_metrics
+        ),
+        "recent_context_duplication_rate": metrics.recent_context_duplication_rate,
+        "over_retrieval_rate": metrics.over_retrieval_rate,
+        "false_positive_retrieval_rate": metrics.false_positive_retrieval_rate,
+        "active_query_exactly_once_rate": metrics.active_query_exactly_once_rate,
+    }
+
+
+def _stage13_assembly_metrics_to_dict(metrics: Stage13AssemblyMetrics) -> dict[str, object]:
+    return {
+        "recent_context_duplication_rate": metrics.recent_context_duplication_rate,
+        "over_retrieval": metrics.over_retrieval,
+        "false_positive_retrieval": metrics.false_positive_retrieval,
+        "active_query_occurrences": metrics.active_query_occurrences,
+        "admitted_memory_count": metrics.admitted_memory_count,
+        "retrieved_candidate_count": metrics.retrieved_candidate_count,
     }
 
 
@@ -4402,6 +4683,44 @@ def _kind_mix_metrics(records: Sequence[Stage12RetrievedEpisodeRecord]) -> Stage
         total_count=total_count,
         message_ratio=0.0 if total_count == 0 else message_count / total_count,
         summary_ratio=0.0 if total_count == 0 else summary_count / total_count,
+    )
+
+
+def _binary_ndcg_at_k(
+    records: Sequence[Stage12RetrievedEpisodeRecord],
+    relevant_episode_ids: set[UUID],
+    top_k: int,
+) -> float:
+    """Compute binary source nDCG@K: source raw/summary IDs are 1, all others are 0."""
+
+    if top_k <= 0 or not relevant_episode_ids:
+        return 0.0
+
+    official_records = tuple(
+        record
+        for record in records
+        if record.official_rank is not None and record.official_rank <= top_k
+    )
+    dcg = sum(
+        _discounted_gain(record.official_rank, 1.0)
+        for record in official_records
+        if record.episode_id in relevant_episode_ids and record.official_rank is not None
+    )
+    ideal_count = min(len(relevant_episode_ids), top_k)
+    ideal_dcg = sum(_discounted_gain(rank, 1.0) for rank in range(1, ideal_count + 1))
+    return 0.0 if ideal_dcg == 0.0 else dcg / ideal_dcg
+
+
+def _discounted_gain(rank: int | None, relevance: float) -> float:
+    if rank is None or rank <= 0 or relevance <= 0.0:
+        return 0.0
+    return relevance / math.log2(rank + 1)
+
+
+def _episodes_with_admission_ranks(episodes: Sequence[ScoredEpisode]) -> tuple[ScoredEpisode, ...]:
+    return tuple(
+        replace(episode, result_rank=admission_rank)
+        for admission_rank, episode in enumerate(episodes, start=1)
     )
 
 
@@ -4965,6 +5284,10 @@ def _case_metrics_to_dict(metrics: Stage12CaseMetrics) -> dict[str, object]:
     return {
         "hit_at_k": metrics.hit_at_k,
         "reciprocal_rank": metrics.reciprocal_rank,
+        "source_reciprocal_rank": metrics.source_reciprocal_rank,
+        "source_raw_reciprocal_rank": metrics.source_raw_reciprocal_rank,
+        "source_summary_reciprocal_rank": metrics.source_summary_reciprocal_rank,
+        "source_ndcg_at_k": metrics.source_ndcg_at_k,
         "precision_at_k": metrics.precision_at_k,
         "recall_at_k": metrics.recall_at_k,
         "raw_hit_at_k": metrics.raw_hit_at_k,

@@ -28,9 +28,38 @@ class PromptBuildRequest:
 
 
 @dataclass(frozen=True)
+class RecentContextSelectionRequest:
+    scope_system_prompt: str
+    recent_messages: tuple[MessageRecord, ...]
+    query_message_id: UUID
+    max_prompt_chars: int = 16000
+
+
+@dataclass(frozen=True)
+class RecentContextSelectionResult:
+    active_query_message_id: UUID
+    selected_recent_messages: tuple[MessageRecord, ...]
+    selected_recent_message_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
 class PromptBuildResult:
     chat_request: ChatRequest
     selected_memories: tuple[ScoredEpisode, ...]
+    selected_recent_messages: tuple[MessageRecord, ...]
+    selected_recent_message_ids: tuple[UUID, ...]
+    skipped_memories: tuple[ScoredEpisode, ...]
+
+
+@dataclass(frozen=True)
+class AssistantPromptAssembly:
+    prompt: PromptBuildResult
+    recent_context: RecentContextSelectionResult
+    active_query_message_id: UUID
+    excluded_message_ids: tuple[UUID, ...]
+    retrieved_memories: tuple[ScoredEpisode, ...]
+    prompt_message_order: tuple[str, ...]
+    active_query_occurrences: int
 
 
 @dataclass(frozen=True)
