@@ -21,6 +21,7 @@ def test_settings_defaults_include_local_ollama_chat_configuration() -> None:
     assert settings.memory_typed_v1_raw_source_limit == 4
     assert settings.memory_typed_v1_summary_source_limit == 2
     assert settings.memory_typed_v1_assistant_derived_limit == 0
+    assert settings.retrieval_candidate_mode == "semantic"
 
 
 def test_settings_loads_local_ollama_chat_configuration_from_environment(
@@ -38,6 +39,7 @@ def test_settings_loads_local_ollama_chat_configuration_from_environment(
     monkeypatch.setenv("SMRITI_MEMORY_TYPED_V1_RAW_SOURCE_LIMIT", "5")
     monkeypatch.setenv("SMRITI_MEMORY_TYPED_V1_SUMMARY_SOURCE_LIMIT", "3")
     monkeypatch.setenv("SMRITI_MEMORY_TYPED_V1_ASSISTANT_DERIVED_LIMIT", "1")
+    monkeypatch.setenv("SMRITI_RETRIEVAL_CANDIDATE_MODE", "hybrid_v1")
 
     settings = Settings(_env_file=None)
 
@@ -53,6 +55,7 @@ def test_settings_loads_local_ollama_chat_configuration_from_environment(
     assert settings.memory_typed_v1_raw_source_limit == 5
     assert settings.memory_typed_v1_summary_source_limit == 3
     assert settings.memory_typed_v1_assistant_derived_limit == 1
+    assert settings.retrieval_candidate_mode == "hybrid_v1"
 
 
 def test_settings_rejects_invalid_local_ollama_chat_configuration() -> None:
@@ -73,6 +76,9 @@ def test_settings_rejects_invalid_local_ollama_chat_configuration() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, memory_policy="unsupported")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, retrieval_candidate_mode="unsupported")
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, memory_typed_v1_total_limit=-1)

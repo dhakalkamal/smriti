@@ -9,6 +9,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MemoryPolicy = Literal["legacy", "typed_v1"]
+RetrievalCandidateMode = Literal["semantic", "hybrid_v1"]
 
 
 class Settings(BaseSettings):
@@ -38,6 +39,7 @@ class Settings(BaseSettings):
     memory_typed_v1_raw_source_limit: int = Field(default=4, ge=0)
     memory_typed_v1_summary_source_limit: int = Field(default=2, ge=0)
     memory_typed_v1_assistant_derived_limit: int = Field(default=0, ge=0)
+    retrieval_candidate_mode: RetrievalCandidateMode = Field(default="semantic")
 
     model_config = SettingsConfigDict(
         env_prefix="SMRITI_",

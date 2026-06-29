@@ -44,12 +44,15 @@ from smriti.memory import (
     AssistantResponseRecord,
     LoadAssistantGenerationContextRequest,
     MemoryService,
+    RetrievalCandidateMode,
     ScoredEpisode,
 )
 
 ASSISTANT_GENERATION_UNAVAILABLE_CODE = "assistant_generation_unavailable"
 ASSISTANT_GENERATION_FAILED_CODE = "assistant_generation_failed"
 ASSISTANT_PERSISTENCE_FAILED_CODE = "assistant_persistence_failed"
+HYBRID_CANDIDATE_DEPTH_FLOOR = 25
+HYBRID_CANDIDATE_DEPTH_CAP = 100
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class AssistantOrchestrator:
     memory_service: MemoryService
     chat_generator: ChatGenerator
     memory_policy: MemoryPolicyName = "legacy"
+    retrieval_candidate_mode: RetrievalCandidateMode = "semantic"
     typed_v1_memory_config: TypedMemoryAdmissionConfig = field(
         default_factory=TypedMemoryAdmissionConfig
     )
@@ -203,6 +207,7 @@ class AssistantOrchestrator:
             )
         )
         if self.memory_policy == "legacy":
+            effective_candidate_mode: RetrievalCandidateMode = "semantic"
             retrieved_memories = tuple(
                 await self.memory_service.retrieve_scoped_episodes(
                     user_id=request.user_id,
@@ -227,13 +232,19 @@ class AssistantOrchestrator:
                 skipped_memories=prompt.skipped_memories,
             )
         else:
-            candidate_top_k = max(request.top_k, self.typed_v1_memory_config.total_limit)
+            effective_candidate_mode = self.retrieval_candidate_mode
+            candidate_top_k = _typed_candidate_top_k(
+                request_top_k=request.top_k,
+                total_limit=self.typed_v1_memory_config.total_limit,
+                candidate_mode=effective_candidate_mode,
+            )
             retrieved_memories = tuple(
                 await self.memory_service.retrieve_scoped_episodes(
                     user_id=request.user_id,
                     scope_id=request.scope_id,
                     query=context.query_message.content,
                     top_k=candidate_top_k,
+                    candidate_mode=effective_candidate_mode,
                     exclude_message_ids=recent_context.selected_recent_message_ids,
                     update_access_metadata=False,
                 )
@@ -277,6 +288,7 @@ class AssistantOrchestrator:
             retrieved_memories=retrieved_memories,
             memory_admission_decisions=memory_admission_decisions,
             memory_policy=self.memory_policy,
+            retrieval_candidate_mode=effective_candidate_mode,
             prompt_message_order=_prompt_message_order(prompt),
             active_query_occurrences=sum(
                 1
@@ -316,6 +328,26 @@ def _assistant_token_count(content: str, completion_tokens: int | None) -> int:
     if content == "":
         return 0
     return max(1, len(content) // 4)
+
+
+def _typed_candidate_top_k(
+    *,
+    request_top_k: int,
+    total_limit: int,
+    candidate_mode: RetrievalCandidateMode,
+) -> int:
+    base_top_k = max(request_top_k, total_limit)
+    if candidate_mode == "semantic":
+        return base_top_k
+    return min(
+        HYBRID_CANDIDATE_DEPTH_CAP,
+        max(
+            HYBRID_CANDIDATE_DEPTH_FLOOR,
+            request_top_k * 5,
+            total_limit * 4,
+            base_top_k,
+        ),
+    )
 
 
 def _prompt_message_order(prompt: PromptBuildResult) -> tuple[str, ...]:

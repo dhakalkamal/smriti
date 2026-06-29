@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import cast
 from uuid import UUID
@@ -44,6 +45,7 @@ from smriti.memory.models import (
     MessageEpisodeRecord,
     MessageRecord,
     MessageRole,
+    RetrievalCandidateMode,
     RetrievalEpisodeSource,
     RetrievalQueryMessage,
     RetrievalRecord,
@@ -55,6 +57,10 @@ from smriti.memory.models import (
 EMBEDDINGS_768_DIMENSIONS = 768
 RETRIEVAL_CANDIDATE_MULTIPLIER = 5
 MIN_RETRIEVAL_CANDIDATES = 25
+HYBRID_RETRIEVAL_CANDIDATE_CAP = 100
+HYBRID_RRF_K = 60.0
+HYBRID_SEMANTIC_RRF_WEIGHT = 1.0
+HYBRID_LEXICAL_RRF_WEIGHT = 1.0
 SECONDS_PER_DAY = 24 * 60 * 60
 RECENCY_HALF_LIFE_SECONDS = 30 * SECONDS_PER_DAY
 ACCESS_HALF_LIFE_SECONDS = 7 * SECONDS_PER_DAY
@@ -65,6 +71,76 @@ IMPORTANCE_WEIGHT = 0.10
 FREQUENCY_WEIGHT = 0.05
 FREQUENCY_NORMALIZATION_COUNT = 10.0
 SCORING_VERSION = "stage-5.2-weighted-v1"
+_LEXICAL_QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_EMAIL_ANCHOR_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_NUMBER_ANCHOR_RE = re.compile(
+    r"\b(?:USD|GBP|EUR|CAD|AUD)\s*\d[\d,]*(?:\.\d+)?\b"
+    r"|\$\s*\d[\d,]*(?:\.\d+)?\b"
+    r"|\b\d[\d,]*(?:\.\d+)?(?:\s*(?:working days|days|weeks|months|hours|"
+    r"students|people|wheels|percent|%))?\b",
+    re.IGNORECASE,
+)
+_DATE_ANCHOR_RE = re.compile(
+    r"\b(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\s+\d{1,2}(?:,\s*\d{4})?\b"
+    r"|\b\d{1,2}\s+(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b"
+    r"|\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_QUOTED_PHRASE_ANCHOR_RE = re.compile(r'"([^"\n]{3,120})"')
+_PROPER_NAME_PHRASE_ANCHOR_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9]*(?:\s+(?:&\s+)?[A-Z][A-Za-z0-9]*)+\b"
+)
+_LEXICAL_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "can",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "our",
+        "please",
+        "the",
+        "their",
+        "there",
+        "they",
+        "to",
+        "was",
+        "we",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "you",
+    }
+)
 SUMMARY_EPISODE_SYSTEM_PROMPT = """You create concise retrieval-useful memory summaries.
 
 Rules:
@@ -103,6 +179,36 @@ class _ScoredEpisodeCandidate:
     importance_score: float
     frequency_score: float
     score: float
+
+
+@dataclass(frozen=True)
+class _ExactAnchor:
+    value: str
+    match_type: str
+
+
+@dataclass(frozen=True)
+class _LexicalQueryPlan:
+    tsquery: str
+    anchors: tuple[_ExactAnchor, ...]
+
+
+@dataclass(frozen=True)
+class _LexicalCandidate:
+    candidate: _ScoredEpisodeCandidate
+    lexical_score: float
+    match_types: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _HybridCandidate:
+    candidate: _ScoredEpisodeCandidate
+    semantic_rank: int | None = None
+    semantic_score: float | None = None
+    lexical_rank: int | None = None
+    lexical_score: float | None = None
+    lexical_match_types: tuple[str, ...] = ()
+    fused_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -699,6 +805,7 @@ class MemoryService:
         query: str,
         top_k: int,
         *,
+        candidate_mode: RetrievalCandidateMode = "semantic",
         exclude_message_id: UUID | None = None,
         exclude_message_ids: Sequence[UUID] = (),
         update_access_metadata: bool = True,
@@ -708,6 +815,8 @@ class MemoryService:
 
         if top_k <= 0:
             raise InvalidRetrievalRequestError("top_k must be greater than zero")
+        if candidate_mode not in ("semantic", "hybrid_v1"):
+            raise InvalidRetrievalRequestError("unsupported retrieval candidate mode")
 
         scored_at = _resolve_scoring_now(now)
 
@@ -717,6 +826,8 @@ class MemoryService:
         # candidate set, then rerank in Python. Lower-similarity episodes with
         # high recency/importance may be missed until eval tuning improves this.
         candidate_limit = max(top_k * RETRIEVAL_CANDIDATE_MULTIPLIER, MIN_RETRIEVAL_CANDIDATES)
+        if candidate_mode == "hybrid_v1":
+            candidate_limit = min(candidate_limit, HYBRID_RETRIEVAL_CANDIDATE_CAP)
         excluded_message_ids = _excluded_message_ids(
             exclude_message_id=exclude_message_id,
             exclude_message_ids=exclude_message_ids,
@@ -729,73 +840,40 @@ class MemoryService:
                 scope_id=scope_id,
             )
             embedding_model_pk = await self._embedding_model_pk(connection)
-            message_exclusion_predicate = (
-                ""
-                if not excluded_message_ids
-                else "AND (episodes.message_id IS NULL OR episodes.message_id <> ALL($6::uuid[]))"
-            )
-            retrieval_query_args: tuple[object, ...] = (
-                scope_id,
-                user_id,
-                list(query_vector),
-                embedding_model_pk,
-                candidate_limit,
-            )
-            if excluded_message_ids:
-                retrieval_query_args = (
-                    *retrieval_query_args,
-                    list(excluded_message_ids),
-                )
-            rows = await connection.fetch(
-                f"""
-                SELECT
-                    episodes.id,
-                    conversations.user_id,
-                    episodes.scope_id,
-                    episodes.conversation_id,
-                    episodes.kind,
-                    episodes.message_id,
-                    messages.role AS message_role,
-                    messages.position AS message_position,
-                    episodes.range_start,
-                    episodes.range_end,
-                    episodes.content,
-                    episodes.created_at,
-                    episodes.importance,
-                    episodes.access_count,
-                    episodes.last_accessed_at,
-                    embeddings_768.model_id AS embedding_model_id,
-                    -- pgvector cosine distance is 0 for identical vectors; convert it
-                    -- to similarity so larger values rank higher in the SQL
-                    -- candidate pool. Final weighted scoring happens in Python.
-                    1.0 - (embeddings_768.embedding <=> $3::vector) AS similarity
-                FROM episodes
-                INNER JOIN conversations
-                    ON conversations.id = episodes.conversation_id
-                   AND conversations.scope_id = episodes.scope_id
-                INNER JOIN embeddings_768
-                    ON embeddings_768.episode_id = episodes.id
-                   AND embeddings_768.model_id = $4
-                LEFT JOIN messages
-                    ON messages.id = episodes.message_id
-                   AND messages.conversation_id = episodes.conversation_id
-                WHERE episodes.scope_id = $1
-                  AND conversations.user_id = $2
-                  {message_exclusion_predicate}
-                ORDER BY similarity DESC, episodes.created_at DESC, episodes.id ASC
-                LIMIT $5;
-                """,
-                *retrieval_query_args,
+            semantic_candidates = await self._fetch_semantic_candidates(
+                connection=connection,
+                user_id=user_id,
+                scope_id=scope_id,
+                query_vector=query_vector,
+                embedding_model_pk=embedding_model_pk,
+                candidate_limit=candidate_limit,
+                excluded_message_ids=excluded_message_ids,
+                scored_at=scored_at,
             )
 
-            scored_candidates = [_scored_episode_candidate_from_row(row, scored_at) for row in rows]
-            retrieved_episodes = [
-                _scored_episode_from_candidate(candidate, result_rank)
-                for result_rank, candidate in enumerate(
-                    sorted(scored_candidates, key=_scored_episode_sort_key)[:top_k],
-                    start=1,
+            if candidate_mode == "semantic":
+                retrieved_episodes = _semantic_scored_episodes(
+                    semantic_candidates=semantic_candidates,
+                    top_k=top_k,
                 )
-            ]
+            else:
+                lexical_candidates = await self._fetch_lexical_candidates(
+                    connection=connection,
+                    user_id=user_id,
+                    scope_id=scope_id,
+                    query=query,
+                    query_vector=query_vector,
+                    embedding_model_pk=embedding_model_pk,
+                    candidate_limit=candidate_limit,
+                    excluded_message_ids=excluded_message_ids,
+                    scored_at=scored_at,
+                )
+                retrieved_episodes = _hybrid_scored_episodes(
+                    semantic_candidates=semantic_candidates,
+                    lexical_candidates=lexical_candidates,
+                    top_k=top_k,
+                )
+
             if retrieved_episodes and update_access_metadata:
                 await self._update_retrieved_episode_access_metadata(
                     connection=connection,
@@ -806,6 +884,200 @@ class MemoryService:
                 )
 
         return retrieved_episodes
+
+    async def _fetch_semantic_candidates(
+        self,
+        *,
+        connection: asyncpg.Connection,
+        user_id: UUID,
+        scope_id: UUID,
+        query_vector: EmbeddingVector,
+        embedding_model_pk: int,
+        candidate_limit: int,
+        excluded_message_ids: tuple[UUID, ...],
+        scored_at: datetime,
+    ) -> list[_ScoredEpisodeCandidate]:
+        message_exclusion_predicate = (
+            ""
+            if not excluded_message_ids
+            else "AND (episodes.message_id IS NULL OR episodes.message_id <> ALL($6::uuid[]))"
+        )
+        retrieval_query_args: tuple[object, ...] = (
+            scope_id,
+            user_id,
+            list(query_vector),
+            embedding_model_pk,
+            candidate_limit,
+        )
+        if excluded_message_ids:
+            retrieval_query_args = (
+                *retrieval_query_args,
+                list(excluded_message_ids),
+            )
+
+        rows = await connection.fetch(
+            f"""
+            SELECT
+                episodes.id,
+                conversations.user_id,
+                episodes.scope_id,
+                episodes.conversation_id,
+                episodes.kind,
+                episodes.message_id,
+                messages.role AS message_role,
+                messages.position AS message_position,
+                episodes.range_start,
+                episodes.range_end,
+                episodes.content,
+                episodes.created_at,
+                episodes.importance,
+                episodes.access_count,
+                episodes.last_accessed_at,
+                embeddings_768.model_id AS embedding_model_id,
+                -- pgvector cosine distance is 0 for identical vectors; convert it
+                -- to similarity so larger values rank higher in the SQL
+                -- candidate pool. Final weighted scoring happens in Python.
+                1.0 - (embeddings_768.embedding <=> $3::vector) AS similarity
+            FROM episodes
+            INNER JOIN conversations
+                ON conversations.id = episodes.conversation_id
+               AND conversations.scope_id = episodes.scope_id
+            INNER JOIN embeddings_768
+                ON embeddings_768.episode_id = episodes.id
+               AND embeddings_768.model_id = $4
+            LEFT JOIN messages
+                ON messages.id = episodes.message_id
+               AND messages.conversation_id = episodes.conversation_id
+            WHERE episodes.scope_id = $1
+              AND conversations.user_id = $2
+              {message_exclusion_predicate}
+            ORDER BY similarity DESC, episodes.created_at DESC, episodes.id ASC
+            LIMIT $5;
+            """,
+            *retrieval_query_args,
+        )
+
+        scored_candidates = [_scored_episode_candidate_from_row(row, scored_at) for row in rows]
+        return sorted(scored_candidates, key=_scored_episode_sort_key)
+
+    async def _fetch_lexical_candidates(
+        self,
+        *,
+        connection: asyncpg.Connection,
+        user_id: UUID,
+        scope_id: UUID,
+        query: str,
+        query_vector: EmbeddingVector,
+        embedding_model_pk: int,
+        candidate_limit: int,
+        excluded_message_ids: tuple[UUID, ...],
+        scored_at: datetime,
+    ) -> list[_LexicalCandidate]:
+        query_plan = _lexical_query_plan(query)
+        anchor_values = _lexical_anchor_values(query_plan)
+        if not query_plan.tsquery and not anchor_values:
+            return []
+
+        message_exclusion_predicate = (
+            ""
+            if not excluded_message_ids
+            else "AND (episodes.message_id IS NULL OR episodes.message_id <> ALL($8::uuid[]))"
+        )
+        retrieval_query_args: tuple[object, ...] = (
+            scope_id,
+            user_id,
+            list(query_vector),
+            embedding_model_pk,
+            query_plan.tsquery,
+            list(anchor_values),
+            candidate_limit,
+        )
+        if excluded_message_ids:
+            retrieval_query_args = (
+                *retrieval_query_args,
+                list(excluded_message_ids),
+            )
+
+        rows = await connection.fetch(
+            f"""
+            WITH lexical_query AS (
+                SELECT CASE
+                    WHEN $5::text = '' THEN NULL
+                    ELSE to_tsquery('simple', $5::text)
+                END AS tsq
+            )
+            SELECT
+                episodes.id,
+                conversations.user_id,
+                episodes.scope_id,
+                episodes.conversation_id,
+                episodes.kind,
+                episodes.message_id,
+                messages.role AS message_role,
+                messages.position AS message_position,
+                episodes.range_start,
+                episodes.range_end,
+                episodes.content,
+                episodes.created_at,
+                episodes.importance,
+                episodes.access_count,
+                episodes.last_accessed_at,
+                embeddings_768.model_id AS embedding_model_id,
+                1.0 - (embeddings_768.embedding <=> $3::vector) AS similarity,
+                CASE
+                    WHEN lexical_query.tsq IS NULL THEN 0.0
+                    ELSE ts_rank(to_tsvector('simple', episodes.content), lexical_query.tsq)
+                END AS fts_score
+            FROM episodes
+            INNER JOIN conversations
+                ON conversations.id = episodes.conversation_id
+               AND conversations.scope_id = episodes.scope_id
+            INNER JOIN embeddings_768
+                ON embeddings_768.episode_id = episodes.id
+               AND embeddings_768.model_id = $4
+            LEFT JOIN messages
+                ON messages.id = episodes.message_id
+               AND messages.conversation_id = episodes.conversation_id
+            CROSS JOIN lexical_query
+            WHERE episodes.scope_id = $1
+              AND conversations.user_id = $2
+              {message_exclusion_predicate}
+              AND (
+                    (
+                        lexical_query.tsq IS NOT NULL
+                        AND to_tsvector('simple', episodes.content) @@ lexical_query.tsq
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM unnest($6::text[]) AS anchor(value)
+                        WHERE POSITION(LOWER(anchor.value) IN LOWER(episodes.content)) > 0
+                    )
+              )
+            ORDER BY fts_score DESC, episodes.created_at DESC, episodes.id ASC
+            LIMIT $7;
+            """,
+            *retrieval_query_args,
+        )
+
+        lexical_candidates: list[_LexicalCandidate] = []
+        for row in rows:
+            candidate = _scored_episode_candidate_from_row(row, scored_at)
+            fts_score = cast(float, row["fts_score"])
+            match_types = _lexical_match_types(
+                query_plan=query_plan,
+                content=candidate.content,
+                fts_score=fts_score,
+            )
+            if not match_types:
+                continue
+            lexical_candidates.append(
+                _LexicalCandidate(
+                    candidate=candidate,
+                    lexical_score=_lexical_score(fts_score=fts_score, match_types=match_types),
+                    match_types=match_types,
+                )
+            )
+        return sorted(lexical_candidates, key=_lexical_candidate_sort_key)
 
     async def update_episode_access_metadata(
         self,
@@ -1756,6 +2028,208 @@ def _summary_window_transcript(candidate: _SummaryWindowCandidate) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def _semantic_scored_episodes(
+    *,
+    semantic_candidates: Sequence[_ScoredEpisodeCandidate],
+    top_k: int,
+) -> list[ScoredEpisode]:
+    retrieved: list[ScoredEpisode] = []
+    for result_rank, candidate in enumerate(semantic_candidates[:top_k], start=1):
+        episode = _scored_episode_from_candidate(candidate, result_rank)
+        retrieved.append(
+            replace(
+                episode,
+                candidate_mode="semantic",
+                semantic_rank=result_rank,
+                semantic_score=candidate.score,
+                fused_rank=result_rank,
+                fused_score=candidate.score,
+            )
+        )
+    return retrieved
+
+
+def _hybrid_scored_episodes(
+    *,
+    semantic_candidates: Sequence[_ScoredEpisodeCandidate],
+    lexical_candidates: Sequence[_LexicalCandidate],
+    top_k: int,
+) -> list[ScoredEpisode]:
+    candidates_by_id: dict[UUID, _HybridCandidate] = {}
+
+    for semantic_rank, semantic_candidate in enumerate(semantic_candidates, start=1):
+        candidates_by_id[semantic_candidate.id] = _HybridCandidate(
+            candidate=semantic_candidate,
+            semantic_rank=semantic_rank,
+            semantic_score=semantic_candidate.score,
+        )
+
+    for lexical_rank, lexical_candidate in enumerate(lexical_candidates, start=1):
+        existing = candidates_by_id.get(lexical_candidate.candidate.id)
+        if existing is None:
+            candidates_by_id[lexical_candidate.candidate.id] = _HybridCandidate(
+                candidate=lexical_candidate.candidate,
+                lexical_rank=lexical_rank,
+                lexical_score=lexical_candidate.lexical_score,
+                lexical_match_types=lexical_candidate.match_types,
+            )
+            continue
+        candidates_by_id[lexical_candidate.candidate.id] = replace(
+            existing,
+            lexical_rank=lexical_rank,
+            lexical_score=lexical_candidate.lexical_score,
+            lexical_match_types=lexical_candidate.match_types,
+        )
+
+    fused_candidates = [
+        replace(hybrid_candidate, fused_score=_rrf_score(hybrid_candidate))
+        for hybrid_candidate in candidates_by_id.values()
+    ]
+    ranked_candidates = sorted(fused_candidates, key=_hybrid_candidate_sort_key)
+
+    retrieved: list[ScoredEpisode] = []
+    for result_rank, hybrid_candidate in enumerate(ranked_candidates[:top_k], start=1):
+        episode = _scored_episode_from_candidate(hybrid_candidate.candidate, result_rank)
+        retrieved.append(
+            replace(
+                episode,
+                score=hybrid_candidate.fused_score,
+                candidate_mode="hybrid_v1",
+                semantic_rank=hybrid_candidate.semantic_rank,
+                semantic_score=hybrid_candidate.semantic_score,
+                lexical_rank=hybrid_candidate.lexical_rank,
+                lexical_score=hybrid_candidate.lexical_score,
+                lexical_match_types=hybrid_candidate.lexical_match_types,
+                fused_rank=result_rank,
+                fused_score=hybrid_candidate.fused_score,
+            )
+        )
+    return retrieved
+
+
+def _rrf_score(candidate: _HybridCandidate) -> float:
+    score = 0.0
+    if candidate.semantic_rank is not None:
+        score += HYBRID_SEMANTIC_RRF_WEIGHT / (HYBRID_RRF_K + candidate.semantic_rank)
+    if candidate.lexical_rank is not None:
+        score += HYBRID_LEXICAL_RRF_WEIGHT / (HYBRID_RRF_K + candidate.lexical_rank)
+    return score
+
+
+def _hybrid_candidate_sort_key(
+    candidate: _HybridCandidate,
+) -> tuple[float, int, int, int, float, int]:
+    present_in_both = candidate.semantic_rank is not None and candidate.lexical_rank is not None
+    return (
+        -candidate.fused_score,
+        -int(present_in_both),
+        candidate.semantic_rank if candidate.semantic_rank is not None else 1_000_000,
+        candidate.lexical_rank if candidate.lexical_rank is not None else 1_000_000,
+        -_datetime_timestamp(candidate.candidate.created_at),
+        candidate.candidate.id.int,
+    )
+
+
+def _lexical_query_plan(query: str) -> _LexicalQueryPlan:
+    anchors: list[_ExactAnchor] = []
+    seen_anchors: set[tuple[str, str]] = set()
+
+    def add_anchor(value: str, match_type: str) -> None:
+        normalized = " ".join(value.strip().split())
+        if len(normalized) < 2:
+            return
+        key = (match_type, normalized.lower())
+        if key in seen_anchors:
+            return
+        seen_anchors.add(key)
+        anchors.append(_ExactAnchor(value=normalized, match_type=match_type))
+
+    for match in _EMAIL_ANCHOR_RE.finditer(query):
+        add_anchor(match.group(0), "email")
+    for match in _NUMBER_ANCHOR_RE.finditer(query):
+        add_anchor(match.group(0), "number")
+    for match in _DATE_ANCHOR_RE.finditer(query):
+        add_anchor(match.group(0), "date")
+    for match in _QUOTED_PHRASE_ANCHOR_RE.finditer(query):
+        add_anchor(match.group(1), "phrase")
+    for match in _PROPER_NAME_PHRASE_ANCHOR_RE.finditer(query):
+        add_anchor(match.group(0), "proper_name")
+    terms = _lexical_query_terms(query)
+    for term in terms:
+        if len(term) >= 7 and not term.isdigit():
+            add_anchor(term, "rare_token")
+
+    return _LexicalQueryPlan(
+        tsquery=" | ".join(terms[:32]),
+        anchors=tuple(anchors),
+    )
+
+
+def _lexical_query_terms(query: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in _LEXICAL_QUERY_TOKEN_RE.finditer(query):
+        term = match.group(0).lower()
+        if term in _LEXICAL_STOPWORDS:
+            continue
+        if len(term) < 3 and not term.isdigit():
+            continue
+        if term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+    return tuple(terms)
+
+
+def _lexical_anchor_values(query_plan: _LexicalQueryPlan) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for anchor in query_plan.anchors:
+        key = anchor.value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(anchor.value)
+    return tuple(values)
+
+
+def _lexical_match_types(
+    *,
+    query_plan: _LexicalQueryPlan,
+    content: str,
+    fts_score: float,
+) -> tuple[str, ...]:
+    match_types: list[str] = []
+    seen: set[str] = set()
+
+    def add_match(match_type: str) -> None:
+        if match_type in seen:
+            return
+        seen.add(match_type)
+        match_types.append(match_type)
+
+    if fts_score > 0.0:
+        add_match("fts")
+    lowered_content = content.lower()
+    for anchor in query_plan.anchors:
+        if anchor.value.lower() in lowered_content:
+            add_match(anchor.match_type)
+    return tuple(match_types)
+
+
+def _lexical_score(*, fts_score: float, match_types: tuple[str, ...]) -> float:
+    exact_match_count = sum(1 for match_type in match_types if match_type != "fts")
+    return float(fts_score) + float(exact_match_count)
+
+
+def _lexical_candidate_sort_key(candidate: _LexicalCandidate) -> tuple[float, float, int]:
+    return (
+        -candidate.lexical_score,
+        -_datetime_timestamp(candidate.candidate.created_at),
+        candidate.candidate.id.int,
+    )
 
 
 def _scored_episode_candidate_from_row(

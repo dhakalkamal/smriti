@@ -11,7 +11,7 @@ from typing import Literal, cast
 from uuid import UUID
 
 from smriti.memory.errors import InvalidRetrievalRequestError
-from smriti.memory.models import EpisodeKind, ScoredEpisode
+from smriti.memory.models import EpisodeKind, MessageRole, RetrievalCandidateMode, ScoredEpisode
 from smriti.memory.service import (
     ACCESS_WEIGHT,
     FREQUENCY_WEIGHT,
@@ -458,6 +458,15 @@ class Stage12RetrievedEpisodeRecord:
     is_derived_answer: bool
     is_current_query: bool
     lexical_features: Stage13LexicalFeatures | None = None
+    message_role: MessageRole | None = None
+    candidate_mode: RetrievalCandidateMode = "semantic"
+    semantic_rank: int | None = None
+    semantic_score: float | None = None
+    lexical_rank: int | None = None
+    lexical_score: float | None = None
+    anchor_match_types: tuple[str, ...] = ()
+    fused_rank: int | None = None
+    fused_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -626,6 +635,8 @@ class Stage13AssemblyMetrics:
     active_query_occurrences: int
     admitted_memory_count: int
     retrieved_candidate_count: int
+    assistant_derived_admitted_count: int = 0
+    negative_control_admitted_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -637,6 +648,19 @@ class Stage13MemoryAdmissionRecord:
     skip_reason: str | None
     original_rank: int
     score: float
+    episode_kind: EpisodeKind | None = None
+    message_id: UUID | None = None
+    message_role: MessageRole | None = None
+    candidate_mode: RetrievalCandidateMode = "semantic"
+    semantic_rank: int | None = None
+    semantic_score: float | None = None
+    lexical_rank: int | None = None
+    lexical_score: float | None = None
+    anchor_match_types: tuple[str, ...] = ()
+    fused_rank: int | None = None
+    fused_score: float | None = None
+    outcome: str | None = None
+    outcome_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -670,6 +694,8 @@ class Stage13AssemblyAggregateMetrics:
     over_retrieval_rate: float
     false_positive_retrieval_rate: float
     active_query_exactly_once_rate: float
+    assistant_derived_admitted_count: int = 0
+    negative_control_admitted_count: int = 0
 
 
 async def run_retrieval_eval(
@@ -1043,6 +1069,11 @@ def score_stage13_assembly_case(
         case.expected_ids.raw or case.expected_ids.summary or case.expected_ids.acceptable
     )
     false_positive_retrieval = no_answer_case and admitted_count > 0
+    assistant_derived_admitted_count = sum(
+        1
+        for record in memory_admission_records
+        if record.lane == "assistant_derived" and record.admitted
+    )
 
     return Stage13AssemblyCaseResult(
         example_id=case.example_id,
@@ -1070,6 +1101,8 @@ def score_stage13_assembly_case(
             active_query_occurrences=active_query_occurrences,
             admitted_memory_count=admitted_count,
             retrieved_candidate_count=len(retrieval_candidate_result.retrieved),
+            assistant_derived_admitted_count=assistant_derived_admitted_count,
+            negative_control_admitted_count=admitted_count if no_answer_case else 0,
         ),
         notes=case.notes,
     )
@@ -1096,6 +1129,8 @@ def summarize_stage13_assembly_results(
             over_retrieval_rate=0.0,
             false_positive_retrieval_rate=0.0,
             active_query_exactly_once_rate=0.0,
+            assistant_derived_admitted_count=0,
+            negative_control_admitted_count=0,
         )
 
     return Stage13AssemblyAggregateMetrics(
@@ -1116,6 +1151,12 @@ def summarize_stage13_assembly_results(
             1 for result in results if result.assembly_metrics.active_query_occurrences == 1
         )
         / total_cases,
+        assistant_derived_admitted_count=sum(
+            result.assembly_metrics.assistant_derived_admitted_count for result in results
+        ),
+        negative_control_admitted_count=sum(
+            result.assembly_metrics.negative_control_admitted_count for result in results
+        ),
     )
 
 
@@ -4034,6 +4075,15 @@ def _retrieved_record_from_dict(record: Mapping[str, object]) -> Stage12Retrieve
         is_derived_answer=_optional_bool(expected_flags, "derived_answer", default=False),
         is_current_query=_required_bool(expected_flags, "current_query"),
         lexical_features=lexical_features,
+        message_role=_optional_message_role(record.get("message_role")),
+        candidate_mode=_retrieval_candidate_mode(str(record.get("candidate_mode", "semantic"))),
+        semantic_rank=_optional_int(record, "semantic_rank"),
+        semantic_score=_optional_float(record, "semantic_score"),
+        lexical_rank=_optional_int(record, "lexical_rank"),
+        lexical_score=_optional_float(record, "lexical_score"),
+        anchor_match_types=_str_tuple(record.get("anchor_match_types", ())),
+        fused_rank=_optional_int(record, "fused_rank"),
+        fused_score=_optional_float(record, "fused_score"),
     )
 
 
@@ -4517,6 +4567,8 @@ def stage13_assembly_aggregate_metrics_to_dict(
         "over_retrieval_rate": metrics.over_retrieval_rate,
         "false_positive_retrieval_rate": metrics.false_positive_retrieval_rate,
         "active_query_exactly_once_rate": metrics.active_query_exactly_once_rate,
+        "assistant_derived_admitted_count": metrics.assistant_derived_admitted_count,
+        "negative_control_admitted_count": metrics.negative_control_admitted_count,
     }
 
 
@@ -4525,12 +4577,25 @@ def _stage13_memory_admission_record_to_dict(
 ) -> dict[str, object]:
     return {
         "episode_id": str(record.episode_id),
+        "episode_kind": record.episode_kind,
+        "message_id": None if record.message_id is None else str(record.message_id),
+        "message_role": record.message_role,
         "lane": record.lane,
         "admitted": record.admitted,
         "admission_reason": record.admission_reason,
         "skip_reason": record.skip_reason,
         "original_rank": record.original_rank,
         "score": record.score,
+        "candidate_mode": record.candidate_mode,
+        "semantic_rank": record.semantic_rank,
+        "semantic_score": record.semantic_score,
+        "lexical_rank": record.lexical_rank,
+        "lexical_score": record.lexical_score,
+        "anchor_match_types": list(record.anchor_match_types),
+        "fused_rank": record.fused_rank,
+        "fused_score": record.fused_score,
+        "outcome": record.outcome,
+        "outcome_reason": record.outcome_reason,
     }
 
 
@@ -4542,6 +4607,8 @@ def _stage13_assembly_metrics_to_dict(metrics: Stage13AssemblyMetrics) -> dict[s
         "active_query_occurrences": metrics.active_query_occurrences,
         "admitted_memory_count": metrics.admitted_memory_count,
         "retrieved_candidate_count": metrics.retrieved_candidate_count,
+        "assistant_derived_admitted_count": metrics.assistant_derived_admitted_count,
+        "negative_control_admitted_count": metrics.negative_control_admitted_count,
     }
 
 
@@ -4652,6 +4719,15 @@ def _stage12_retrieved_record(
         is_derived_answer=episode.id in derived_answer_ids,
         is_current_query=is_current_query,
         lexical_features=stage13_lexical_features(query, episode.content),
+        message_role=episode.message_role,
+        candidate_mode=episode.candidate_mode,
+        semantic_rank=episode.semantic_rank,
+        semantic_score=episode.semantic_score,
+        lexical_rank=episode.lexical_rank,
+        lexical_score=episode.lexical_score,
+        anchor_match_types=episode.lexical_match_types,
+        fused_rank=episode.fused_rank,
+        fused_score=episode.fused_score,
     )
 
 
@@ -5107,6 +5183,22 @@ def _episode_kind(value: str) -> EpisodeKind:
     return cast(EpisodeKind, value)
 
 
+def _optional_message_role(value: object) -> MessageRole | None:
+    if value is None:
+        return None
+    if value not in {"system", "user", "assistant"}:
+        raise InvalidRetrievalRequestError("Stage 12 field must be a message role: message_role")
+    return cast(MessageRole, value)
+
+
+def _retrieval_candidate_mode(value: str) -> RetrievalCandidateMode:
+    if value not in {"semantic", "hybrid_v1"}:
+        raise InvalidRetrievalRequestError(
+            f"Stage 12 field must be a retrieval candidate mode: {value}"
+        )
+    return cast(RetrievalCandidateMode, value)
+
+
 def _required_str(record: Mapping[str, object], key: str) -> str:
     value = record.get(key)
     if not isinstance(value, str):
@@ -5286,11 +5378,20 @@ def _retrieved_record_to_dict(record: Stage12RetrievedEpisodeRecord) -> dict[str
         "conversation_id": str(record.conversation_id),
         "scope_id": str(record.scope_id),
         "message_id": None if record.message_id is None else str(record.message_id),
+        "message_role": record.message_role,
         "message_position": record.message_position,
         "range_start": record.range_start,
         "range_end": record.range_end,
         "score": record.score,
         "similarity": record.similarity,
+        "candidate_mode": record.candidate_mode,
+        "semantic_rank": record.semantic_rank,
+        "semantic_score": record.semantic_score,
+        "lexical_rank": record.lexical_rank,
+        "lexical_score": record.lexical_score,
+        "anchor_match_types": list(record.anchor_match_types),
+        "fused_rank": record.fused_rank,
+        "fused_score": record.fused_score,
         "score_components": {
             "recency": record.recency_score,
             "access": record.access_score,

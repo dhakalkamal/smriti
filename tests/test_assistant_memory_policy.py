@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -75,6 +76,45 @@ def test_typed_memory_policy_skips_derived_and_unsupported_by_default() -> None:
     decisions_by_id = {decision.memory.id: decision for decision in result.decisions}
     assert decisions_by_id[assistant_2.id].skip_reason == "assistant_derived_disabled"
     assert decisions_by_id[unsupported_3.id].skip_reason == "system_message"
+
+
+def test_typed_memory_policy_keeps_hybrid_candidates_on_runtime_lanes() -> None:
+    lexical_assistant = replace(
+        _message(rank=1, role="assistant"),
+        candidate_mode="hybrid_v1",
+        lexical_rank=1,
+        lexical_score=2.0,
+        lexical_match_types=("email",),
+        fused_rank=1,
+        fused_score=0.03,
+    )
+    lexical_raw = replace(
+        _message(rank=2, role="user"),
+        candidate_mode="hybrid_v1",
+        lexical_rank=2,
+        lexical_score=1.0,
+        lexical_match_types=("rare_token",),
+        fused_rank=2,
+        fused_score=0.02,
+    )
+
+    result = apply_typed_memory_admission(
+        (lexical_assistant, lexical_raw),
+        config=TypedMemoryAdmissionConfig(
+            total_limit=2,
+            raw_source_limit=1,
+            summary_source_limit=0,
+            assistant_derived_limit=0,
+        ),
+        excluded_message_ids=(),
+    )
+
+    assert result.admitted_memories == (lexical_raw,)
+    decisions_by_id = {decision.memory.id: decision for decision in result.decisions}
+    assert decisions_by_id[lexical_assistant.id].lane == "assistant_derived"
+    assert decisions_by_id[lexical_assistant.id].skip_reason == "assistant_derived_disabled"
+    assert decisions_by_id[lexical_raw.id].lane == "raw_source"
+    assert decisions_by_id[lexical_raw.id].admission_reason == "raw_source_quota"
 
 
 def test_typed_memory_policy_can_admit_assistant_derived_after_source_lanes() -> None:

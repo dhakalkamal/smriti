@@ -7,6 +7,7 @@ from uuid import UUID
 
 MessageRole = Literal["system", "user", "assistant"]
 EpisodeKind = Literal["message", "summary"]
+RetrievalCandidateMode = Literal["semantic", "hybrid_v1"]
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,14 @@ class ScoredEpisode:
     frequency_score: float
     score: float
     message_role: MessageRole | None = None
+    candidate_mode: RetrievalCandidateMode = "semantic"
+    semantic_rank: int | None = None
+    semantic_score: float | None = None
+    lexical_rank: int | None = None
+    lexical_score: float | None = None
+    lexical_match_types: tuple[str, ...] = ()
+    fused_rank: int | None = None
+    fused_score: float | None = None
 
 
 @dataclass(frozen=True)

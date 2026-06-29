@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
+import asyncpg
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -26,10 +28,10 @@ if TYPE_CHECKING:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the Stage 13e-2 assembly-aware retrieval eval."""
+    """Run the assembly-aware retrieval eval."""
 
     parser = argparse.ArgumentParser(
-        description="Run the Stage 13e-2 assembly-aware retrieval eval.",
+        description="Run the assembly-aware retrieval eval.",
     )
     parser.add_argument(
         "--corpus",
@@ -91,6 +93,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Override SMRITI_MEMORY_POLICY for assembly eval comparison.",
     )
+    parser.add_argument(
+        "--retrieval-candidate-mode",
+        choices=("semantic", "hybrid_v1"),
+        default=None,
+        help="Override SMRITI_RETRIEVAL_CANDIDATE_MODE for typed_v1 candidate comparison.",
+    )
     args = parser.parse_args(argv)
     if args.diagnostic_top_k is not None and args.diagnostic_top_k <= 0:
         parser.error("--diagnostic-top-k must be greater than zero")
@@ -123,6 +131,12 @@ async def _run(args: argparse.Namespace) -> int:
         stage13_assembly_case_result_to_dict,
         summarize_stage13_assembly_results,
     )
+    from smriti.memory.service import (
+        HYBRID_LEXICAL_RRF_WEIGHT,
+        HYBRID_RETRIEVAL_CANDIDATE_CAP,
+        HYBRID_RRF_K,
+        HYBRID_SEMANTIC_RRF_WEIGHT,
+    )
     from tests.eval.fixtures import build_terrafold_fixture, reset_fixture_access_metadata
 
     corpus = load_stage12_corpus(args.corpus)
@@ -130,6 +144,7 @@ async def _run(args: argparse.Namespace) -> int:
     if args.database_url is not None:
         settings = settings.model_copy(update={"database_url": args.database_url})
     memory_policy = args.memory_policy or settings.memory_policy
+    retrieval_candidate_mode = args.retrieval_candidate_mode or settings.retrieval_candidate_mode
 
     if args.apply_migrations:
         await apply_migrations(settings=settings, migrations_dir=settings.migrations_dir)
@@ -157,6 +172,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
         ),
         memory_policy=memory_policy,
+        retrieval_candidate_mode=retrieval_candidate_mode,
         typed_v1_memory_config=TypedMemoryAdmissionConfig(
             total_limit=settings.memory_typed_v1_total_limit,
             raw_source_limit=settings.memory_typed_v1_raw_source_limit,
@@ -170,6 +186,7 @@ async def _run(args: argparse.Namespace) -> int:
         args.mode,
         args.embedder,
         memory_policy,
+        retrieval_candidate_mode,
     )
 
     try:
@@ -217,6 +234,21 @@ async def _run(args: argparse.Namespace) -> int:
                             skip_reason=decision.skip_reason,
                             original_rank=decision.memory.result_rank,
                             score=decision.memory.score,
+                            episode_kind=decision.memory.kind,
+                            message_id=decision.memory.message_id,
+                            message_role=decision.memory.message_role,
+                            candidate_mode=decision.memory.candidate_mode,
+                            semantic_rank=decision.memory.semantic_rank,
+                            semantic_score=decision.memory.semantic_score,
+                            lexical_rank=decision.memory.lexical_rank,
+                            lexical_score=decision.memory.lexical_score,
+                            anchor_match_types=decision.memory.lexical_match_types,
+                            fused_rank=decision.memory.fused_rank,
+                            fused_score=decision.memory.fused_score,
+                            outcome="assembled" if decision.admitted else "skipped",
+                            outcome_reason=decision.admission_reason
+                            if decision.admitted
+                            else decision.skip_reason,
                         )
                         for decision in assembly.memory_admission_decisions
                     ),
@@ -249,9 +281,16 @@ async def _run(args: argparse.Namespace) -> int:
         metadata_payload = stage12_baseline_metadata_to_dict(metadata)
         metadata_payload.update(
             {
-                "eval_stage": "stage13e-2",
+                "eval_stage": "stage14",
                 "eval_layer": "assembly",
                 "memory_policy": memory_policy,
+                "retrieval_candidate_mode": retrieval_candidate_mode,
+                "rrf_k": HYBRID_RRF_K,
+                "semantic_rrf_weight": HYBRID_SEMANTIC_RRF_WEIGHT,
+                "lexical_rrf_weight": HYBRID_LEXICAL_RRF_WEIGHT,
+                "hybrid_candidate_depth_cap": HYBRID_RETRIEVAL_CANDIDATE_CAP,
+                "lexical_query_strategy": "postgres_simple_fts_plus_exact_anchors",
+                "fts_index_present": await _fts_index_present(pool),
                 "memory_typed_v1_total_limit": settings.memory_typed_v1_total_limit,
                 "memory_typed_v1_raw_source_limit": (settings.memory_typed_v1_raw_source_limit),
                 "memory_typed_v1_summary_source_limit": (
@@ -277,16 +316,16 @@ async def _run(args: argparse.Namespace) -> int:
     finally:
         await close_pool()
 
-    print(f"Wrote Stage 13e-2 assembly eval output to {args.output_root / 'runs' / run_id}")
+    print(f"Wrote Stage 14 assembly eval output to {args.output_root / 'runs' / run_id}")
     print(
-        "Wrote Stage 13e-2 assembly eval Markdown report to "
+        "Wrote Stage 14 assembly eval Markdown report to "
         f"{args.output_root / 'results' / f'{run_id}.md'}"
     )
     return 0
 
 
 async def _current_query_message_context(
-    pool,
+    pool: asyncpg.Pool,
     case: Stage12ResolvedEvalCase,
 ) -> tuple[UUID, UUID]:
     current_query_ids = case.expected_ids.current_query
@@ -313,6 +352,16 @@ async def _current_query_message_context(
             f"{case.example_id}"
         )
     return row["message_id"], row["conversation_id"]
+
+
+async def _fts_index_present(pool: asyncpg.Pool) -> bool:
+    async with pool.acquire() as connection:
+        value = await connection.fetchval(
+            """
+            SELECT to_regclass('public.idx_episodes_content_fts_simple') IS NOT NULL;
+            """
+        )
+    return bool(value)
 
 
 def _write_outputs(
@@ -354,7 +403,7 @@ def _markdown_report(
     retrieval_metrics = _mapping_value(aggregate_metrics, "retrieval_candidate_metrics")
     assembled_metrics = _mapping_value(aggregate_metrics, "assembled_context_metrics")
     lines = [
-        f"# Stage 13e-2 Assembly Eval: {metadata['run_id']}",
+        f"# Stage 14 Assembly Eval: {metadata['run_id']}",
         "",
         "## Metadata",
         "",
@@ -363,6 +412,9 @@ def _markdown_report(
         f"- Embedder: {metadata['embedder_mode']} ({metadata['embedding_model']})",
         f"- Diagnostic top-k: {metadata['diagnostic_top_k']}",
         f"- Memory policy: {metadata['memory_policy']}",
+        f"- Retrieval candidate mode: {metadata['retrieval_candidate_mode']}",
+        f"- RRF k: {metadata['rrf_k']}",
+        f"- FTS index present: {metadata['fts_index_present']}",
         f"- Max prompt chars: {metadata['max_prompt_chars']}",
         f"- Recent message limit: {metadata['recent_message_limit']}",
         f"- Git branch: {metadata['git_branch']}",
@@ -387,6 +439,23 @@ def _markdown_report(
         (
             "| recent_context_duplication_rate | "
             f"{_format_metric(aggregate_metrics['recent_context_duplication_rate'])} |"
+        ),
+        (
+            "| false_positive_retrieval_rate | "
+            f"{_format_metric(aggregate_metrics['false_positive_retrieval_rate'])} |"
+        ),
+        (f"| over_retrieval_rate | {_format_metric(aggregate_metrics['over_retrieval_rate'])} |"),
+        (
+            "| assistant_derived_admitted_count | "
+            f"{aggregate_metrics['assistant_derived_admitted_count']} |"
+        ),
+        (
+            "| negative_control_admitted_count | "
+            f"{aggregate_metrics['negative_control_admitted_count']} |"
+        ),
+        (
+            "| assembled_context_metrics.source_hit_rate_at_k | "
+            f"{_format_metric(assembled_metrics['source_hit_rate_at_k'])} |"
         ),
         (
             "| assembled_context_metrics.source_raw_hit_rate_at_k | "
@@ -462,9 +531,17 @@ def _format_metric(value: object) -> str:
     return str(value)
 
 
-def _default_run_id(created_at: datetime, mode: str, embedder: str, memory_policy: str) -> str:
+def _default_run_id(
+    created_at: datetime,
+    mode: str,
+    embedder: str,
+    memory_policy: str,
+    retrieval_candidate_mode: str,
+) -> str:
     timestamp = created_at.strftime("%Y%m%dT%H%M%SZ")
-    return f"stage13e2-assembly-{memory_policy}-{mode}-{embedder}-{timestamp}"
+    return (
+        f"stage14-assembly-{memory_policy}-{retrieval_candidate_mode}-{mode}-{embedder}-{timestamp}"
+    )
 
 
 def _git_output(args: tuple[str, ...]) -> str | None:

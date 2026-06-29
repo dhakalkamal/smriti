@@ -308,7 +308,9 @@ async def test_assistant_orchestrator_typed_v1_reinforces_selected_only() -> Non
 
     assert memory_service.retrieve_update_access_metadata_flags == [False]
     assert memory_service.retrieve_top_k_values == [2]
+    assert memory_service.retrieve_candidate_modes == ["semantic"]
     assert assembly.memory_policy == "typed_v1"
+    assert assembly.retrieval_candidate_mode == "semantic"
     assert assembly.prompt.selected_memories == (raw_memory, summary_memory)
     assert memory_service.access_update_requests == [(raw_memory, summary_memory)]
     decisions_by_id = {
@@ -327,6 +329,47 @@ async def test_assistant_orchestrator_typed_v1_reinforces_selected_only() -> Non
     assert "episode_id=" not in prompt_text
     assert "rank=" not in prompt_text
     assert "score=" not in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_typed_v1_hybrid_widens_candidate_depth() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 1, "user", "find exact memory")
+    raw_memory = _episode(UUID(int=10), rank=1, score=0.9, content="raw source", role="user")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[raw_memory],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="unused", model="fake-chat")),
+        memory_policy="typed_v1",
+        retrieval_candidate_mode="hybrid_v1",
+        typed_v1_memory_config=TypedMemoryAdmissionConfig(
+            total_limit=6,
+            raw_source_limit=4,
+            summary_source_limit=2,
+            assistant_derived_limit=0,
+        ),
+    )
+
+    assembly = await orchestrator.prepare_generation_debug(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=5,
+            max_prompt_chars=1000,
+        )
+    )
+
+    assert memory_service.retrieve_top_k_values == [25]
+    assert memory_service.retrieve_candidate_modes == ["hybrid_v1"]
+    assert assembly.retrieval_candidate_mode == "hybrid_v1"
 
 
 @pytest.mark.asyncio
@@ -665,6 +708,7 @@ class _FakeMemoryService:
     persisted: AssistantResponseRecord | None
     retrieve_queries: list[str] = field(default_factory=list)
     retrieve_top_k_values: list[int] = field(default_factory=list)
+    retrieve_candidate_modes: list[str] = field(default_factory=list)
     retrieve_exclude_message_id_sets: list[tuple[UUID, ...]] = field(default_factory=list)
     retrieve_update_access_metadata_flags: list[bool] = field(default_factory=list)
     access_update_requests: list[tuple[ScoredEpisode, ...]] = field(default_factory=list)
@@ -686,6 +730,7 @@ class _FakeMemoryService:
         query: str,
         top_k: int,
         *,
+        candidate_mode: str = "semantic",
         exclude_message_id: UUID | None = None,
         exclude_message_ids: tuple[UUID, ...] = (),
         update_access_metadata: bool = True,
@@ -693,6 +738,7 @@ class _FakeMemoryService:
         _ = (user_id, scope_id)
         self.retrieve_queries.append(query)
         self.retrieve_top_k_values.append(top_k)
+        self.retrieve_candidate_modes.append(candidate_mode)
         self.retrieve_update_access_metadata_flags.append(update_access_metadata)
         ids = tuple(exclude_message_ids)
         if exclude_message_id is not None and exclude_message_id not in ids:

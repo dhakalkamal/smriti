@@ -5,7 +5,7 @@ from typing import Literal
 from uuid import UUID
 
 from smriti.chat import ChatRequest
-from smriti.memory import MessageRecord, ScoredEpisode
+from smriti.memory import MessageRecord, RetrievalCandidateMode, ScoredEpisode
 
 MemoryPromptStyle = Literal["legacy", "typed_v1"]
 
@@ -73,6 +73,7 @@ class AssistantPromptAssembly:
     retrieved_memories: tuple[ScoredEpisode, ...]
     memory_admission_decisions: tuple[MemoryAdmissionDecision, ...]
     memory_policy: str
+    retrieval_candidate_mode: RetrievalCandidateMode
     prompt_message_order: tuple[str, ...]
     active_query_occurrences: int
 

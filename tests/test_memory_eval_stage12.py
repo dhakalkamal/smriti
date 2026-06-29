@@ -2001,6 +2001,8 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
                 "stage13e1-assembly-smoke",
                 "--memory-policy",
                 "typed_v1",
+                "--retrieval-candidate-mode",
+                "hybrid_v1",
                 "--diagnostic-top-k",
                 "25",
             ]
@@ -2018,9 +2020,11 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     retrieval_candidate_metrics = cast(dict[str, object], aggregate["retrieval_candidate_metrics"])
     assembled_context_metrics = cast(dict[str, object], aggregate["assembled_context_metrics"])
 
-    assert payload["metadata"]["eval_stage"] == "stage13e-2"
+    assert payload["metadata"]["eval_stage"] == "stage14"
     assert payload["metadata"]["eval_layer"] == "assembly"
     assert payload["metadata"]["memory_policy"] == "typed_v1"
+    assert payload["metadata"]["retrieval_candidate_mode"] == "hybrid_v1"
+    assert payload["metadata"]["rrf_k"] == pytest.approx(60.0)
     assert payload["metadata"]["timing_mode"] == "app_realistic"
     assert payload["metadata"]["embedder_mode"] == "fake"
     assert payload["metadata"]["diagnostic_top_k"] == 25
@@ -2029,6 +2033,9 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     assert assembled_context_metrics["self_query_hit_rate"] == pytest.approx(0.0)
     assert aggregate["active_query_exactly_once_rate"] == pytest.approx(1.0)
     assert aggregate["recent_context_duplication_rate"] == pytest.approx(0.0)
+    assert "false_positive_retrieval_rate" in aggregate
+    assert "over_retrieval_rate" in aggregate
+    assert "assistant_derived_admitted_count" in aggregate
     assert "source_raw_hit_rate_at_k" in assembled_context_metrics
     assert "source_summary_hit_rate_at_k" in assembled_context_metrics
     assert "mean_source_ndcg_at_k" in assembled_context_metrics
@@ -2057,6 +2064,11 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     ]
     assert serialized_memories
     assert all("content" not in memory for memory in serialized_memories)
+    assert all("candidate_mode" in memory for memory in serialized_memories)
+    assert all("semantic_rank" in memory for memory in serialized_memories)
+    assert all("lexical_rank" in memory for memory in serialized_memories)
+    assert all("anchor_match_types" in memory for memory in serialized_memories)
+    assert all("fused_score" in memory for memory in serialized_memories)
     admission_records = [
         record
         for case_record in case_records
@@ -2064,8 +2076,14 @@ def test_stage13_assembly_eval_runner_smoke_writes_json_jsonl_and_markdown(
     ]
     assert admission_records
     assert all("lane" in record for record in admission_records)
+    assert all("episode_kind" in record for record in admission_records)
+    assert all("message_id" in record for record in admission_records)
+    assert all("semantic_rank" in record for record in admission_records)
+    assert all("lexical_rank" in record for record in admission_records)
+    assert all("outcome" in record for record in admission_records)
+    assert all("outcome_reason" in record for record in admission_records)
     assert all("content" not in record for record in admission_records)
-    assert "Stage 13e-2 Assembly Eval" in report_path.read_text(encoding="utf-8")
+    assert "Stage 14 Assembly Eval" in report_path.read_text(encoding="utf-8")
 
 
 def _case(

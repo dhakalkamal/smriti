@@ -63,6 +63,7 @@ def create_app(
             memory_service=memory_service,
             chat_generator=resolved_chat_generator,
             memory_policy=resolved_settings.memory_policy,
+            retrieval_candidate_mode=resolved_settings.retrieval_candidate_mode,
             typed_v1_memory_config=TypedMemoryAdmissionConfig(
                 total_limit=resolved_settings.memory_typed_v1_total_limit,
                 raw_source_limit=resolved_settings.memory_typed_v1_raw_source_limit,

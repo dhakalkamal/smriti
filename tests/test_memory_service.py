@@ -992,6 +992,247 @@ async def test_retrieve_scoped_episodes_can_exclude_active_and_recent_message_ep
 
 
 @pytest.mark.asyncio
+async def test_retrieve_scoped_episodes_semantic_candidate_mode_matches_default() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content="semantic control alpha memory",
+            )
+            await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content="semantic control beta memory",
+            )
+
+            default_results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query="semantic control alpha memory",
+                top_k=2,
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+            explicit_results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query="semantic control alpha memory",
+                top_k=2,
+                candidate_mode="semantic",
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+
+            assert default_results == explicit_results
+            assert [result.candidate_mode for result in explicit_results] == [
+                "semantic",
+                "semantic",
+            ]
+            assert [result.semantic_rank for result in explicit_results] == [1, 2]
+            assert all(result.lexical_rank is None for result in explicit_results)
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_scoped_episodes_hybrid_recovers_exact_anchor_and_dedupes() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            query = "What email uses hello@terrafold.studio?"
+            target = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content="The studio contact email is hello@terrafold.studio.",
+            )
+            semantic_distractor = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content="A pottery newsletter process has unrelated routing details.",
+            )
+            query_vector = await service.embedder.embed_text(query)
+            await _set_episode_embedding(pool, semantic_distractor.id, query_vector)
+            await _set_episode_embedding(pool, target.id, _near_vector(query_vector, 0.10))
+
+            semantic_results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query=query,
+                top_k=1,
+                candidate_mode="semantic",
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+            hybrid_results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query=query,
+                top_k=2,
+                candidate_mode="hybrid_v1",
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+
+            assert [result.id for result in semantic_results] == [semantic_distractor.id]
+            assert hybrid_results[0].id == target.id
+            assert [result.id for result in hybrid_results].count(target.id) == 1
+            assert hybrid_results[0].candidate_mode == "hybrid_v1"
+            assert hybrid_results[0].semantic_rank is not None
+            assert hybrid_results[0].lexical_rank == 1
+            assert "email" in hybrid_results[0].lexical_match_types
+            assert hybrid_results[0].fused_rank == 1
+            assert hybrid_results[0].fused_score == hybrid_results[0].score
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_scoped_episodes_hybrid_preserves_message_exclusions_and_summaries() -> None:
+    migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
+
+    with PostgresContainer(
+        "pgvector/pgvector:pg16",
+        username="smriti",
+        password="smriti",
+        dbname="smriti",
+    ) as postgres:
+        database_url = _to_asyncpg_dsn(postgres.get_connection_url())
+        settings = Settings(database_url=database_url)
+        await apply_migrations(settings=settings, migrations_dir=migrations_dir)
+
+        pool = await get_pool(settings)
+        service = MemoryService(pool=pool, embedder=FakeEmbedder(dimensions=768))
+
+        try:
+            user_id, scope_id, conversation_id = await _create_user_scope_conversation(
+                service,
+                pool,
+            )
+            content = "Precise anchor GBP 48 belongs to source evidence."
+            source_episode = await _append_embedded_message(
+                service=service,
+                user_id=user_id,
+                scope_id=scope_id,
+                conversation_id=conversation_id,
+                content=content,
+            )
+            active_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            recent_message_episode = await service.append_message_with_episode(
+                AppendMessageWithEpisodeRequest(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=content,
+                    token_count=len(content.split()),
+                )
+            )
+            summary_episode_id = await _seed_embedded_summary_episode(
+                service=service,
+                pool=pool,
+                conversation_id=conversation_id,
+                scope_id=scope_id,
+                content=content,
+            )
+
+            results = await service.retrieve_scoped_episodes(
+                user_id=user_id,
+                scope_id=scope_id,
+                query="What was the GBP 48 source evidence?",
+                top_k=10,
+                candidate_mode="hybrid_v1",
+                exclude_message_ids=(
+                    active_message_episode.message.id,
+                    recent_message_episode.message.id,
+                ),
+                update_access_metadata=False,
+                now=FIXED_RETRIEVAL_NOW,
+            )
+
+            result_ids = {result.id for result in results}
+            assert source_episode.id in result_ids
+            assert summary_episode_id in result_ids
+            assert active_message_episode.episode.id not in result_ids
+            assert recent_message_episode.episode.id not in result_ids
+            assert all(
+                result.message_id
+                not in {active_message_episode.message.id, recent_message_episode.message.id}
+                for result in results
+            )
+            assert any(
+                result.id == summary_episode_id
+                and result.kind == "summary"
+                and result.message_id is None
+                for result in results
+            )
+            assert all(result.candidate_mode == "hybrid_v1" for result in results)
+            assert any("number" in result.lexical_match_types for result in results)
+
+            access_metadata = await _episode_access_metadata(
+                pool,
+                [
+                    source_episode.id,
+                    active_message_episode.episode.id,
+                    recent_message_episode.episode.id,
+                ],
+            )
+            assert all(access_count == 0 for access_count, _ in access_metadata.values())
+        finally:
+            await close_pool()
+
+
+@pytest.mark.asyncio
 async def test_retrieve_scoped_episodes_rejects_wrong_user_for_scope() -> None:
     migrations_dir = Path(__file__).resolve().parents[1] / "src" / "smriti" / "db" / "migrations"
 
