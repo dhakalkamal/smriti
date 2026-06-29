@@ -343,12 +343,12 @@ Completed:
 - Stage 10b: read-only retrieval inspection panel
 - Stage 10c: explicit Ollama context window configuration
 - Stage 11: fixed-window summary episodes
+- Stage 12: Eval harness created
+- Stage 13: Scope management UI beyond create and list
+- Stage 14: Expanded retrieval eval harness
 
 Next planned areas:
-
-- Scope management UI beyond create and list
-- Expanded retrieval eval harness
-- Optional MCP server after the core local UI product is complete
+- Tune in the rolling summaries, eval harness and keep the system improving
 
 ## License
 
