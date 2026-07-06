@@ -10,6 +10,7 @@ from smriti.assistant import (
     InvalidAssistantRequestError,
     PromptBuildRequest,
     build_chat_request,
+    reserved_memory_chars,
 )
 from smriti.memory import MessageRecord, ScoredEpisode
 
@@ -58,7 +59,7 @@ def test_prompt_builder_orders_sections_and_preserves_roles() -> None:
     )
 
 
-def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget() -> None:
+def test_prompt_builder_skips_oversized_memory_without_blocking_smaller_ones() -> None:
     query_message = _message(1, "user", "q")
     high_score_memory = _episode(rank=2, score=0.95, content="small high")
     oversized_memory = _episode(rank=1, score=0.9, content="x" * 500)
@@ -68,6 +69,7 @@ def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget
         + len(FIXED_PRIVACY_INSTRUCTIONS)
         + len(query_message.content)
         + len(_memory_context_content_for_test(high_score_memory))
+        + len(_memory_context_content_for_test(later_small_memory))
     )
 
     result = build_chat_request(
@@ -80,11 +82,36 @@ def test_prompt_builder_selects_memories_by_score_and_stops_at_first_over_budget
         )
     )
 
-    assert result.selected_memories == (high_score_memory,)
-    assert result.skipped_memories == (oversized_memory, later_small_memory)
+    assert result.selected_memories == (high_score_memory, later_small_memory)
+    assert result.skipped_memories == (oversized_memory,)
     prompt_contents = [message.content for message in result.chat_request.messages]
     assert any("small high" in content for content in prompt_contents)
-    assert not any("small low" in content for content in prompt_contents)
+    assert any("small low" in content for content in prompt_contents)
+    assert not any("x" * 500 in content for content in prompt_contents)
+
+
+def test_prompt_builder_typed_v1_oversized_raw_does_not_block_smaller_summary() -> None:
+    query_message = _message(1, "user", "q")
+    oversized_raw_memory = _episode(rank=1, score=0.9, content="x" * 2000, role="user")
+    small_summary_memory = _summary_episode(rank=2, score=0.8, content="summary source")
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=(oversized_raw_memory, small_summary_memory),
+            recent_messages=(query_message,),
+            query_message_id=query_message.id,
+            max_prompt_chars=1000,
+            memory_prompt_style="typed_v1",
+        )
+    )
+
+    assert result.selected_memories == (small_summary_memory,)
+    assert result.skipped_memories == (oversized_raw_memory,)
+    prompt_text = "\n".join(message.content for message in result.chat_request.messages)
+    assert "Long-term summary memories" in prompt_text
+    assert "summary source" in prompt_text
+    assert "x" * 2000 not in prompt_text
 
 
 def test_prompt_builder_typed_v1_uses_clean_memory_sections() -> None:
@@ -114,53 +141,129 @@ def test_prompt_builder_typed_v1_uses_clean_memory_sections() -> None:
     assert "score=" not in prompt_text
 
 
-def test_prompt_builder_reserves_selected_recent_context_before_memory() -> None:
-    older_message = _message(1, "user", "older")
-    recent_message = _message(2, "assistant", "recent")
-    query_message = _message(3, "user", "query")
-    memory = _episode(rank=1, score=0.9, content="memory" * 100)
-    max_prompt_chars = (
-        len("scope")
-        + len(FIXED_PRIVACY_INSTRUCTIONS)
-        + len(older_message.content)
-        + len(recent_message.content)
-        + len(query_message.content)
+def test_prompt_builder_typed_v1_overflow_backfills_after_size_skip() -> None:
+    query_message = _message(1, "user", "q")
+    small_raw = _episode(rank=1, score=0.9, content="raw source", role="user")
+    oversized_summary = _summary_episode(rank=2, score=0.8, content="s" * 2000)
+    overflow_summary = _summary_episode(rank=3, score=0.7, content="small overflow summary")
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=(small_raw, oversized_summary),
+            recent_messages=(query_message,),
+            query_message_id=query_message.id,
+            max_prompt_chars=1000,
+            memory_prompt_style="typed_v1",
+            overflow_memories=(overflow_summary,),
+        )
     )
+
+    assert result.selected_memories == (small_raw, overflow_summary)
+    assert result.overflow_selected_memories == (overflow_summary,)
+    assert oversized_summary in result.skipped_memories
+    prompt_text = "\n".join(message.content for message in result.chat_request.messages)
+    assert "small overflow summary" in prompt_text
+    assert "s" * 2000 not in prompt_text
+
+
+def test_prompt_builder_typed_v1_ignores_overflow_without_size_skip() -> None:
+    query_message = _message(1, "user", "q")
+    small_raw = _episode(rank=1, score=0.9, content="raw source", role="user")
+    overflow_summary = _summary_episode(rank=2, score=0.7, content="unused overflow summary")
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=(small_raw,),
+            recent_messages=(query_message,),
+            query_message_id=query_message.id,
+            max_prompt_chars=1000,
+            memory_prompt_style="typed_v1",
+            overflow_memories=(overflow_summary,),
+        )
+    )
+
+    assert result.selected_memories == (small_raw,)
+    assert result.overflow_selected_memories == ()
+    prompt_text = "\n".join(message.content for message in result.chat_request.messages)
+    assert "unused overflow summary" not in prompt_text
+
+
+def test_prompt_builder_reserves_memory_budget_before_recent_context() -> None:
+    max_prompt_chars = 2000
+    recent_budget = max_prompt_chars - reserved_memory_chars(max_prompt_chars)
+    older_message = _message(1, "user", "older")
+    big_recent_message = _message(2, "assistant", "r" * 1100)
+    query_message = _message(3, "user", "query")
+    memory = _episode(rank=1, score=0.9, content="memory " * 70)
+    mandatory_chars = len("scope") + len(FIXED_PRIVACY_INSTRUCTIONS) + len(query_message.content)
+    # The big recent message would fit the total budget but not the
+    # recent-context share left after the long-term memory reservation.
+    assert mandatory_chars + len(big_recent_message.content) <= max_prompt_chars
+    assert mandatory_chars + len(big_recent_message.content) > recent_budget
 
     result = build_chat_request(
         PromptBuildRequest(
             scope_system_prompt="scope",
             retrieved_memories=(memory,),
-            recent_messages=(older_message, recent_message, query_message),
+            recent_messages=(older_message, big_recent_message, query_message),
             query_message_id=query_message.id,
             max_prompt_chars=max_prompt_chars,
         )
     )
 
-    assert result.selected_memories == ()
-    assert result.skipped_memories == (memory,)
-    assert result.selected_recent_message_ids == (
-        older_message.id,
-        recent_message.id,
-        query_message.id,
+    assert result.selected_recent_message_ids == (query_message.id,)
+    assert result.selected_memories == (memory,)
+    assert result.skipped_memories == ()
+
+
+def test_prompt_builder_keeps_reserved_memory_budget_when_recents_fill_their_share() -> None:
+    max_prompt_chars = 2000
+    memory_reserve = reserved_memory_chars(max_prompt_chars)
+    query_message = _message(3, "user", "query")
+    mandatory_chars = len("scope") + len(FIXED_PRIVACY_INSTRUCTIONS) + len(query_message.content)
+    recent_budget = max_prompt_chars - memory_reserve
+    filler_chars = recent_budget - mandatory_chars
+    recent_message = _message(2, "assistant", "r" * filler_chars)
+    memories = tuple(
+        _padded_memory(rank=rank, score=1.0 - rank / 10, context_chars=memory_reserve // 3)
+        for rank in range(1, 5)
     )
-    assert [message.content for message in result.chat_request.messages[-3:]] == [
-        "older",
-        "recent",
-        "query",
-    ]
+
+    result = build_chat_request(
+        PromptBuildRequest(
+            scope_system_prompt="scope",
+            retrieved_memories=memories,
+            recent_messages=(recent_message, query_message),
+            query_message_id=query_message.id,
+            max_prompt_chars=max_prompt_chars,
+        )
+    )
+
+    # Recents consumed their entire share, so exactly the reserved budget is
+    # left and must be filled with eligible memories.
+    assert result.selected_recent_message_ids == (recent_message.id, query_message.id)
+    assert result.selected_memories == memories[:3]
+    selected_memory_chars = sum(
+        len(message.content)
+        for message in result.chat_request.messages
+        if message.content.startswith("Memory context ")
+    )
+    assert selected_memory_chars == 3 * (memory_reserve // 3)
+    assert selected_memory_chars >= memory_reserve - (memory_reserve // 3)
 
 
 def test_prompt_builder_adds_recent_messages_newest_first_for_budget_then_chronological() -> None:
     older_message = _message(1, "user", "older")
     newer_message = _message(2, "assistant", "newer")
     query_message = _message(3, "user", "query")
-    max_prompt_chars = (
-        len("scope")
-        + len(FIXED_PRIVACY_INSTRUCTIONS)
-        + len(query_message.content)
-        + len(newer_message.content)
-    )
+    max_prompt_chars = 715
+    recent_budget = max_prompt_chars - reserved_memory_chars(max_prompt_chars)
+    mandatory_chars = len("scope") + len(FIXED_PRIVACY_INSTRUCTIONS) + len(query_message.content)
+    # Room for the newer message but not both within the recent-context share.
+    assert mandatory_chars + len(newer_message.content) <= recent_budget
+    assert mandatory_chars + len(newer_message.content) + len(older_message.content) > recent_budget
 
     result = build_chat_request(
         PromptBuildRequest(
@@ -303,3 +406,11 @@ def _memory_context_content_for_test(memory: ScoredEpisode) -> str:
     from smriti.assistant.prompt_builder import _memory_context_content
 
     return _memory_context_content(memory)
+
+
+def _padded_memory(rank: int, score: float, context_chars: int) -> ScoredEpisode:
+    probe = _episode(rank=rank, score=score, content="")
+    header_chars = len(_memory_context_content_for_test(probe))
+    if context_chars <= header_chars:
+        raise ValueError("context_chars must exceed the memory context header size")
+    return _episode(rank=rank, score=score, content="m" * (context_chars - header_chars))

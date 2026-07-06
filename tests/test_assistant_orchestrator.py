@@ -307,7 +307,7 @@ async def test_assistant_orchestrator_typed_v1_reinforces_selected_only() -> Non
     )
 
     assert memory_service.retrieve_update_access_metadata_flags == [False]
-    assert memory_service.retrieve_top_k_values == [2]
+    assert memory_service.retrieve_top_k_values == [25]
     assert memory_service.retrieve_candidate_modes == ["semantic"]
     assert assembly.memory_policy == "typed_v1"
     assert assembly.retrieval_candidate_mode == "semantic"
@@ -329,6 +329,125 @@ async def test_assistant_orchestrator_typed_v1_reinforces_selected_only() -> Non
     assert "episode_id=" not in prompt_text
     assert "rank=" not in prompt_text
     assert "score=" not in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_typed_v1_semantic_depth_lets_summary_reach_admission() -> (
+    None
+):
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 2, "user", "find memory")
+    raw_memories = [
+        _episode(
+            UUID(int=100 + rank),
+            rank=rank,
+            score=1.0 - rank / 100,
+            content=f"raw source {rank}",
+            role="user",
+        )
+        for rank in range(1, 9)
+    ]
+    deep_summary = _summary_episode(UUID(int=12), rank=9, score=0.7, content="summary source")
+    distant_raw_memories = [
+        _episode(
+            UUID(int=200 + rank),
+            rank=rank,
+            score=0.3 - rank / 100,
+            content=f"distant raw {rank}",
+            role="user",
+        )
+        for rank in range(10, 15)
+    ]
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[*raw_memories, deep_summary, *distant_raw_memories],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="unused", model="fake-chat")),
+        memory_policy="typed_v1",
+        typed_v1_memory_config=TypedMemoryAdmissionConfig(
+            total_limit=6,
+            raw_source_limit=4,
+            summary_source_limit=2,
+            assistant_derived_limit=0,
+        ),
+    )
+
+    assembly = await orchestrator.prepare_generation_debug(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=5,
+            max_prompt_chars=5000,
+        )
+    )
+
+    # Semantic mode must request a candidate pool deeper than the prompt
+    # limits so a summary ranked below the old depth (6) can reach admission.
+    assert memory_service.retrieve_top_k_values == [25]
+    assert memory_service.retrieve_candidate_modes == ["semantic"]
+    assert memory_service.retrieve_exclude_message_id_sets == [(query_message.id,)]
+    assert deep_summary in assembly.prompt.selected_memories
+    decisions_by_id = {
+        decision.memory.id: decision for decision in assembly.memory_admission_decisions
+    }
+    assert decisions_by_id[deep_summary.id].lane == "summary_source"
+    assert decisions_by_id[deep_summary.id].admitted is True
+
+
+@pytest.mark.asyncio
+async def test_assistant_orchestrator_typed_v1_marks_prompt_overflow_backfill() -> None:
+    user_id = UUID(int=1)
+    scope_id = UUID(int=2)
+    conversation_id = UUID(int=3)
+    query_message = _message(UUID(int=4), conversation_id, 2, "user", "find memory")
+    oversized_raw = _episode(UUID(int=10), rank=1, score=0.9, content="x" * 5000, role="user")
+    overflow_raw = _episode(UUID(int=11), rank=2, score=0.9, content="tiny raw", role="user")
+    memory_service = _FakeMemoryService(
+        context=_context(user_id, scope_id, conversation_id, query_message),
+        retrieved=[oversized_raw, overflow_raw],
+        persisted=None,
+    )
+    orchestrator = AssistantOrchestrator(
+        memory_service=memory_service,  # type: ignore[arg-type]
+        chat_generator=_RecordingChatGenerator(ChatResponse(content="unused", model="fake-chat")),
+        memory_policy="typed_v1",
+        typed_v1_memory_config=TypedMemoryAdmissionConfig(
+            total_limit=1,
+            raw_source_limit=1,
+            summary_source_limit=1,
+            assistant_derived_limit=0,
+        ),
+    )
+
+    assembly = await orchestrator.prepare_generation_debug(
+        AssistantGenerationRequest(
+            user_id=user_id,
+            scope_id=scope_id,
+            conversation_id=conversation_id,
+            query_message_id=query_message.id,
+            top_k=1,
+            max_prompt_chars=700,
+        )
+    )
+
+    assert assembly.overflow_memories == (overflow_raw,)
+    assert assembly.prompt.selected_memories == (overflow_raw,)
+    assert assembly.prompt.overflow_selected_memories == (overflow_raw,)
+    decisions_by_id = {
+        decision.memory.id: decision for decision in assembly.memory_admission_decisions
+    }
+    assert decisions_by_id[overflow_raw.id].admitted is True
+    assert decisions_by_id[overflow_raw.id].admission_reason == "prompt_overflow_backfill"
+    assert decisions_by_id[oversized_raw.id].admitted is False
+    assert decisions_by_id[oversized_raw.id].skip_reason == "prompt_character_budget"
+    assert memory_service.access_update_requests == [(overflow_raw,)]
 
 
 @pytest.mark.asyncio

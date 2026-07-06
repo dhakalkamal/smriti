@@ -64,13 +64,17 @@ HYBRID_LEXICAL_RRF_WEIGHT = 1.0
 SECONDS_PER_DAY = 24 * 60 * 60
 RECENCY_HALF_LIFE_SECONDS = 30 * SECONDS_PER_DAY
 ACCESS_HALF_LIFE_SECONDS = 7 * SECONDS_PER_DAY
-SIMILARITY_WEIGHT = 0.55
+# Access/frequency weights are zero: retrieval-driven reinforcement created a
+# rich-get-richer loop that permanently locked out never-retrieved episodes
+# (summaries in particular). Component scores are still computed and persisted
+# for provenance; only their weight in ranking is removed.
+SIMILARITY_WEIGHT = 0.70
 RECENCY_WEIGHT = 0.20
-ACCESS_WEIGHT = 0.10
+ACCESS_WEIGHT = 0.0
 IMPORTANCE_WEIGHT = 0.10
-FREQUENCY_WEIGHT = 0.05
+FREQUENCY_WEIGHT = 0.0
 FREQUENCY_NORMALIZATION_COUNT = 10.0
-SCORING_VERSION = "stage-5.2-weighted-v1"
+SCORING_VERSION = "stage-15-weighted-v2"
 _LEXICAL_QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _EMAIL_ANCHOR_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _NUMBER_ANCHOR_RE = re.compile(

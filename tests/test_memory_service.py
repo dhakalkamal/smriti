@@ -1449,11 +1449,11 @@ async def test_retrieve_scoped_episodes_uses_weighted_score_components() -> None
             assert result.frequency_score == pytest.approx(0.5)
 
             expected_score = (
-                0.55 * result.similarity
+                0.70 * result.similarity
                 + 0.20 * result.recency_score
-                + 0.10 * result.access_score
+                + 0.0 * result.access_score
                 + 0.10 * result.importance_score
-                + 0.05 * result.frequency_score
+                + 0.0 * result.frequency_score
             )
             assert result.score == pytest.approx(expected_score)
         finally:

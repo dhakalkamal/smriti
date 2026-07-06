@@ -32,7 +32,9 @@ from smriti.assistant.prompt_builder import (
     DEFAULT_MAX_PROMPT_CHARS,
     DEFAULT_RECENT_MESSAGE_LIMIT,
     FIXED_PRIVACY_INSTRUCTIONS,
+    MEMORY_BUDGET_RESERVED_FRACTION,
     build_chat_request,
+    reserved_memory_chars,
     select_recent_context,
 )
 
@@ -54,6 +56,7 @@ __all__ = [
     "DEFAULT_RECENT_MESSAGE_LIMIT",
     "FIXED_PRIVACY_INSTRUCTIONS",
     "InvalidAssistantRequestError",
+    "MEMORY_BUDGET_RESERVED_FRACTION",
     "MemoryAdmissionDecision",
     "MemoryPolicyName",
     "MemoryPromptStyle",
@@ -63,5 +66,6 @@ __all__ = [
     "RecentContextSelectionResult",
     "TypedMemoryAdmissionConfig",
     "build_chat_request",
+    "reserved_memory_chars",
     "select_recent_context",
 ]

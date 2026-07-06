@@ -51,8 +51,8 @@ from smriti.memory import (
 ASSISTANT_GENERATION_UNAVAILABLE_CODE = "assistant_generation_unavailable"
 ASSISTANT_GENERATION_FAILED_CODE = "assistant_generation_failed"
 ASSISTANT_PERSISTENCE_FAILED_CODE = "assistant_persistence_failed"
-HYBRID_CANDIDATE_DEPTH_FLOOR = 25
-HYBRID_CANDIDATE_DEPTH_CAP = 100
+TYPED_CANDIDATE_DEPTH_FLOOR = 25
+TYPED_CANDIDATE_DEPTH_CAP = 100
 
 
 @dataclass(frozen=True)
@@ -206,6 +206,7 @@ class AssistantOrchestrator:
                 max_prompt_chars=request.max_prompt_chars,
             )
         )
+        overflow_memories: tuple[ScoredEpisode, ...] = ()
         if self.memory_policy == "legacy":
             effective_candidate_mode: RetrievalCandidateMode = "semantic"
             retrieved_memories = tuple(
@@ -236,7 +237,6 @@ class AssistantOrchestrator:
             candidate_top_k = _typed_candidate_top_k(
                 request_top_k=request.top_k,
                 total_limit=self.typed_v1_memory_config.total_limit,
-                candidate_mode=effective_candidate_mode,
             )
             retrieved_memories = tuple(
                 await self.memory_service.retrieve_scoped_episodes(
@@ -254,6 +254,7 @@ class AssistantOrchestrator:
                 config=self.typed_v1_memory_config,
                 excluded_message_ids=recent_context.selected_recent_message_ids,
             )
+            overflow_memories = admission.overflow_memories
             prompt = build_chat_request(
                 request=PromptBuildRequest(
                     scope_system_prompt=context.scope.system_prompt,
@@ -262,18 +263,25 @@ class AssistantOrchestrator:
                     query_message_id=request.query_message_id,
                     max_prompt_chars=request.max_prompt_chars,
                     memory_prompt_style="typed_v1",
+                    overflow_memories=admission.overflow_memories,
                 )
             )
+            selected_memory_ids = {memory.id for memory in prompt.selected_memories}
             prompt = replace(
                 prompt,
                 skipped_memories=_dedupe_memories(
-                    (*prompt.skipped_memories, *admission.skipped_memories)
+                    tuple(
+                        memory
+                        for memory in (*prompt.skipped_memories, *admission.skipped_memories)
+                        if memory.id not in selected_memory_ids
+                    )
                 ),
             )
             memory_admission_decisions = finalize_memory_admission_decisions(
                 admission.decisions,
                 selected_memories=prompt.selected_memories,
                 prompt_skipped_memories=prompt.skipped_memories,
+                overflow_selected_memories=prompt.overflow_selected_memories,
             )
             await self.memory_service.update_episode_access_metadata(
                 user_id=request.user_id,
@@ -295,6 +303,7 @@ class AssistantOrchestrator:
                 for message in prompt.selected_recent_messages
                 if message.id == recent_context.active_query_message_id
             ),
+            overflow_memories=overflow_memories,
         )
 
     async def _persist_assistant_response(
@@ -334,18 +343,16 @@ def _typed_candidate_top_k(
     *,
     request_top_k: int,
     total_limit: int,
-    candidate_mode: RetrievalCandidateMode,
 ) -> int:
-    base_top_k = max(request_top_k, total_limit)
-    if candidate_mode == "semantic":
-        return base_top_k
+    # Typed admission needs a candidate pool deeper than the final prompt
+    # limits, or lane quotas (for example the summary lane) can never fill.
     return min(
-        HYBRID_CANDIDATE_DEPTH_CAP,
+        TYPED_CANDIDATE_DEPTH_CAP,
         max(
-            HYBRID_CANDIDATE_DEPTH_FLOOR,
+            TYPED_CANDIDATE_DEPTH_FLOOR,
             request_top_k * 5,
             total_limit * 4,
-            base_top_k,
+            max(request_top_k, total_limit),
         ),
     )
 

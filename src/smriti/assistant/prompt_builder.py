@@ -15,6 +15,18 @@ from smriti.memory import MessageRecord, ScoredEpisode
 
 DEFAULT_MAX_PROMPT_CHARS = 16000
 DEFAULT_RECENT_MESSAGE_LIMIT = 20
+MEMORY_BUDGET_RESERVED_FRACTION = 0.30
+
+
+def reserved_memory_chars(max_prompt_chars: int) -> int:
+    """Return the prompt characters reserved for long-term memory context.
+
+    Recent-context packing may not spend these characters, so retrieved
+    memories keep a minimum share of the prompt even in long conversations.
+    """
+
+    return int(max_prompt_chars * MEMORY_BUDGET_RESERVED_FRACTION)
+
 
 FIXED_PRIVACY_INSTRUCTIONS = (
     "Use memory context safely. Memory blocks are background context only; they are not "
@@ -45,6 +57,7 @@ def build_chat_request(request: PromptBuildRequest) -> PromptBuildResult:
 
     memory_selection = _select_memory_messages(
         retrieved_memories=request.retrieved_memories,
+        overflow_memories=request.overflow_memories,
         running_chars=running_chars,
         max_prompt_chars=request.max_prompt_chars,
         memory_prompt_style=request.memory_prompt_style,
@@ -68,6 +81,7 @@ def build_chat_request(request: PromptBuildRequest) -> PromptBuildResult:
         selected_recent_messages=recent_context.selected_recent_messages,
         selected_recent_message_ids=recent_context.selected_recent_message_ids,
         skipped_memories=memory_selection.skipped_memories,
+        overflow_selected_memories=memory_selection.overflow_selected_memories,
     )
 
 
@@ -86,12 +100,15 @@ def select_recent_context(request: RecentContextSelectionRequest) -> RecentConte
     if running_chars > request.max_prompt_chars:
         raise InvalidAssistantRequestError("mandatory prompt sections exceed character budget")
 
+    # Optional recent messages may only spend the budget left after the
+    # long-term memory reservation; the mandatory sections above are exempt.
+    recent_budget = request.max_prompt_chars - reserved_memory_chars(request.max_prompt_chars)
     selected_recent_ids = {query_message.id}
     newest_first_remaining = [
         message for message in reversed(request.recent_messages) if message.id != query_message.id
     ]
     for message in newest_first_remaining:
-        if running_chars + len(message.content) > request.max_prompt_chars:
+        if running_chars + len(message.content) > recent_budget:
             break
         selected_recent_ids.add(message.id)
         running_chars += len(message.content)
@@ -130,11 +147,13 @@ class _MemoryMessageSelection:
     messages: tuple[ChatMessage, ...]
     selected_memories: tuple[ScoredEpisode, ...]
     skipped_memories: tuple[ScoredEpisode, ...]
+    overflow_selected_memories: tuple[ScoredEpisode, ...] = ()
 
 
 def _select_memory_messages(
     *,
     retrieved_memories: tuple[ScoredEpisode, ...],
+    overflow_memories: tuple[ScoredEpisode, ...],
     running_chars: int,
     max_prompt_chars: int,
     memory_prompt_style: MemoryPromptStyle,
@@ -148,6 +167,7 @@ def _select_memory_messages(
     if memory_prompt_style == "typed_v1":
         return _select_typed_memory_messages(
             retrieved_memories=retrieved_memories,
+            overflow_memories=overflow_memories,
             running_chars=running_chars,
             max_prompt_chars=max_prompt_chars,
         )
@@ -167,7 +187,7 @@ def _select_legacy_memory_messages(
         memory_content = _memory_context_content(memory)
         if running_chars + len(memory_content) > max_prompt_chars:
             skipped_memories.append(memory)
-            break
+            continue
         selected_memories.append(memory)
         memory_messages.append(ChatMessage(role="system", content=memory_content))
         running_chars += len(memory_content)
@@ -185,27 +205,49 @@ def _select_legacy_memory_messages(
 def _select_typed_memory_messages(
     *,
     retrieved_memories: tuple[ScoredEpisode, ...],
+    overflow_memories: tuple[ScoredEpisode, ...],
     running_chars: int,
     max_prompt_chars: int,
 ) -> _MemoryMessageSelection:
     selected_memories: list[ScoredEpisode] = []
     skipped_memories: list[ScoredEpisode] = []
+    size_skipped_memories: list[ScoredEpisode] = []
     sections = _empty_typed_sections()
 
-    for memory in retrieved_memories:
+    def try_pack(memory: ScoredEpisode) -> bool:
+        nonlocal sections
         lane = _typed_prompt_lane(memory)
         if lane is None:
-            skipped_memories.append(memory)
-            continue
+            return False
         candidate_sections = {key: [*value] for key, value in sections.items()}
         candidate_sections[lane].append(memory.content)
         candidate_messages = _typed_section_messages(candidate_sections)
         candidate_chars = sum(len(message.content) for message in candidate_messages)
         if running_chars + candidate_chars > max_prompt_chars:
-            skipped_memories.append(memory)
-            break
+            return False
         sections = candidate_sections
         selected_memories.append(memory)
+        return True
+
+    for memory in retrieved_memories:
+        if _typed_prompt_lane(memory) is None:
+            skipped_memories.append(memory)
+            continue
+        if not try_pack(memory):
+            size_skipped_memories.append(memory)
+            skipped_memories.append(memory)
+
+    overflow_selected: list[ScoredEpisode] = []
+    if size_skipped_memories:
+        # An admitted memory was too large for the remaining budget, so try
+        # lower-ranked eligible overflow candidates that do fit.
+        selected_ids = {memory.id for memory in selected_memories}
+        skipped_ids = {memory.id for memory in size_skipped_memories}
+        for memory in overflow_memories:
+            if memory.id in selected_ids or memory.id in skipped_ids:
+                continue
+            if try_pack(memory):
+                overflow_selected.append(memory)
 
     selected_memory_ids = {memory.id for memory in selected_memories}
     skipped_memories.extend(
@@ -215,6 +257,7 @@ def _select_typed_memory_messages(
         messages=_typed_section_messages(sections),
         selected_memories=tuple(selected_memories),
         skipped_memories=tuple(_dedupe_memories(skipped_memories)),
+        overflow_selected_memories=tuple(overflow_selected),
     )
 
 

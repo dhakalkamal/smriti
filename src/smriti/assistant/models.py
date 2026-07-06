@@ -29,6 +29,7 @@ class PromptBuildRequest:
     query_message_id: UUID
     max_prompt_chars: int = 16000
     memory_prompt_style: MemoryPromptStyle = "legacy"
+    overflow_memories: tuple[ScoredEpisode, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class PromptBuildResult:
     selected_recent_messages: tuple[MessageRecord, ...]
     selected_recent_message_ids: tuple[UUID, ...]
     skipped_memories: tuple[ScoredEpisode, ...]
+    overflow_selected_memories: tuple[ScoredEpisode, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ class AssistantPromptAssembly:
     retrieval_candidate_mode: RetrievalCandidateMode
     prompt_message_order: tuple[str, ...]
     active_query_occurrences: int
+    overflow_memories: tuple[ScoredEpisode, ...] = ()
 
 
 @dataclass(frozen=True)
