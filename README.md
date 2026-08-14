@@ -29,6 +29,7 @@ Implemented:
 - Provenance visualization in the UI
 - Read-only retrieval inspection panel 
 - Explicit Ollama context window configuration 
+- hybrid retrieval 
 
 
 Not implemented:
