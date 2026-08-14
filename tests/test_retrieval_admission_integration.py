@@ -84,7 +84,7 @@ async def test_summary_at_rank_nine_reaches_assembled_prompt_through_real_retrie
                 )
                 history_episode_ids.append(record.episode.id)
 
-            summary = await service.create_summary_episode_for_latest_complete_window(
+            summary = await service.create_summary_episode_for_next_uncovered_window(
                 CreateSummaryEpisodeRequest(
                     user_id=user_id,
                     scope_id=scope.id,

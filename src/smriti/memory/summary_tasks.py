@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -12,6 +13,8 @@ from smriti.memory.service import MemoryService
 
 logger = logging.getLogger(__name__)
 SUMMARY_EPISODE_DRAIN_TIMEOUT_SECONDS = 120.0
+# Bound catch-up work per task; remaining windows are picked up on later completions.
+SUMMARY_EPISODE_MAX_WINDOWS_PER_TASK = 4
 
 
 @dataclass(frozen=True)
@@ -44,8 +47,26 @@ class SummaryEpisodeMemoryScheduler:
         """Schedule summary memory work without blocking the user stream."""
 
         if not self.enabled:
+            logger.debug(
+                "summary_episode_memory_schedule_skipped conversation_id=%s status=disabled",
+                request.conversation_id,
+                extra={
+                    "event": "summary_episode_memory_schedule_skipped",
+                    "conversation_id": request.conversation_id,
+                    "status": "disabled",
+                },
+            )
             return None
 
+        logger.debug(
+            "summary_episode_memory_scheduled conversation_id=%s status=scheduled",
+            request.conversation_id,
+            extra={
+                "event": "summary_episode_memory_scheduled",
+                "conversation_id": request.conversation_id,
+                "status": "scheduled",
+            },
+        )
         task = asyncio.create_task(self._run(request))
         self._tasks.add(task)
         self._task_requests[task] = request
@@ -85,15 +106,42 @@ class SummaryEpisodeMemoryScheduler:
 
     async def _run(self, request: SummaryEpisodeMemoryScheduleRequest) -> None:
         try:
-            await self.memory_service.create_summary_episode_for_latest_complete_window(
-                CreateSummaryEpisodeRequest(
-                    user_id=request.user_id,
-                    scope_id=request.scope_id,
-                    conversation_id=request.conversation_id,
-                    window_messages=self.window_messages,
-                ),
-                self.chat_generator,
-            )
+            for _ in range(SUMMARY_EPISODE_MAX_WINDOWS_PER_TASK):
+                started_at = time.monotonic()
+                record = await self.memory_service.create_summary_episode_for_next_uncovered_window(
+                    CreateSummaryEpisodeRequest(
+                        user_id=request.user_id,
+                        scope_id=request.scope_id,
+                        conversation_id=request.conversation_id,
+                        window_messages=self.window_messages,
+                    ),
+                    self.chat_generator,
+                )
+                if record is None:
+                    break
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                logger.info(
+                    "summary_episode_memory_created "
+                    f"conversation_id={record.conversation_id} "
+                    f"range_start={record.range_start} "
+                    f"range_end={record.range_end} "
+                    f"summary_model={_log_value(_summary_model(self.chat_generator))} "
+                    f"embedding_model={_log_value(self.memory_service.embedding_model_id)} "
+                    f"elapsed_ms={elapsed_ms} "
+                    "status=created",
+                    extra={
+                        "event": "summary_episode_memory_created",
+                        "user_id": request.user_id,
+                        "scope_id": request.scope_id,
+                        "conversation_id": record.conversation_id,
+                        "range_start": record.range_start,
+                        "range_end": record.range_end,
+                        "summary_model": _summary_model(self.chat_generator),
+                        "embedding_model": self.memory_service.embedding_model_id,
+                        "elapsed_ms": elapsed_ms,
+                        "status": "created",
+                    },
+                )
         except SummaryEpisodeMemoryError as exc:
             _log_summary_failure(exc)
         except Exception as exc:

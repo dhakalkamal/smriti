@@ -465,7 +465,7 @@ async def test_summary_scheduler_drain_timeout_cancels_and_logs_pending_tasks(
 
 
 @pytest.mark.asyncio
-async def test_sse_schedules_summary_work_after_done_event_is_yielded() -> None:
+async def test_sse_schedules_summary_work_before_done_event_is_yielded() -> None:
     conversation_id = uuid4()
     schedule_request = SummaryEpisodeMemoryScheduleRequest(
         user_id=uuid4(),
@@ -483,7 +483,7 @@ async def test_sse_schedules_summary_work_after_done_event_is_yielded() -> None:
     ):
         chunks.append(chunk)
         if "event: done" in chunk:
-            assert scheduler.requests == []
+            assert scheduler.requests == [schedule_request]
 
     assert [event["event"] for event in _parse_sse("".join(chunks))] == ["start", "done"]
     assert scheduler.requests == [schedule_request]
@@ -553,7 +553,7 @@ async def _create_summary(
     scope_id: UUID,
     conversation_id: UUID,
 ):
-    return await service.create_summary_episode_for_latest_complete_window(
+    return await service.create_summary_episode_for_next_uncovered_window(
         CreateSummaryEpisodeRequest(
             user_id=user_id,
             scope_id=scope_id,
@@ -725,7 +725,7 @@ class _BlockingSummaryMemoryService:
     release: asyncio.Event = field(default_factory=asyncio.Event)
     embedding_model_id: str = "fake-embedder"
 
-    async def create_summary_episode_for_latest_complete_window(
+    async def create_summary_episode_for_next_uncovered_window(
         self,
         request: CreateSummaryEpisodeRequest,
         chat_generator: FakeChatGenerator,

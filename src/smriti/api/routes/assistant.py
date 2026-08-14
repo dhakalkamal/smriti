@@ -47,6 +47,10 @@ async def create_assistant_response(
         AssistantOrchestrator,
         Depends(get_assistant_orchestrator),
     ],
+    summary_episode_memory_scheduler: Annotated[
+        SummaryEpisodeMemoryScheduler,
+        Depends(get_summary_episode_memory_scheduler),
+    ],
     local_user_id: Annotated[UUID, Depends(get_current_local_user_id)],
 ) -> AssistantGenerationResponse:
     """Generate and persist one assistant response for a local conversation."""
@@ -60,6 +64,13 @@ async def create_assistant_response(
             top_k=body.top_k,
             max_prompt_chars=body.max_prompt_chars,
             recent_message_limit=body.recent_message_limit,
+        )
+    )
+    summary_episode_memory_scheduler.schedule(
+        SummaryEpisodeMemoryScheduleRequest(
+            user_id=local_user_id,
+            scope_id=body.scope_id,
+            conversation_id=conversation_id,
         )
     )
     return AssistantGenerationResponse(
@@ -125,13 +136,16 @@ async def _stream_sse_events(
                 event = await anext(events)
             except StopAsyncIteration:
                 break
-            yield _encode_sse_event(event)
+            # Schedule before yielding the terminal event: once the assistant
+            # message is persisted, summary work must not depend on the client
+            # staying connected to read the final SSE chunk.
             if (
                 isinstance(event, AssistantStreamDone)
                 and summary_episode_memory_scheduler is not None
                 and summary_episode_memory_request is not None
             ):
                 summary_episode_memory_scheduler.schedule(summary_episode_memory_request)
+            yield _encode_sse_event(event)
     finally:
         close = getattr(events, "aclose", None)
         if close is not None:

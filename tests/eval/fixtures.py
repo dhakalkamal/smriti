@@ -7,12 +7,10 @@ from uuid import UUID
 
 import asyncpg
 
-from smriti.chat import ChatResponse, FakeChatGenerator
 from smriti.memory import (
     AppendMessageWithEpisodeRequest,
     CreateConversationRequest,
     CreateScopeRequest,
-    CreateSummaryEpisodeRequest,
     MemoryService,
     MessageRole,
 )
@@ -87,47 +85,32 @@ async def build_terrafold_fixture(
         if message.semantic_ref is not None:
             ref_to_episode_id[message.semantic_ref] = record.episode.id
 
+        # Seed summary rows directly with explicit ranges: the fixture
+        # intentionally has no 1..12 summary, while the production service now
+        # catches up from the earliest uncovered window.
         if record.message.position == 24:
-            summary = await service.create_summary_episode_for_latest_complete_window(
-                CreateSummaryEpisodeRequest(
-                    user_id=user_id,
-                    scope_id=scope.id,
-                    conversation_id=conversation.id,
-                    window_messages=12,
-                ),
-                FakeChatGenerator(
-                    response=ChatResponse(
-                        content=SUMMARY_13_24,
-                        model="stage-12-fake-summary",
-                        finish_reason="stop",
-                    )
-                ),
+            summary_id = await _seed_summary_episode(
+                service=service,
+                conversation_id=conversation.id,
+                scope_id=scope.id,
+                range_start=13,
+                range_end=24,
+                content=SUMMARY_13_24,
             )
-            if summary is None:
-                raise RuntimeError("Stage 12 fixture failed to create summary_window_13_24")
-            ref_to_episode_id["summary_window_13_24"] = summary.id
-            episode_ids.append(summary.id)
+            ref_to_episode_id["summary_window_13_24"] = summary_id
+            episode_ids.append(summary_id)
 
         if record.message.position == 36:
-            summary = await service.create_summary_episode_for_latest_complete_window(
-                CreateSummaryEpisodeRequest(
-                    user_id=user_id,
-                    scope_id=scope.id,
-                    conversation_id=conversation.id,
-                    window_messages=12,
-                ),
-                FakeChatGenerator(
-                    response=ChatResponse(
-                        content=SUMMARY_25_36,
-                        model="stage-12-fake-summary",
-                        finish_reason="stop",
-                    )
-                ),
+            summary_id = await _seed_summary_episode(
+                service=service,
+                conversation_id=conversation.id,
+                scope_id=scope.id,
+                range_start=25,
+                range_end=36,
+                content=SUMMARY_25_36,
             )
-            if summary is None:
-                raise RuntimeError("Stage 12 fixture failed to create summary_window_25_36")
-            ref_to_episode_id["summary_window_25_36"] = summary.id
-            episode_ids.append(summary.id)
+            ref_to_episode_id["summary_window_25_36"] = summary_id
+            episode_ids.append(summary_id)
 
     current_query_conversation_id = conversation.id
     if timing_mode == "clean_memory":
@@ -206,6 +189,50 @@ async def _create_user(pool: asyncpg.Pool) -> UUID:
         return cast(
             UUID, await connection.fetchval("INSERT INTO users DEFAULT VALUES RETURNING id;")
         )
+
+
+async def _seed_summary_episode(
+    service: MemoryService,
+    conversation_id: UUID,
+    scope_id: UUID,
+    range_start: int,
+    range_end: int,
+    content: str,
+) -> UUID:
+    vector = await service.embedder.embed_text(content)
+    async with service.pool.acquire() as connection:
+        embedding_model_pk = await connection.fetchval(
+            """
+            SELECT id
+            FROM embedding_models
+            WHERE model_id = $1
+              AND dimensions = 768
+              AND is_active = TRUE;
+            """,
+            service.embedding_model_id,
+        )
+        episode_id = await connection.fetchval(
+            """
+            INSERT INTO episodes (conversation_id, scope_id, kind, range_start, range_end, content)
+            VALUES ($1, $2, 'summary', $3, $4, $5)
+            RETURNING id;
+            """,
+            conversation_id,
+            scope_id,
+            range_start,
+            range_end,
+            content,
+        )
+        await connection.execute(
+            """
+            INSERT INTO embeddings_768 (episode_id, model_id, embedding)
+            VALUES ($1, $2, $3);
+            """,
+            episode_id,
+            embedding_model_pk,
+            list(vector),
+        )
+    return cast(UUID, episode_id)
 
 
 def _base_messages() -> tuple[_FixtureMessage, ...]:

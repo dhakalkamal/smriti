@@ -729,12 +729,18 @@ class MemoryService:
 
         return _episode_from_row(row, embedding_model_pk)
 
-    async def create_summary_episode_for_latest_complete_window(
+    async def create_summary_episode_for_next_uncovered_window(
         self,
         request: CreateSummaryEpisodeRequest,
         chat_generator: ChatGenerator,
     ) -> SummaryEpisodeRecord | None:
-        """Create an embedded summary episode for the latest complete N-message window."""
+        """Create an embedded summary episode for the next complete, not-yet-summarized window.
+
+        Windows are fixed and non-overlapping (1..N, N+1..2N, ...). The next window
+        starts right after the highest summarized position, so windows missed at the
+        moment they completed (feature disabled, transient failure, restart) are
+        caught up on later invocations instead of being lost forever.
+        """
 
         if request.window_messages <= 0:
             raise InvalidMemoryRequestError("summary window size must be greater than zero")
@@ -1254,11 +1260,29 @@ class MemoryService:
                     request.conversation_id,
                 ),
             )
-            if message_count == 0 or message_count % request.window_messages != 0:
+            covered_summary_end = cast(
+                int,
+                await connection.fetchval(
+                    """
+                    SELECT COALESCE(MAX(range_end), 0)
+                    FROM episodes
+                    WHERE conversation_id = $1
+                      AND scope_id = $2
+                      AND kind = 'summary';
+                    """,
+                    request.conversation_id,
+                    request.scope_id,
+                ),
+            )
+            window = _next_summary_window(
+                message_count=message_count,
+                covered_summary_end=covered_summary_end,
+                window_messages=request.window_messages,
+            )
+            if window is None:
                 return None
 
-            range_end = message_count
-            range_start = range_end - request.window_messages + 1
+            range_start, range_end = window
             if await self._summary_episode_exists(
                 connection=connection,
                 conversation_id=request.conversation_id,
@@ -1984,6 +2008,25 @@ def _episode_from_row(row: asyncpg.Record, embedding_model_id: int) -> EpisodeRe
         created_at=cast(datetime, row["created_at"]),
         embedding_model_id=embedding_model_id,
     )
+
+
+def _next_summary_window(
+    *,
+    message_count: int,
+    covered_summary_end: int,
+    window_messages: int,
+) -> tuple[int, int] | None:
+    """Return the next complete fixed window not yet covered by a summary episode.
+
+    Fixed windows advance in steps of window_messages from the highest summarized
+    position, so the sequence stays 1..N, N+1..2N, ... regardless of when checks run.
+    """
+
+    range_start = covered_summary_end + 1
+    range_end = covered_summary_end + window_messages
+    if message_count < range_end:
+        return None
+    return range_start, range_end
 
 
 def _summary_episode_from_row(
